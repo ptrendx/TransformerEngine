@@ -521,6 +521,7 @@ void reduce_dbias(const Tensor &workspace, Tensor *dbias,
         reinterpret_cast<const fp32 *>(workspace.data.dptr),
         reduce_dbias_row_length,
         reduce_dbias_num_rows);
+  NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
 void cast_transpose_dbias(const Tensor &input,
@@ -594,9 +595,10 @@ void cast_transpose_dbias(const Tensor &input,
       param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
 
       if (full_tile) {
-        cudaFuncSetAttribute(cast_transpose_dbias_kernel<nvec_in, nvec_out, Param>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                cast_transpose_dbias_kernel<nvec_in, nvec_out, Param>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         cast_transpose_dbias_kernel<nvec_in, nvec_out, Param>
           <<<n_blocks,
              cast_transpose_num_threads,
@@ -612,8 +614,10 @@ void cast_transpose_dbias(const Tensor &input,
              shared_size_transpose,
              stream>>>(param, row_length, num_rows, n_tiles);
       }
+      NVTE_CHECK_CUDA(cudaGetLastError());
 
       reduce_dbias<InputType>(*workspace, dbias, row_length, num_rows, nvec_out, stream);
+      NVTE_CHECK_CUDA(cudaGetLastError());
     );  // NOLINT(*)
   );  // NOLINT(*)
 }
@@ -1423,9 +1427,10 @@ void cast_transpose_dbias_dgelu(const Tensor &input,
       param.amax = reinterpret_cast<ComputeType *>(cast_output->amax.dptr);
       param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
       if (full_tile) {
-        cudaFuncSetAttribute(cast_transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                cast_transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         cast_transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>
           <<<n_blocks,
           cast_transpose_num_threads,
@@ -1441,8 +1446,10 @@ void cast_transpose_dbias_dgelu(const Tensor &input,
           shared_size_transpose,
           stream>>>(param, row_length, num_rows, n_tiles);
       }
+      NVTE_CHECK_CUDA(cudaGetLastError());
 
       reduce_dbias<InputType>(*workspace, dbias, row_length, num_rows, nvec_out, stream);
+      NVTE_CHECK_CUDA(cudaGetLastError());
     ); // NOLINT(*)
   );  // NOLINT(*)
 }
@@ -1504,10 +1511,11 @@ void dgeglu_cast_transpose(const Tensor &input,
       const bool full_tile = row_length % (nvec_in * THREADS_PER_WARP) == 0 &&
                              num_rows % (nvec_out * THREADS_PER_WARP) == 0;
       if (full_tile) {
-        cudaFuncSetAttribute(dgeglu_cast_transpose_kernel<nvec_in, nvec_out, fp32,
-                                                   InputType, OutputType>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                dgeglu_cast_transpose_kernel<nvec_in, nvec_out, fp32,
+                                             InputType, OutputType>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         dgeglu_cast_transpose_kernel<nvec_in, nvec_out, fp32, InputType, OutputType>
             <<<n_blocks,
                cast_transpose_num_threads,
@@ -1542,6 +1550,7 @@ void dgeglu_cast_transpose(const Tensor &input,
                 reinterpret_cast<fp32 *>(cast_output->scale_inv.dptr),
                 row_length, num_rows, n_tiles);
       }
+      NVTE_CHECK_CUDA(cudaGetLastError());
     ); // NOLINT(*)
   );  // NOLINT(*)
 }

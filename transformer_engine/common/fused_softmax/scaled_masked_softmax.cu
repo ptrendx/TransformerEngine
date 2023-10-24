@@ -597,6 +597,7 @@ void dispatch_scaled_softmax_forward(
             default:
                 break;
         }
+        NVTE_CHECK_CUDA(cudaGetLastError());
     }
 }
 
@@ -772,6 +773,7 @@ void dispatch_scaled_masked_softmax_forward(
             default:
                 break;
         }
+        NVTE_CHECK_CUDA(cudaGetLastError());
     }
 }
 
@@ -945,6 +947,7 @@ void dispatch_scaled_masked_softmax_backward(
             default:
                 break;
         }
+        NVTE_CHECK_CUDA(cudaGetLastError());
     }
 }
 

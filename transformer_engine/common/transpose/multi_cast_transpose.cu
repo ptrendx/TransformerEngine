@@ -194,9 +194,9 @@ multi_cast_transpose_kernel(MultiCastTransposeArgs args) {
 
 }  // namespace
 
-void multi_cast_transpose(const std::vector<Tensor*> input_list,
-                          std::vector<Tensor*> cast_output_list,
-                          std::vector<Tensor*> transposed_output_list,
+void multi_cast_transpose(const std::vector<Tensor*>& input_list,
+                          const std::vector<Tensor*>& cast_output_list,
+                          const std::vector<Tensor*>& transposed_output_list,
                           cudaStream_t stream) {
   // Check that number of tensors is valid
   NVTE_CHECK(cast_output_list.size() == input_list.size(),

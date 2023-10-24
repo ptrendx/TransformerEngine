@@ -429,6 +429,7 @@ void reduce_dbias(const Tensor &workspace, Tensor *dbias,
         reinterpret_cast<const fp32 *>(workspace.data.dptr),
         reduce_dbias_row_length,
         reduce_dbias_num_rows);
+  NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
 void fp8_transpose_dbias(const Tensor &input,
@@ -488,14 +489,16 @@ void fp8_transpose_dbias(const Tensor &input,
       param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
 
       if (full_tile) {
-        cudaFuncSetAttribute(transpose_dbias_kernel<nvec_in, nvec_out, Param>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                transpose_dbias_kernel<nvec_in, nvec_out, Param>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         transpose_dbias_kernel<nvec_in, nvec_out, Param>
           <<<n_blocks,
              cast_transpose_num_threads,
              shared_size_transpose,
              stream>>>(param, row_length, num_rows, n_tiles);
+        NVTE_CHECK_CUDA(cudaGetLastError());
       } else {
         cudaFuncSetAttribute(transpose_dbias_kernel_notaligned<nvec_in, nvec_out, Param>,
                              cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -505,9 +508,11 @@ void fp8_transpose_dbias(const Tensor &input,
              cast_transpose_num_threads,
              shared_size_transpose,
              stream>>>(param, row_length, num_rows, n_tiles);
+        NVTE_CHECK_CUDA(cudaGetLastError());
       }
 
       reduce_dbias<BiasType>(*workspace, dbias, row_length, num_rows, nvec_out, stream);
+      NVTE_CHECK_CUDA(cudaGetLastError());
     );  // NOLINT(*)
   );  // NOLINT(*)
 }

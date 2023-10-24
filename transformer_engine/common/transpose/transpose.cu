@@ -252,6 +252,7 @@ void transpose(const Tensor &input,
         static_cast<const Type *>(input.data.dptr),
         static_cast<Type *>(output.data.dptr),
         row_length, num_rows);
+      NVTE_CHECK_CUDA(cudaGetLastError());
     }
   );  // NOLINT(*)
 }

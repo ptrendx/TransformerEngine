@@ -192,8 +192,8 @@ void layernorm_fwd(const Tensor& x,        // BxSxhidden_size
     launch_params.stream = stream;
 
     // Request the kernel launcher.
-    auto launcher = layer_norm::get_fwd_launcher(wtype, itype, otype, ctype,
-                                                 hidden_size, rows);
+    const auto& launcher = layer_norm::get_fwd_launcher(wtype, itype, otype, ctype,
+                                                        hidden_size, rows);
 
     // Set the kernel runtime parameters.
     layer_norm::FwdParams &params = launch_params.params;
@@ -311,8 +311,8 @@ void layernorm_bwd(const Tensor& dz,
     launch_params.stream = stream;
     launch_params.multiprocessorCount = multiprocessorCount;
 
-    auto launcher = layer_norm::get_bwd_launcher(wtype, itype, otype, ctype,
-                                                 hidden_size, rows);
+    const auto& launcher = layer_norm::get_bwd_launcher(wtype, itype, otype, ctype,
+                                                        hidden_size, rows);
 
     // Set the kernel runtime parameters.
     layer_norm::BwdParams &params = launch_params.params;

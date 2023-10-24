@@ -139,7 +139,7 @@ void rmsnorm_fwd(const Tensor &x, const Tensor &gamma, const float epsilon, Tens
     launch_params.stream = stream;
 
     // Request the kernel launcher.
-    auto launcher = rmsnorm::get_fwd_launcher(wtype, itype, otype, ctype, hidden_size, rows);
+    const auto& launcher = rmsnorm::get_fwd_launcher(wtype, itype, otype, ctype, hidden_size, rows);
 
     // Set the kernel runtime parameters.
     rmsnorm::FwdParams &params = launch_params.params;
@@ -233,7 +233,7 @@ void rmsnorm_bwd(const Tensor &dz, const Tensor &x, const Tensor &rsigma, const 
     launch_params.stream = stream;
     launch_params.multiprocessorCount = multiprocessorCount;
 
-    auto launcher = rmsnorm::get_bwd_launcher(wtype, itype, otype, ctype, hidden_size, rows);
+    const auto& launcher = rmsnorm::get_bwd_launcher(wtype, itype, otype, ctype, hidden_size, rows);
 
     // Set the kernel runtime parameters.
     rmsnorm::BwdParams &params = launch_params.params;

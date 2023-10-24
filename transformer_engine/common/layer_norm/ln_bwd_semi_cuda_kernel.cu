@@ -39,8 +39,8 @@ void launch_tuned_(LaunchParams<BwdParams> &launch_params, const bool configure_
 
     if ( configure_params ) {
         int ctas_per_sm;
-        cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES);
+        NVTE_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES));
         launch_params.params.ctas_per_row = CTAS_PER_ROW;
         launch_params.params.ctas_per_col = launch_params.multiprocessorCount
                                             * ctas_per_sm / launch_params.params.ctas_per_row;
@@ -69,15 +69,16 @@ void launch_tuned_(LaunchParams<BwdParams> &launch_params, const bool configure_
     if ( ctas_per_row == 1 ) {
         kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES, stream>>>
                                                                             (launch_params.params);
+        NVTE_CHECK_CUDA(cudaGetLastError());
     } else {
         dim3 grid(ctas_per_row * ctas_per_col);
         dim3 block(Kernel_traits::THREADS_PER_CTA);
         void *params_ = reinterpret_cast<void *>(&launch_params.params);
-        cudaLaunchCooperativeKernel(reinterpret_cast<void *>(kernel),
-                                    grid,
-                                    block,
-                                    reinterpret_cast<void **>(&params_),
-                                    Kernel_traits::SMEM_BYTES, stream);
+        NVTE_CHECK_CUDA(cudaLaunchCooperativeKernel(reinterpret_cast<void *>(kernel),
+                                                    grid,
+                                                    block,
+                                                    reinterpret_cast<void **>(&params_),
+                                                    Kernel_traits::SMEM_BYTES, stream));
     }
 
     using Kernel_traits_f = layer_norm::Kernel_traits_finalize<HIDDEN_SIZE,
@@ -92,6 +93,7 @@ void launch_tuned_(LaunchParams<BwdParams> &launch_params, const bool configure_
     auto kernel_f = &layer_norm::ln_bwd_finalize_tuned_kernel<Kernel_traits_f>;
     kernel_f<<<Kernel_traits_f::CTAS, Kernel_traits_f::THREADS_PER_CTA, 0, stream>>>
                                                              (launch_params.params);
+    NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
 template<
@@ -130,8 +132,8 @@ void launch_general_(LaunchParams<BwdParams> &launch_params, const bool configur
     int ctas_per_row = launch_params.params.ctas_per_row;
     if ( configure_params ) {
         int ctas_per_sm;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, 0);
+        NVTE_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &ctas_per_sm, kernel, Kernel_traits::THREADS_PER_CTA, 0));
         const int max_ctas = launch_params.multiprocessorCount * ctas_per_sm;
         ctas_per_row = ceil_div(cols, HIDDEN_SIZE);
         ctas_per_col = std::min(ceil_div(rows, WARPS_M),
@@ -158,14 +160,15 @@ void launch_general_(LaunchParams<BwdParams> &launch_params, const bool configur
     dim3 block(Kernel_traits::THREADS_PER_CTA);
     if ( ctas_per_row == 1 ) {
         kernel<<<grid, block, 0, stream>>>(launch_params.params);
+        NVTE_CHECK_CUDA(cudaGetLastError());
     } else {
         void *params_ = reinterpret_cast<void *>(&launch_params.params);
-        cudaLaunchCooperativeKernel(reinterpret_cast<void *>(kernel),
-                                    grid,
-                                    block,
-                                    reinterpret_cast<void **>(&params_),
-                                    0,
-                                    stream);
+        NVTE_CHECK_CUDA(cudaLaunchCooperativeKernel(reinterpret_cast<void *>(kernel),
+                                                    grid,
+                                                    block,
+                                                    reinterpret_cast<void **>(&params_),
+                                                    0,
+                                                    stream));
     }
 
     // Launch finalization kernel
@@ -184,6 +187,7 @@ void launch_general_(LaunchParams<BwdParams> &launch_params, const bool configur
     dim3 block_final(Kernel_traits::THREADS_PER_WARP * WARPS_N_FINAL, WARPS_M_FINAL);
     dim3 grid_final(ceil_div(cols, ELTS_N_PER_CTA_FINAL), 1);
     kernel_final<<<grid_final, block_final, 0, stream>>>(launch_params.params);
+    NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
