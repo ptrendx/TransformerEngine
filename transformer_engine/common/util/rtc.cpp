@@ -79,7 +79,7 @@ Kernel::~Kernel() {
         }
         cuda_driver::call("cuModuleUnload", modules_[device_id]);
         cuda_driver::call("cuDevicePrimaryCtxRelease", device);
-      } catch (const std::runtime_exception &) {
+      } catch (const std::runtime_error &) {
         // Could not load the driver functions, do nothing
       }
     }
