@@ -37,6 +37,7 @@ struct LaunchParams{
 struct ParamsBase {
     ParamsBase()
         : ctas_per_col(0)
+        , ctas_per_row(0)
         , rows(0)
         , cols(0)
         , x(nullptr)
@@ -81,6 +82,8 @@ struct FwdParams : public ParamsBase {
         , z(nullptr)
         , beta(nullptr)
         , epsilon(0.f)
+        , scale(nullptr)
+        , amax(nullptr)
         , fp8_out(false) {}
 
     // Output of LN FWD.

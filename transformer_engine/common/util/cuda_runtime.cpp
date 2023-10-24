@@ -35,7 +35,7 @@ int num_devices() {
 
 int current_device() {
   // Return 0 if CUDA context is not initialized
-  CUcontext context;
+  CUcontext context = nullptr;
   NVTE_CALL_CHECK_CUDA_DRIVER(cuCtxGetCurrent, &context);
   if (context == nullptr) {
     return 0;

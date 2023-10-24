@@ -1437,9 +1437,10 @@ void cast_transpose_dbias_dgelu(const Tensor &input,
           shared_size_transpose,
           stream>>>(param, row_length, num_rows, n_tiles);
       } else {
-        cudaFuncSetAttribute(cast_transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                cast_transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         cast_transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>
           <<<n_blocks,
           cast_transpose_num_threads,
@@ -1531,10 +1532,11 @@ void dgeglu_cast_transpose(const Tensor &input,
                 reinterpret_cast<fp32 *>(cast_output->scale_inv.dptr),
                 row_length, num_rows, n_tiles);
       } else {
-        cudaFuncSetAttribute(dgeglu_cast_transpose_kernel_notaligned<nvec_in, nvec_out, fp32,
-                                                              InputType, OutputType>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                dgeglu_cast_transpose_kernel_notaligned<nvec_in, nvec_out, fp32,
+                                                        InputType, OutputType>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         dgeglu_cast_transpose_kernel_notaligned<nvec_in, nvec_out, fp32, InputType, OutputType>
             <<<n_blocks,
                cast_transpose_num_threads,

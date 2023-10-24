@@ -500,9 +500,10 @@ void fp8_transpose_dbias(const Tensor &input,
              stream>>>(param, row_length, num_rows, n_tiles);
         NVTE_CHECK_CUDA(cudaGetLastError());
       } else {
-        cudaFuncSetAttribute(transpose_dbias_kernel_notaligned<nvec_in, nvec_out, Param>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             100);
+        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                transpose_dbias_kernel_notaligned<nvec_in, nvec_out, Param>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                100));
         transpose_dbias_kernel_notaligned<nvec_in, nvec_out, Param>
           <<<n_blocks,
              cast_transpose_num_threads,

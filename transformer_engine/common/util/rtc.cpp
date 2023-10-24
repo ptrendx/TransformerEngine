@@ -66,18 +66,22 @@ Kernel::~Kernel() {
   for (int device_id=0; device_id<static_cast<int>(modules_.size()); ++device_id) {
     // Unload CUDA modules if needed
     if (modules_[device_id] != null_module) {
-      CUdevice device;
-      CUcontext context;
-      if (cuda_driver::call("cuDeviceGet", &device, device_id)
-          != CUDA_SUCCESS) {
-        continue;
+      try {
+        CUdevice device;
+        CUcontext context;
+        if (cuda_driver::call("cuDeviceGet", &device, device_id)
+            != CUDA_SUCCESS) {
+          continue;
+        }
+        if (cuda_driver::call("cuDevicePrimaryCtxRetain", &context, device)
+            != CUDA_SUCCESS) {
+          continue;
+        }
+        cuda_driver::call("cuModuleUnload", modules_[device_id]);
+        cuda_driver::call("cuDevicePrimaryCtxRelease", device);
+      } catch (const std::runtime_exception &) {
+        // Could not load the driver functions, do nothing
       }
-      if (cuda_driver::call("cuDevicePrimaryCtxRetain", &context, device)
-          != CUDA_SUCCESS) {
-        continue;
-      }
-      cuda_driver::call("cuModuleUnload", modules_[device_id]);
-      cuda_driver::call("cuDevicePrimaryCtxRelease", device);
     }
   }
 }
@@ -105,8 +109,8 @@ CUfunction Kernel::get_function(int device_id) {
   // Load kernel on device if needed
   auto load_on_device = [&] () {
     // Set driver context to proper device
-    CUdevice device;
-    CUcontext context;
+    CUdevice device = 0;
+    CUcontext context = nullptr;
     NVTE_CALL_CHECK_CUDA_DRIVER(cuDeviceGet, &device, device_id);
     NVTE_CALL_CHECK_CUDA_DRIVER(cuDevicePrimaryCtxRetain, &context, device);
 
