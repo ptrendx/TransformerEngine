@@ -1,0 +1,7 @@
+recursive-include transformer_engine *.*
+recursive-include 3rdparty *.*
+include LICENSE
+include README.rst
+include MANIFEST.in
+include .gitmodules
+include VERSION
