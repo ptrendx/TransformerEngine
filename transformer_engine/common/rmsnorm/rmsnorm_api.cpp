@@ -21,7 +21,8 @@ void rmsnorm_fwd(const Tensor &x, const Tensor &gamma, const float epsilon, Tens
                  Tensor *workspace, Tensor *barrier, const bool zero_centered_gamma) {
   NVTE_CHECK(x.data.shape.size() == 2);
 
-  NVTE_CHECK(gamma.data.shape[0] == x.data.shape[1]);
+  NVTE_CHECK(gamma.data.shape.size() <= 2);
+  NVTE_CHECK(x.data.shape[1] == gamma.data.shape[gamma.data.shape.size() - 1]);
   NVTE_CHECK(epsilon >= 0.f);
 
   NVTE_CHECK(z->data.shape == x.data.shape);

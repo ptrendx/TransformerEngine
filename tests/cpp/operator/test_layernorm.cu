@@ -50,18 +50,20 @@ void compute_ref_stats(const InputType *data, float *mu, float *rsigma,
 template <typename InputType, typename OutputType>
 void compute_ref_output(const InputType *data, const InputType *gamma, const InputType *beta,
                  OutputType *output, const float *mu, const float *rsigma,
-                 const size_t N, const size_t H,
+                 const size_t B, const size_t N, const size_t H,
                  float *amax, float scale, const bool zero_centered_gamma) {
   using compute_t = float;
   compute_t current_max = -1e100;
+  const size_t rows_per_sample = N / B;
   for (size_t i = 0 ; i < N; ++i) {
+    const size_t b = i / rows_per_sample;
     for (size_t j = 0; j < H; ++j) {
       compute_t current = static_cast<compute_t>(data[i * H + j]);
-      compute_t g = static_cast<compute_t>(gamma[j]);
+      compute_t g = static_cast<compute_t>(gamma[j + b * H]);
       if (zero_centered_gamma) {
         g += 1;
       }
-      compute_t tmp = (current - mu[i]) * rsigma[i] * g + static_cast<compute_t>(beta[j]);
+      compute_t tmp = (current - mu[i]) * rsigma[i] * g + static_cast<compute_t>(beta[j + b * H]);
       output[i * H + j] = static_cast<OutputType>(tmp * scale);
       current_max = fmaxf(current_max, fabsf(tmp));
     }
@@ -75,13 +77,15 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
                           const InputType *gamma,
                           InputType *data_grad,
                           InputType *gamma_grad, InputType *beta_grad,
-                          const size_t N, const size_t H,
+                          const size_t B, const size_t N, const size_t H,
                           const bool zero_centered_gamma) {
   using compute_t = float;
-  std::vector<compute_t> dgamma(H, 0.f);
-  std::vector<compute_t> dbeta(H, 0.f);
+  std::vector<compute_t> dgamma(B * H, 0.f);
+  std::vector<compute_t> dbeta(B * H, 0.f);
 
+  const size_t rows_per_sample = N / B;
   for (size_t i = 0 ; i < N; ++i) {
+    const size_t b = i / rows_per_sample;
     // Reductions
     compute_t mdy = 0, mdyy = 0;
     for (size_t j = 0; j < H; ++j) {
@@ -93,8 +97,8 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
       }
       const compute_t dz = static_cast<compute_t>(output_grad[i * H + j]);
       const compute_t dy = g * dz;
-      dgamma[j] += y * dz;
-      dbeta[j] += dz;
+      dgamma[j + b * H] += y * dz;
+      dbeta[j + b * H] += dz;
       mdy += dy;
       mdyy += dy * y;
     }
@@ -117,14 +121,14 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
   }
 
   // Weight grads
-  for (size_t j = 0; j < H; ++j) {
+  for (size_t j = 0; j < B * H; ++j) {
     gamma_grad[j] = static_cast<InputType>(dgamma[j]);
     beta_grad[j] = static_cast<InputType>(dbeta[j]);
   }
 }
 
 template <typename InputType, typename OutputType>
-void performTest(const size_t N, const size_t H, const bool zero_centered_gamma) {
+void performTest(const size_t B, const size_t N, const size_t H, const bool zero_centered_gamma) {
   if (sizeof(InputType) < sizeof(OutputType)) {
     GTEST_SKIP() << "LN kernel does not support OutputType > InputType";
     return;
@@ -140,16 +144,18 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma)
     return;
   }
 
+  std::vector<size_t> gamma_shape = B == 1 ? std::vector<size_t>{ H } 
+                                           : std::vector<size_t>{ B, H };
   Tensor input({ N, H }, itype);
   Tensor z({ N, H }, otype);
-  Tensor gamma({ H }, wtype);
-  Tensor beta({ H }, wtype);
+  Tensor gamma(gamma_shape, wtype);
+  Tensor beta(gamma_shape, wtype);
   Tensor mu({ N }, DType::kFloat32);
   Tensor rsigma({ N }, DType::kFloat32);
   Tensor dz({ N, H }, wtype);
   Tensor dx({ N, H }, itype);
-  Tensor dgamma({ H }, wtype);
-  Tensor dbeta({ H }, wtype);
+  Tensor dgamma(gamma_shape, wtype);
+  Tensor dbeta(gamma_shape, wtype);
   Tensor workspace, barrier, dgamma_part, dbeta_part;
 
   fillUniform(&input);
@@ -162,8 +168,8 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma)
   std::unique_ptr<float[]> ref_mu = std::make_unique<float[]>(N);
   std::unique_ptr<float[]> ref_rsigma = std::make_unique<float[]>(N);
   std::unique_ptr<InputType[]> ref_dx = std::make_unique<InputType[]>(N * H);
-  std::unique_ptr<WeightType[]> ref_dgamma = std::make_unique<InputType[]>(H);
-  std::unique_ptr<WeightType[]> ref_dbeta = std::make_unique<InputType[]>(H);
+  std::unique_ptr<WeightType[]> ref_dgamma = std::make_unique<InputType[]>(B * H);
+  std::unique_ptr<WeightType[]> ref_dbeta = std::make_unique<InputType[]>(B * H);
 
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
@@ -213,7 +219,7 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma)
                      ref_output.get(),
                      mu.cpu_dptr<float>(),
                      rsigma.cpu_dptr<float>(),
-                     N, H,
+                     B, N, H,
                      &ref_amax,
                      ref_scale,
                      zero_centered_gamma);
@@ -221,7 +227,7 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma)
                        mu.cpu_dptr<float>(), rsigma.cpu_dptr<float>(),
                        gamma.cpu_dptr<WeightType>(),
                        ref_dx.get(), ref_dgamma.get(), ref_dbeta.get(),
-                       N, H, zero_centered_gamma);
+                       B, N, H, zero_centered_gamma);
 
   cudaDeviceSynchronize();
   auto err = cudaGetLastError();
@@ -252,20 +258,25 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma)
   compareResults("dbeta", dbeta, ref_dbeta.get(), atol_bwd, rtol_bwd);
 }
 
-std::vector<std::pair<size_t, size_t>> test_cases = {{2048, 12288},
-                                                     {768, 1024},
-                                                     {256, 65536},
-                                                     {128, 6144},
-                                                     {64, 2304},
-                                                     {229, 541},   // Primes 50, 100
-                                                     {71, 3571},   // Primes 20, 500
-                                                     {29, 17389}}; // Primes 10, 2000
+std::vector<std::tuple<size_t, size_t, size_t>> test_cases = {{1, 2048, 12288},
+                                                              {1, 768, 1024},
+                                                              {1, 256, 65536},
+                                                              {1, 128, 6144},
+                                                              {1, 64, 2304},
+                                                              {2, 2048, 12288},
+                                                              {2, 768, 1024},
+                                                              {2, 256, 65536},
+                                                              {2, 128, 6144},
+                                                              {2, 64, 2304},
+                                                              {1, 229, 541},   // Primes 50, 100
+                                                              {1, 71, 3571},   // Primes 20, 500
+                                                              {1, 29, 17389}}; // Primes 10, 2000
 
 }  // namespace
 
 class LNTestSuite : public ::testing::TestWithParam<std::tuple<transformer_engine::DType,
                                                                transformer_engine::DType,
-                                                               std::pair<size_t, size_t>,
+                                                               std::tuple<size_t, size_t, size_t>,
                                                                bool>> {};
 
 TEST_P(LNTestSuite, TestLN) {
@@ -279,7 +290,7 @@ TEST_P(LNTestSuite, TestLN) {
 
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
       TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
-        performTest<InputType, OutputType>(size.first, size.second, zero_centered_gamma);
+        performTest<InputType, OutputType>(size.get<0>(), size.get<1>(), size.get<2>(), zero_centered_gamma);
       );
     );
 }

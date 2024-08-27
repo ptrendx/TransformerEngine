@@ -50,6 +50,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
 
   const index_t r = bidm * Ktraits::ROWS_PER_CTA + warp_m;
   const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
+  const index_t b = r / params.rows_per_sample;
 
   static_assert(COLS == THREADS_PER_ROW * LDGS * NUM_ELTS * CTAS_PER_ROW);
 
@@ -68,7 +69,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
 
   constexpr float rn = 1.f / static_cast<float>(COLS);
   Wvec gamma[LDGS];
-  index_t idx = c;
+  index_t idx = c + b * params.cols;
 #pragma unroll
   for (int it = 0; it < LDGS; it++) {
     gamma[it].load_from(params.gamma, idx);

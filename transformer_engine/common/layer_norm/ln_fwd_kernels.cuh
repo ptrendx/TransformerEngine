@@ -51,6 +51,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
 
   const index_t r = bidm * ROWS_PER_CTA + warp_m;
   const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
+  const index_t b = r / params.rows_per_sample;
 
   Stats stats(params, bidm, bidn, warp_m, warp_n, lane, smem_);
 
@@ -59,7 +60,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
 
   Wvec gamma[LDGS];
   Wvec beta[LDGS];
-  index_t idx = c;
+  index_t idx = c + b * params.cols;
 #pragma unroll
   for (int it = 0; it < LDGS; ++it) {
     gamma[it].load_from(params.gamma, idx);
@@ -75,7 +76,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
   }
   compute_t amax = 0;
 
-  for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+  for (size_t row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
     Ivec x[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
     compute_t xf[LDGS * NUM_ELTS];
@@ -194,15 +195,6 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_general_kerne
   // Load weights
   Cvec gamma[LDGS];
   Cvec beta[LDGS];
-#pragma unroll
-  for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && col < params.cols;
-       ++it, col += gdimn * NUM_ELTS) {
-    Wvec gamma_in, beta_in;
-    gamma_in.load_from_elts(params.gamma, col, params.cols - col);
-    beta_in.load_from_elts(params.beta, col, params.cols - col);
-    gamma_in.to(gamma[it]);
-    beta_in.to(beta[it]);
-  }
 
   // fp8 factors
   compute_t scale;
@@ -211,8 +203,24 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_general_kerne
   }
   compute_t amax = 0;
 
-  for (int cta_row = bidm * bdimm; cta_row < params.rows; cta_row += gdimm) {
+  size_t b = static_cast<size_t>(-1);
+
+  for (size_t cta_row = bidm * bdimm; cta_row < params.rows; cta_row += gdimm) {
     const int row = cta_row + warp_m;
+    const size_t new_b = row / params.rows_per_sample;
+    if (new_b != b) {
+#pragma unroll
+      for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && col < params.cols;
+           ++it, col += gdimn * NUM_ELTS) {
+        Wvec gamma_in, beta_in;
+        gamma_in.load_from_elts(params.gamma, col + new_b * params.cols, params.cols - col);
+        beta_in.load_from_elts(params.beta, col + new_b * params.cols, params.cols - col);
+        gamma_in.to(gamma[it]);
+        beta_in.to(beta[it]);
+      }
+      b = new_b;
+    }
+
 
     // Load input
     Cvec x[LDGS];
@@ -243,7 +251,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_general_kerne
          it++, col += gdimn * NUM_ELTS) {
 #pragma unroll
       for (int jt = 0; jt < NUM_ELTS; jt++) {
-        if (col + jt < params.cols) {
+        if (static_cast<size_t>(col + jt) < params.cols) {
           compute_t diff = x[it].data.elt[jt] - mu;
           sqsigma += diff * diff;
         }
@@ -281,7 +289,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_general_kerne
       if (params.fp8_out) {
 #pragma unroll
         for (int jt = 0; jt < NUM_ELTS; jt++) {
-          if (col + jt < params.cols) {
+          if (static_cast<size_t>(col + jt) < params.cols) {
             compute_t z_ij = z.data.elt[jt];
             __builtin_assume(amax >= 0);
             amax = fmaxf(amax, fabsf(z_ij));

@@ -35,6 +35,7 @@ struct ParamsBase {
       : ctas_per_col(0),
         rows(0),
         cols(0),
+        rows_per_sample(0),
         x(nullptr),
         mu(nullptr),
         rs(nullptr),
@@ -49,8 +50,9 @@ struct ParamsBase {
   int ctas_per_row;
 
   // Input is interpreted as matrix. We normalize across columns.
-  int rows;
-  int cols;
+  size_t rows;
+  size_t cols;
+  size_t rows_per_sample;
 
   // Common data pointers.
   void* x;

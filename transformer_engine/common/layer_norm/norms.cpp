@@ -80,8 +80,13 @@ FwdFunction& get_fwd_launcher(DType wtype, DType itype, DType otype, DType ctype
     // Assume vectorized memory accesses are <=16B
     return reinterpret_cast<uintptr_t>(ptr) % 16 == 0;
   };
-  if (params.rows % 4 == 0 && is_aligned(params.x) && is_aligned(params.rs) &&
-      is_aligned(params.gamma) && is_aligned(params.z) && FWD_TUNED_FUNCS.count(tuned_key) > 0) {
+  if (params.rows % 4 == 0 &&
+      params.rows_per_sample % 4 == 0 &&
+      is_aligned(params.x) &&
+      is_aligned(params.rs) &&
+      is_aligned(params.gamma) &&
+      is_aligned(params.z) &&
+      FWD_TUNED_FUNCS.count(tuned_key) > 0) {
     if constexpr (NormEnum == NVTE_NORM_TYPE::LN_FWD_TE) {
       if (is_aligned(params.mu) && is_aligned(params.beta)) return FWD_TUNED_FUNCS.at(tuned_key);
     } else
@@ -117,9 +122,15 @@ BwdFunction& get_bwd_launcher(DType wtype, DType itype, DType otype, DType ctype
     // Assume vectorized memory accesses are <=16B
     return reinterpret_cast<uintptr_t>(ptr) % 16 == 0;
   };
-  if (params.rows % 4 == 0 && is_aligned(params.x) && is_aligned(params.rs) &&
-      is_aligned(params.gamma) && is_aligned(params.dz) && is_aligned(params.dx) &&
-      is_aligned(params.dgamma) && is_aligned(params.dgamma_part) &&
+  if (params.rows % 4 == 0 &&
+      params.rows_per_sample % 4 == 0 &&
+      is_aligned(params.x) &&
+      is_aligned(params.rs) &&
+      is_aligned(params.gamma) &&
+      is_aligned(params.dz) &&
+      is_aligned(params.dx) &&
+      is_aligned(params.dgamma) &&
+      is_aligned(params.dgamma_part) &&
       BWD_TUNED_FUNCS.count(tuned_key) > 0) {
     if constexpr (NormEnum == NVTE_NORM_TYPE::LN_BWD_TE) {
       if (is_aligned(params.mu) && is_aligned(params.dbeta) && is_aligned(params.dbeta_part))
@@ -166,6 +177,8 @@ NormFwdTe<NormEnum>::NormFwdTe(const Tensor& x, const Tensor& gamma, const Tenso
   auto& params = _launch_params.params;
   params.rows = x.data.shape[0];
   params.cols = x.data.shape[1];
+  const size_t batch_size = gamma.data.shape.size() == 2 ? gamma.data.shape[0] : 1;
+  params.rows_per_sample = params.rows / batch_size;
   params.x = x.data.dptr;
   params.rs = rsigma->data.dptr;
   params.gamma = gamma.data.dptr;
@@ -211,6 +224,8 @@ NormBwdTe<NormEnum>::NormBwdTe(const Tensor& dz, const Tensor& x, const Tensor& 
   auto& params = _launch_params.params;
   params.rows = x.data.shape[0];
   params.cols = x.data.shape[1];
+  const size_t batch_size = gamma.data.shape.size() == 2 ? gamma.data.shape[0] : 1;
+  params.rows_per_sample = params.rows / batch_size;
   params.x = x.data.dptr;
   params.rs = rsigma.data.dptr;
   params.gamma = gamma.data.dptr;
