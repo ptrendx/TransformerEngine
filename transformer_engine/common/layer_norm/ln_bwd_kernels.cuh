@@ -69,7 +69,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
 
   constexpr float rn = 1.f / static_cast<float>(COLS);
   Wvec gamma[LDGS];
-  index_t idx = c + b * params.cols;
+  index_t idx = c + b * Ktraits::VEC_COLS;
 #pragma unroll
   for (int it = 0; it < LDGS; it++) {
     gamma[it].load_from(params.gamma, idx);
@@ -132,6 +132,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
         compute_t dy_tmp = dy[it * NUM_ELTS + jt];
         compute_t y_tmp = y[it * NUM_ELTS + jt];
         compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
+        if (idx == 24576/NUM_ELTS) {
+          printf("BWD %d %d: %f %f %f\n", threadIdx.x, blockIdx.x, dy_tmp, y_tmp, dx_tmp);
+        }
         dx[it].data.elt[jt] = dx_tmp;
       }
       dx[it].store_to(params.dx, idx);
@@ -229,95 +232,101 @@ __global__ __launch_bounds__(Kernel_traits::THREADS_PER_CTA) void ln_bwd_finaliz
   const uint32_t c = bidn * THREADS_PER_WARP + lane;
   const uint32_t c_out = bidn * THREADS_PER_WARP / 2 + lane;
   constexpr uint32_t COL_STRIDE = Kernel_traits::CTAS * THREADS_PER_WARP;
+  const size_t batch_size = params.rows / params.rows_per_sample;
+  const size_t ctas_per_sample = params.ctas_per_col / batch_size;
   for (uint32_t col = c, col_out = c_out; col < Kernel_traits::COLS;
        col += COL_STRIDE, col_out += COL_STRIDE / 2) {
-    // Each thread sums over NUM_ELT columns.
-    Vec<compute_t, NUM_ELT> dbeta_local, dgamma_local;
-    memset(&dgamma_local, 0, sizeof(dgamma_local));
-    memset(&dbeta_local, 0, sizeof(dbeta_local));
-    for (uint32_t row = warp; row < params.ctas_per_col; row += Kernel_traits::ROWS_PER_CTA) {
-      index_t idx = row * Kernel_traits::COLS + col;
-
-      Vec<compute_t, NUM_ELT> dbeta_part, dgamma_part;
-      dbeta_part.load_from(params.dbeta_part, idx);
-      dgamma_part.load_from(params.dgamma_part, idx);
-#pragma unroll
-      for (int it = 0; it < NUM_ELT; it++) {
-        dgamma_local.data.elt[it] += dgamma_part.data.elt[it];
-        dbeta_local.data.elt[it] += dbeta_part.data.elt[it];
-      }
-    }
-
-    void *smem_gamma = smem_;
-    void *smem_beta = &smem_[Kernel_traits::SMEM_BYTES_TRANSPOSE];
-
-    const int write_row = warp;
-    const int write_col = lane ^ write_row;
-    const int write_idx = write_row * THREADS_PER_WARP + write_col;
-
-    dgamma_local.store_to(smem_gamma, write_idx);
-    dbeta_local.store_to(smem_beta, write_idx);
-
-    __syncthreads();
-
-    // It would be probably safe to reuse the first row of smem_beta and smem_gamma
-    void *smem_gamma_out = &smem_[2 * Kernel_traits::SMEM_BYTES_TRANSPOSE];
-    void *smem_beta_out =
-        &smem_[2 * Kernel_traits::SMEM_BYTES_TRANSPOSE + Kernel_traits::SMEM_BYTES_OUTPUT];
-
-    // More than one iter iff ROWS_PER_CTA < 32.
-    for (int w = warp; w < THREADS_PER_WARP; w += Kernel_traits::ROWS_PER_CTA) {
-      const int read_row = lane;
-      const int read_col = w ^ read_row;
-      const int read_idx = read_row * THREADS_PER_WARP + read_col;
-
-      memset(&dbeta_local, 0, sizeof(dbeta_local));
+    for (size_t b = 0; b < batch_size; ++b) {
+      // Each thread sums over NUM_ELT columns.
+      Vec<compute_t, NUM_ELT> dbeta_local, dgamma_local;
       memset(&dgamma_local, 0, sizeof(dgamma_local));
+      memset(&dbeta_local, 0, sizeof(dbeta_local));
+      for (uint32_t row = warp + b * ctas_per_sample;
+           row < (b + 1) * ctas_per_sample;
+           row += Kernel_traits::ROWS_PER_CTA) {
+        index_t idx = row * Kernel_traits::COLS + col;
 
-      // Load beta and gamma transposed
-      if (read_row < Kernel_traits::ROWS_PER_CTA) {
-        dbeta_local.load_from(smem_beta, read_idx);
-        dgamma_local.load_from(smem_gamma, read_idx);
-      }
-
-// Call reducer on the loaded value(s) and convert.
+        Vec<compute_t, NUM_ELT> dbeta_part, dgamma_part;
+        dbeta_part.load_from(params.dbeta_part, idx);
+        dgamma_part.load_from(params.dgamma_part, idx);
 #pragma unroll
-      for (int it = 0; it < NUM_ELT; it++) {
-        compute_t b_i = dbeta_local.data.elt[it];
-        compute_t g_i = dgamma_local.data.elt[it];
-        b_i = reducer.allreduce(b_i, sum);
-        g_i = reducer.allreduce(g_i, sum);
-
-        dgamma_local.data.elt[it] = g_i;
-        dbeta_local.data.elt[it] = b_i;
+        for (int it = 0; it < NUM_ELT; it++) {
+          dgamma_local.data.elt[it] += dgamma_part.data.elt[it];
+          dbeta_local.data.elt[it] += dbeta_part.data.elt[it];
+        }
       }
 
-      // Leader stores the result at the current column.
-      if (lane == 0) {
-        dgamma_local.store_to(smem_gamma_out, w);
-        dbeta_local.store_to(smem_beta_out, w);
-      }
-    }
+      void *smem_gamma = smem_;
+      void *smem_beta = &smem_[Kernel_traits::SMEM_BYTES_TRANSPOSE];
 
-    // All writes done.
-    __syncthreads();
+      const int write_row = warp;
+      const int write_col = lane ^ write_row;
+      const int write_idx = write_row * THREADS_PER_WARP + write_col;
 
-    // Pack and store: 2-wide stores with half the threads.
-    if (warp == Kernel_traits::ROWS_PER_CTA - 1 && lane < THREADS_PER_WARP / 2) {
-      using src_t = typename TypeToVec2<compute_t>::Type;
-      using dst_t = typename TypeToVec2<weight_t>::Type;
-      Vec<src_t, NUM_ELT> dbeta_vec2, dgamma_vec2;
-      Vec<dst_t, NUM_ELT> dbeta_out2, dgamma_out2;
+      dgamma_local.store_to(smem_gamma, write_idx);
+      dbeta_local.store_to(smem_beta, write_idx);
 
-      dgamma_vec2.load_from(smem_gamma_out, lane);
-      dbeta_vec2.load_from(smem_beta_out, lane);
+      __syncthreads();
+
+      // It would be probably safe to reuse the first row of smem_beta and smem_gamma
+      void *smem_gamma_out = &smem_[2 * Kernel_traits::SMEM_BYTES_TRANSPOSE];
+      void *smem_beta_out =
+          &smem_[2 * Kernel_traits::SMEM_BYTES_TRANSPOSE + Kernel_traits::SMEM_BYTES_OUTPUT];
+
+      // More than one iter iff ROWS_PER_CTA < 32.
+      for (int w = warp; w < THREADS_PER_WARP; w += Kernel_traits::ROWS_PER_CTA) {
+        const int read_row = lane;
+        const int read_col = w ^ read_row;
+        const int read_idx = read_row * THREADS_PER_WARP + read_col;
+
+        memset(&dbeta_local, 0, sizeof(dbeta_local));
+        memset(&dgamma_local, 0, sizeof(dgamma_local));
+
+        // Load beta and gamma transposed
+        if (read_row < Kernel_traits::ROWS_PER_CTA) {
+          dbeta_local.load_from(smem_beta, read_idx);
+          dgamma_local.load_from(smem_gamma, read_idx);
+        }
+
+  // Call reducer on the loaded value(s) and convert.
 #pragma unroll
-      for (int it = 0; it < NUM_ELT; it++) {
-        dgamma_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dgamma_vec2.data.elt[it]);
-        dbeta_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dbeta_vec2.data.elt[it]);
+        for (int it = 0; it < NUM_ELT; it++) {
+          compute_t b_i = dbeta_local.data.elt[it];
+          compute_t g_i = dgamma_local.data.elt[it];
+          b_i = reducer.allreduce(b_i, sum);
+          g_i = reducer.allreduce(g_i, sum);
+
+          dgamma_local.data.elt[it] = g_i;
+          dbeta_local.data.elt[it] = b_i;
+        }
+
+        // Leader stores the result at the current column.
+        if (lane == 0) {
+          dgamma_local.store_to(smem_gamma_out, w);
+          dbeta_local.store_to(smem_beta_out, w);
+        }
       }
-      dgamma_out2.store_to(params.dgamma, col_out);
-      dbeta_out2.store_to(params.dbeta, col_out);
+
+      // All writes done.
+      __syncthreads();
+
+      // Pack and store: 2-wide stores with half the threads.
+      if (warp == Kernel_traits::ROWS_PER_CTA - 1 && lane < THREADS_PER_WARP / 2) {
+        using src_t = typename TypeToVec2<compute_t>::Type;
+        using dst_t = typename TypeToVec2<weight_t>::Type;
+        Vec<src_t, NUM_ELT> dbeta_vec2, dgamma_vec2;
+        Vec<dst_t, NUM_ELT> dbeta_out2, dgamma_out2;
+
+        dgamma_vec2.load_from(smem_gamma_out, lane);
+        dbeta_vec2.load_from(smem_beta_out, lane);
+#pragma unroll
+        for (int it = 0; it < NUM_ELT; it++) {
+          dgamma_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dgamma_vec2.data.elt[it]);
+          dbeta_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dbeta_vec2.data.elt[it]);
+        }
+        dgamma_out2.store_to(params.dgamma, col_out + b * params.cols);
+        dbeta_out2.store_to(params.dbeta, col_out + b * params.cols);
+      }
     }
   }
 }
@@ -374,15 +383,20 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_general_kerne
 
   // Load weights
   Cvec gamma[LDGS];
+  const int first_cta_row = bidm * bdimm * params.ctas_per_col;
+  const int last_cta_row = min(static_cast<size_t>((bidm + 1) * bdimm * params.ctas_per_col),
+                               params.rows);
+  const int b = first_cta_row / params.rows_per_sample;
+
 #pragma unroll
   for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && col < params.cols;
        it++, col += gdimn * NUM_ELTS) {
     Wvec gamma_in;
-    gamma_in.load_from_elts(params.gamma, col, params.cols - col);
+    gamma_in.load_from_elts(params.gamma, col + b * params.cols, params.cols - col);
     gamma_in.to(gamma[it]);
   }
 
-  for (int cta_row = bidm * bdimm; cta_row < params.rows; cta_row += gdimm) {
+  for (int cta_row = first_cta_row; cta_row < last_cta_row; cta_row += bdimm) {
     const int row = cta_row + warp_m;
     compute_t mu = 0.f;
     compute_t rs = 0.f;

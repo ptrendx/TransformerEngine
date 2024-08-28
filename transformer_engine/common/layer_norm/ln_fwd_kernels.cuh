@@ -60,7 +60,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
 
   Wvec gamma[LDGS];
   Wvec beta[LDGS];
-  index_t idx = c + b * params.cols;
+  index_t idx = c + b * Ktraits::VEC_COLS;
 #pragma unroll
   for (int it = 0; it < LDGS; ++it) {
     gamma[it].load_from(params.gamma, idx);
@@ -119,6 +119,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
         }
         compute_t b_ij = beta[it].data.elt[jt];
         compute_t temp_output = g_ij * y_ij + b_ij;
+        if (idx == 24576/NUM_ELTS) {
+          printf("%d %d: %f %f %f %f\n", threadIdx.x, blockIdx.x, y_ij, g_ij, b_ij, temp_output);
+        }
 
         if (params.fp8_out) {
           __builtin_assume(amax >= 0);

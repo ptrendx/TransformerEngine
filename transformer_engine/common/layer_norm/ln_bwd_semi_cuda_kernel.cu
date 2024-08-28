@@ -90,7 +90,8 @@ void launch_general_(LaunchParams<BwdParams> &launch_params,
                                                   Kernel_traits::THREADS_PER_CTA, 0);
     const int max_ctas = launch_params.multiprocessorCount * ctas_per_sm;
     ctas_per_row = ceil_div(cols, HIDDEN_SIZE);
-    ctas_per_col = std::min(ceil_div(rows, WARPS_M), max_ctas / ctas_per_row);
+    ctas_per_col = std::max(std::min(ceil_div(rows, WARPS_M), max_ctas / ctas_per_row),
+                            static_cast<int>(rows / launch_params.params.rows_per_sample));
     launch_params.params.ctas_per_row = ctas_per_row;
     launch_params.params.ctas_per_col = ctas_per_col;
 

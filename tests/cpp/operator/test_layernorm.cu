@@ -64,6 +64,9 @@ void compute_ref_output(const InputType *data, const InputType *gamma, const Inp
         g += 1;
       }
       compute_t tmp = (current - mu[i]) * rsigma[i] * g + static_cast<compute_t>(beta[j + b * H]);
+      if (i * H + j == 24576) {
+        std::cout << "REF: " << (current - mu[i]) * rsigma[i] << " " << g << " " << static_cast<compute_t>(beta[j + b * H]) << " " << tmp << std::endl;
+      }
       output[i * H + j] = static_cast<OutputType>(tmp * scale);
       current_max = fmaxf(current_max, fabsf(tmp));
     }
@@ -91,7 +94,7 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
     for (size_t j = 0; j < H; ++j) {
       const compute_t x = static_cast<compute_t>(data[i * H + j]);
       const compute_t y = (x - mu[i]) * rsigma[i];
-      compute_t g = static_cast<compute_t>(gamma[j]);
+      compute_t g = static_cast<compute_t>(gamma[j + b * H]);
       if (zero_centered_gamma) {
         g += 1;
       }
@@ -109,13 +112,16 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
     for (size_t j = 0; j < H; ++j) {
       const compute_t x = static_cast<compute_t>(data[i * H + j]);
       const compute_t y = (x - mu[i]) * rsigma[i];
-      compute_t g = static_cast<compute_t>(gamma[j]);
+      compute_t g = static_cast<compute_t>(gamma[j + b * H]);
       if (zero_centered_gamma) {
         g += 1;
       }
       const compute_t dz = static_cast<compute_t>(output_grad[i * H + j]);
       const compute_t dy = g * dz;
       const compute_t dx = rsigma[i] * (dy - mdyy * y - mdy);
+      if (i * H + j == 24576) {
+        std::cout << dy << " " << y << " " <<  dx << std::endl;
+      }
       data_grad[i * H + j] = static_cast<InputType>(dx);
     }
   }
@@ -144,7 +150,7 @@ void performTest(const size_t B, const size_t N, const size_t H, const bool zero
     return;
   }
 
-  std::vector<size_t> gamma_shape = B == 1 ? std::vector<size_t>{ H } 
+  std::vector<size_t> gamma_shape = B == 1 ? std::vector<size_t>{ H }
                                            : std::vector<size_t>{ B, H };
   Tensor input({ N, H }, itype);
   Tensor z({ N, H }, otype);
@@ -267,7 +273,7 @@ std::vector<std::tuple<size_t, size_t, size_t>> test_cases = {{1, 2048, 12288},
                                                               {2, 768, 1024},
                                                               {2, 256, 65536},
                                                               {2, 128, 6144},
-                                                              {2, 64, 2304},
+                                                              {2, 64, 768},
                                                               {1, 229, 541},   // Primes 50, 100
                                                               {1, 71, 3571},   // Primes 20, 500
                                                               {1, 29, 17389}}; // Primes 10, 2000
@@ -290,7 +296,7 @@ TEST_P(LNTestSuite, TestLN) {
 
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
       TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
-        performTest<InputType, OutputType>(size.get<0>(), size.get<1>(), size.get<2>(), zero_centered_gamma);
+        performTest<InputType, OutputType>(std::get<0>(size), std::get<1>(size), std::get<2>(size), zero_centered_gamma);
       );
     );
 }
@@ -306,8 +312,9 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<LNTestSuite::ParamType>& info) {
       std::string name = test::typeName(std::get<0>(info.param)) + "X" +
                          test::typeName(std::get<1>(info.param)) + "X" +
-                         std::to_string(std::get<2>(info.param).first) + "X" +
-                         std::to_string(std::get<2>(info.param).second) + "X" +
+                         std::to_string(std::get<0>(std::get<2>(info.param))) + "X" +
+                         std::to_string(std::get<1>(std::get<2>(info.param))) + "X" +
+                         std::to_string(std::get<2>(std::get<2>(info.param))) + "X" +
                          std::to_string(std::get<3>(info.param));
       return name;
     });
