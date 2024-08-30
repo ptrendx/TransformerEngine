@@ -329,9 +329,6 @@ __global__ __launch_bounds__(Kernel_traits::THREADS_PER_CTA) void ln_bwd_finaliz
           dgamma_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dgamma_vec2.data.elt[it]);
           dbeta_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dbeta_vec2.data.elt[it]);
         }
-        if (col_out + b * Kernel_traits::COLS / 2 == 768 / (NUM_ELT * 2)) {
-          printf("%d %d\n", threadIdx.x, blockIdx.x);
-        }
         dgamma_out2.store_to(params.dgamma, col_out + b * Kernel_traits::COLS / 2);
         dbeta_out2.store_to(params.dbeta, col_out + b * Kernel_traits::COLS / 2);
       }

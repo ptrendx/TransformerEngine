@@ -65,9 +65,6 @@ void compute_ref_output(const InputType *data, const InputType *gamma, const Inp
         g += 1;
       }
       compute_t tmp = (current - mu[i]) * rsigma[i] * g + static_cast<compute_t>(beta[j + b * H]);
-      if (i * H + j == 458752) {
-        std::cout << "REF: " << (current - mu[i]) * rsigma[i] << " " << g << " " << static_cast<compute_t>(beta[j + b * H]) << " " << tmp << std::endl;
-      }
       output[i * H + j] = static_cast<OutputType>(tmp * scale);
       current_max = fmaxf(current_max, fabsf(tmp));
     }
@@ -102,9 +99,6 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
       }
       const compute_t dz = static_cast<compute_t>(output_grad[i * H + j]);
       const compute_t dy = g * dz;
-      // if (j + b * H == 0) {
-        // std::cout << "REF adding row " << i << ": " << y * dz << std::endl;
-      // }
       dgamma[j + b * H] += y * dz;
       dbeta[j + b * H] += dz;
       mdy += dy;
@@ -124,9 +118,6 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
       const compute_t dz = static_cast<compute_t>(output_grad[i * H + j]);
       const compute_t dy = g * dz;
       const compute_t dx = rsigma[i] * (dy - mdyy * y - mdy);
-      if (i * H + j == 24576) {
-        std::cout << dy << " " << y << " " <<  dx << std::endl;
-      }
       data_grad[i * H + j] = static_cast<InputType>(dx);
     }
   }
