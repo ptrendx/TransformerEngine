@@ -26,6 +26,8 @@ void launch_tuned_(LaunchParams<BwdParams> &launch_params,
     launch_params.params.ctas_per_row = CTAS_PER_ROW;
     launch_params.params.ctas_per_col =
         launch_params.multiprocessorCount * ctas_per_sm / launch_params.params.ctas_per_row;
+    launch_params.params.ctas_per_col -= launch_params.params.ctas_per_col % launch_params.params.batch_size;
+
     launch_params.barrier_size = 0;
     launch_params.workspace_bytes = 0;
     if (Kernel_traits::CTAS_PER_ROW > 1) {
@@ -90,8 +92,7 @@ void launch_general_(LaunchParams<BwdParams> &launch_params,
                                                   Kernel_traits::THREADS_PER_CTA, 0);
     const int max_ctas = launch_params.multiprocessorCount * ctas_per_sm;
     ctas_per_row = ceil_div(cols, HIDDEN_SIZE);
-    ctas_per_col = std::max(std::min(ceil_div(rows, WARPS_M), max_ctas / ctas_per_row),
-                            static_cast<int>(rows / launch_params.params.rows_per_sample));
+    ctas_per_col = std::min(ceil_div(rows, WARPS_M), max_ctas / ctas_per_row);
     launch_params.params.ctas_per_row = ctas_per_row;
     launch_params.params.ctas_per_col = ctas_per_col;
 
@@ -185,6 +186,12 @@ REGISTER_BWD_TUNED_LAUNCHER(2048, fp16, fp32, fp16, fp32, 1, 1, 4, 16, 4);
 REGISTER_BWD_TUNED_LAUNCHER(2048, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 REGISTER_BWD_TUNED_LAUNCHER(2048, bf16, fp32, bf16, fp32, 1, 1, 4, 16, 4);
 
+REGISTER_BWD_TUNED_LAUNCHER(2560, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
+REGISTER_BWD_TUNED_LAUNCHER(2560, fp16, fp16, fp16, fp32, 1, 1, 4, 8, 4);
+REGISTER_BWD_TUNED_LAUNCHER(2560, fp16, fp32, fp16, fp32, 1, 1, 4, 16, 4);
+REGISTER_BWD_TUNED_LAUNCHER(2560, bf16, bf16, bf16, fp32, 1, 1, 4, 8, 4);
+REGISTER_BWD_TUNED_LAUNCHER(2560, bf16, fp32, bf16, fp32, 1, 1, 4, 16, 4);
+
 REGISTER_BWD_TUNED_LAUNCHER(2304, fp32, fp32, fp32, fp32, 1, 1, 4, 8, 4);
 REGISTER_BWD_TUNED_LAUNCHER(2304, fp16, fp16, fp16, fp32, 1, 1, 4, 4, 4);
 REGISTER_BWD_TUNED_LAUNCHER(2304, fp16, fp32, fp16, fp32, 1, 1, 4, 8, 4);
@@ -196,6 +203,12 @@ REGISTER_BWD_TUNED_LAUNCHER(3072, fp16, fp16, fp16, fp32, 1, 1, 4, 16, 4);
 REGISTER_BWD_TUNED_LAUNCHER(3072, fp16, fp32, fp16, fp32, 1, 1, 4, 16, 4);
 REGISTER_BWD_TUNED_LAUNCHER(3072, bf16, bf16, bf16, fp32, 1, 1, 4, 16, 4);
 REGISTER_BWD_TUNED_LAUNCHER(3072, bf16, fp32, bf16, fp32, 1, 1, 4, 16, 4);
+
+REGISTER_BWD_TUNED_LAUNCHER(3584, fp32, fp32, fp32, fp32, 1, 1, 4, 16, 4);
+REGISTER_BWD_TUNED_LAUNCHER(3584, fp16, fp16, fp16, fp32, 1, 1, 4, 8, 4);
+REGISTER_BWD_TUNED_LAUNCHER(3584, fp16, fp32, fp16, fp32, 1, 1, 4, 16, 4);
+REGISTER_BWD_TUNED_LAUNCHER(3584, bf16, bf16, bf16, fp32, 1, 1, 4, 8, 4);
+REGISTER_BWD_TUNED_LAUNCHER(3584, bf16, fp32, bf16, fp32, 1, 1, 4, 16, 4);
 
 REGISTER_BWD_TUNED_LAUNCHER(3840, fp32, fp32, fp32, fp32, 1, 1, 4, 8, 4);
 REGISTER_BWD_TUNED_LAUNCHER(3840, fp16, fp16, fp16, fp32, 1, 1, 4, 4, 4);

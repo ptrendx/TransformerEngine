@@ -42,15 +42,21 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
   const index_t tidx = threadIdx.x;
   const index_t bidn = blockIdx.x % CTAS_PER_ROW;
   const index_t bidm = blockIdx.x / CTAS_PER_ROW;
+  const index_t blocks_per_sample = params.ctas_per_col / params.batch_size;
+  const index_t b = bidm / blocks_per_sample;
+  const index_t bidb = bidm % blocks_per_sample;
+  const index_t batch_start = params.batch_stride * b;
+  const index_t batch_period = params.batch_stride == 1 ? params.batch_size : 1;
+  const index_t batch_end = params.batch_stride == 1 ? params.rows
+                                                     : params.batch_stride * (b + 1);
   const index_t lane = tidx % THREADS_PER_WARP;
   const index_t warp = tidx / THREADS_PER_WARP;
   const index_t warp_m = warp / Ktraits::WARPS_N;
   const index_t warp_n = warp % Ktraits::WARPS_N;
   const index_t tid_r = warp_n * THREADS_PER_WARP + lane;
 
-  const index_t r = bidm * Ktraits::ROWS_PER_CTA + warp_m;
+  const index_t r = (bidb * Ktraits::ROWS_PER_CTA + warp_m) * batch_period + batch_start;
   const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
-  const index_t b = r / params.rows_per_sample;
 
   static_assert(COLS == THREADS_PER_ROW * LDGS * NUM_ELTS * CTAS_PER_ROW);
 
@@ -79,7 +85,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
 // last blocks with syncthreads!
 // grid stride over rows
 #pragma unroll 1
-  for (int row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+  for (int row = r;
+       row < batch_end;
+       row += blocks_per_sample * ROWS_PER_CTA * batch_period) {
     const compute_t mu_r = static_cast<const compute_t *>(params.mu)[row];
     const compute_t rs_r = static_cast<const compute_t *>(params.rs)[row];
     Ivec x[LDGS];
@@ -132,9 +140,6 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
         compute_t dy_tmp = dy[it * NUM_ELTS + jt];
         compute_t y_tmp = y[it * NUM_ELTS + jt];
         compute_t dx_tmp = rs_r * (dy_tmp - (mdyy_local * y_tmp + mdy_local));
-        if (idx == 24576/NUM_ELTS) {
-          printf("BWD %d %d: %f %f %f\n", threadIdx.x, blockIdx.x, dy_tmp, y_tmp, dx_tmp);
-        }
         dx[it].data.elt[jt] = dx_tmp;
       }
       dx[it].store_to(params.dx, idx);
@@ -143,7 +148,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_tuned_kernel(
   }  // end: grid stride loop
 
   if (WARPS_M == 1) {
-    idx = r * Ktraits::VEC_COLS + c;
+    idx = bidm * Ktraits::CTAS_PER_ROW * Ktraits::VEC_COLS + c;
 #pragma unroll
     for (int it = 0; it < LDGS; it++) {
       dz_sum[it].store_to(params.dbeta_part, idx);
@@ -232,7 +237,7 @@ __global__ __launch_bounds__(Kernel_traits::THREADS_PER_CTA) void ln_bwd_finaliz
   const uint32_t c = bidn * THREADS_PER_WARP + lane;
   const uint32_t c_out = bidn * THREADS_PER_WARP / 2 + lane;
   constexpr uint32_t COL_STRIDE = Kernel_traits::CTAS * THREADS_PER_WARP;
-  const size_t batch_size = params.rows / params.rows_per_sample;
+  const size_t batch_size = params.batch_size;
   const size_t ctas_per_sample = params.ctas_per_col / batch_size;
   for (uint32_t col = c, col_out = c_out; col < Kernel_traits::COLS;
        col += COL_STRIDE, col_out += COL_STRIDE / 2) {
@@ -324,8 +329,11 @@ __global__ __launch_bounds__(Kernel_traits::THREADS_PER_CTA) void ln_bwd_finaliz
           dgamma_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dgamma_vec2.data.elt[it]);
           dbeta_out2.data.elt[it] = Converter<src_t, dst_t>::convert(dbeta_vec2.data.elt[it]);
         }
-        dgamma_out2.store_to(params.dgamma, col_out + b * params.cols);
-        dbeta_out2.store_to(params.dbeta, col_out + b * params.cols);
+        if (col_out + b * Kernel_traits::COLS / 2 == 768 / (NUM_ELT * 2)) {
+          printf("%d %d\n", threadIdx.x, blockIdx.x);
+        }
+        dgamma_out2.store_to(params.dgamma, col_out + b * Kernel_traits::COLS / 2);
+        dbeta_out2.store_to(params.dbeta, col_out + b * Kernel_traits::COLS / 2);
       }
     }
   }
@@ -386,7 +394,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_bwd_general_kerne
   const int first_cta_row = bidm * bdimm * params.ctas_per_col;
   const int last_cta_row = min(static_cast<size_t>((bidm + 1) * bdimm * params.ctas_per_col),
                                params.rows);
-  const int b = first_cta_row / params.rows_per_sample;
+  const int b = first_cta_row / params.batch_stride % params.batch_size;
 
 #pragma unroll
   for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && col < params.cols;

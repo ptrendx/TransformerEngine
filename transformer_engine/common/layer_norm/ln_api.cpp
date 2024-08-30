@@ -45,7 +45,8 @@ void layernorm_fwd(const Tensor& x,      // BxSxhidden_size
   using namespace transformer_engine;
 
   NVTE_CHECK(x.data.shape.size() == 2);
-  NVTE_CHECK(gamma.data.shape.size() <= 2);
+  NVTE_CHECK(gamma.data.shape.size() == 1 ||
+             gamma.data.shape.size() == 3);
   NVTE_CHECK(gamma.data.shape == beta.data.shape);
   NVTE_CHECK(x.data.shape[1] == gamma.data.shape[gamma.data.shape.size() - 1]);
 
@@ -91,7 +92,8 @@ void layernorm_bwd(const Tensor& dz, const Tensor& x, const Tensor& mu, const Te
   NVTE_CHECK(mu.data.shape[0] == x.data.shape[0]);
   NVTE_CHECK(mu.data.shape == rsigma.data.shape);
 
-  NVTE_CHECK(gamma.data.shape.size() <= 2);
+  NVTE_CHECK(gamma.data.shape.size() == 1 ||
+             gamma.data.shape.size() == 3);
   NVTE_CHECK(x.data.shape[1] == gamma.data.shape[gamma.data.shape.size() - 1]);
 
   NVTE_CHECK(dx->data.shape == x.data.shape);

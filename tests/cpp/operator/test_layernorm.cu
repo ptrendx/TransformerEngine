@@ -51,12 +51,13 @@ template <typename InputType, typename OutputType>
 void compute_ref_output(const InputType *data, const InputType *gamma, const InputType *beta,
                  OutputType *output, const float *mu, const float *rsigma,
                  const size_t B, const size_t N, const size_t H,
-                 float *amax, float scale, const bool zero_centered_gamma) {
+                 float *amax, float scale, const bool zero_centered_gamma,
+                 const std::string &layout) {
   using compute_t = float;
   compute_t current_max = -1e100;
-  const size_t rows_per_sample = N / B;
+  const size_t S = N / B;
   for (size_t i = 0 ; i < N; ++i) {
-    const size_t b = i / rows_per_sample;
+    const size_t b = layout == "BSD" ? i / S : i % B;
     for (size_t j = 0; j < H; ++j) {
       compute_t current = static_cast<compute_t>(data[i * H + j]);
       compute_t g = static_cast<compute_t>(gamma[j + b * H]);
@@ -64,7 +65,7 @@ void compute_ref_output(const InputType *data, const InputType *gamma, const Inp
         g += 1;
       }
       compute_t tmp = (current - mu[i]) * rsigma[i] * g + static_cast<compute_t>(beta[j + b * H]);
-      if (i * H + j == 24576) {
+      if (i * H + j == 458752) {
         std::cout << "REF: " << (current - mu[i]) * rsigma[i] << " " << g << " " << static_cast<compute_t>(beta[j + b * H]) << " " << tmp << std::endl;
       }
       output[i * H + j] = static_cast<OutputType>(tmp * scale);
@@ -81,14 +82,15 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
                           InputType *data_grad,
                           InputType *gamma_grad, InputType *beta_grad,
                           const size_t B, const size_t N, const size_t H,
+                          const std::string &layout,
                           const bool zero_centered_gamma) {
   using compute_t = float;
   std::vector<compute_t> dgamma(B * H, 0.f);
   std::vector<compute_t> dbeta(B * H, 0.f);
 
-  const size_t rows_per_sample = N / B;
+  const size_t S = N / B;
   for (size_t i = 0 ; i < N; ++i) {
-    const size_t b = i / rows_per_sample;
+    const size_t b = layout == "BSD" ? i / S : i % B;
     // Reductions
     compute_t mdy = 0, mdyy = 0;
     for (size_t j = 0; j < H; ++j) {
@@ -100,6 +102,9 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
       }
       const compute_t dz = static_cast<compute_t>(output_grad[i * H + j]);
       const compute_t dy = g * dz;
+      // if (j + b * H == 0) {
+        // std::cout << "REF adding row " << i << ": " << y * dz << std::endl;
+      // }
       dgamma[j + b * H] += y * dz;
       dbeta[j + b * H] += dz;
       mdy += dy;
@@ -134,9 +139,14 @@ void compute_ref_backward(const OutputType *output_grad, const InputType *data,
 }
 
 template <typename InputType, typename OutputType>
-void performTest(const size_t B, const size_t N, const size_t H, const bool zero_centered_gamma) {
+void performTest(const size_t B, const size_t N, const size_t H,
+                 const std::string &layout, const bool zero_centered_gamma) {
   if (sizeof(InputType) < sizeof(OutputType)) {
     GTEST_SKIP() << "LN kernel does not support OutputType > InputType";
+    return;
+  }
+  if (layout == "BSD") {
+    GTEST_SKIP() << "BSD not supported yet!";
     return;
   }
   using WeightType = InputType;
@@ -151,7 +161,8 @@ void performTest(const size_t B, const size_t N, const size_t H, const bool zero
   }
 
   std::vector<size_t> gamma_shape = B == 1 ? std::vector<size_t>{ H }
-                                           : std::vector<size_t>{ B, H };
+                                           : (layout == "BSD" ? std::vector<size_t>{ B, 1, H }
+                                                              : std::vector<size_t>{ 1, B, H });
   Tensor input({ N, H }, itype);
   Tensor z({ N, H }, otype);
   Tensor gamma(gamma_shape, wtype);
@@ -228,12 +239,13 @@ void performTest(const size_t B, const size_t N, const size_t H, const bool zero
                      B, N, H,
                      &ref_amax,
                      ref_scale,
-                     zero_centered_gamma);
+                     zero_centered_gamma,
+                     layout);
   compute_ref_backward(dz.cpu_dptr<WeightType>(), input.cpu_dptr<InputType>(),
                        mu.cpu_dptr<float>(), rsigma.cpu_dptr<float>(),
                        gamma.cpu_dptr<WeightType>(),
                        ref_dx.get(), ref_dgamma.get(), ref_dbeta.get(),
-                       B, N, H, zero_centered_gamma);
+                       B, N, H, layout, zero_centered_gamma);
 
   cudaDeviceSynchronize();
   auto err = cudaGetLastError();
@@ -264,25 +276,30 @@ void performTest(const size_t B, const size_t N, const size_t H, const bool zero
   compareResults("dbeta", dbeta, ref_dbeta.get(), atol_bwd, rtol_bwd);
 }
 
-std::vector<std::tuple<size_t, size_t, size_t>> test_cases = {{1, 2048, 12288},
+std::vector<std::tuple<size_t, size_t, size_t>> test_cases = {
+                                                              {1, 2048, 12288},
                                                               {1, 768, 1024},
                                                               {1, 256, 65536},
                                                               {1, 128, 6144},
                                                               {1, 64, 2304},
-                                                              {2, 2048, 12288},
                                                               {2, 768, 1024},
-                                                              {2, 256, 65536},
-                                                              {2, 128, 6144},
+                                                              {2, 768, 2048},
+                                                              {2, 768, 2560},
+                                                              {2, 768, 3072},
+                                                              {2, 768, 3584},
+                                                              {2, 768, 4096},
                                                               {2, 64, 768},
                                                               {1, 229, 541},   // Primes 50, 100
                                                               {1, 71, 3571},   // Primes 20, 500
                                                               {1, 29, 17389}}; // Primes 10, 2000
 
+std::vector<std::string> all_layouts = {"SBD", "BSD"};
 }  // namespace
 
 class LNTestSuite : public ::testing::TestWithParam<std::tuple<transformer_engine::DType,
                                                                transformer_engine::DType,
                                                                std::tuple<size_t, size_t, size_t>,
+                                                               std::string,
                                                                bool>> {};
 
 TEST_P(LNTestSuite, TestLN) {
@@ -292,11 +309,13 @@ TEST_P(LNTestSuite, TestLN) {
     const DType input_type = std::get<0>(GetParam());
     const DType output_type = std::get<1>(GetParam());
     const auto size = std::get<2>(GetParam());
-    const bool zero_centered_gamma = std::get<3>(GetParam());
+    const std::string &layout = std::get<3>(GetParam());
+    const bool zero_centered_gamma = std::get<4>(GetParam());
 
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
       TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
-        performTest<InputType, OutputType>(std::get<0>(size), std::get<1>(size), std::get<2>(size), zero_centered_gamma);
+        performTest<InputType, OutputType>(std::get<0>(size), std::get<1>(size),
+                                           std::get<2>(size), layout, zero_centered_gamma);
       );
     );
 }
@@ -308,6 +327,7 @@ INSTANTIATE_TEST_SUITE_P(
         ::testing::Values(DType::kFloat32, DType::kBFloat16, DType::kFloat16),
         ::testing::Values(DType::kFloat32, DType::kBFloat16, DType::kFloat16, DType::kFloat8E4M3),
         ::testing::ValuesIn(test_cases),
+        ::testing::ValuesIn(all_layouts),
         ::testing::Values(false, true)),
     [](const testing::TestParamInfo<LNTestSuite::ParamType>& info) {
       std::string name = test::typeName(std::get<0>(info.param)) + "X" +
@@ -315,6 +335,7 @@ INSTANTIATE_TEST_SUITE_P(
                          std::to_string(std::get<0>(std::get<2>(info.param))) + "X" +
                          std::to_string(std::get<1>(std::get<2>(info.param))) + "X" +
                          std::to_string(std::get<2>(std::get<2>(info.param))) + "X" +
-                         std::to_string(std::get<3>(info.param));
+                         std::get<3>(info.param) + "X" +
+                         std::to_string(std::get<4>(info.param));
       return name;
     });

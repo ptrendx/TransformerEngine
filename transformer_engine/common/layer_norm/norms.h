@@ -35,7 +35,9 @@ struct ParamsBase {
       : ctas_per_col(0),
         rows(0),
         cols(0),
-        rows_per_sample(0),
+        adaptive(false),
+        batch_size(0),
+        batch_stride(0),
         x(nullptr),
         mu(nullptr),
         rs(nullptr),
@@ -52,7 +54,9 @@ struct ParamsBase {
   // Input is interpreted as matrix. We normalize across columns.
   size_t rows;
   size_t cols;
-  size_t rows_per_sample;
+  bool adaptive;
+  size_t batch_size;
+  size_t batch_stride;
 
   // Common data pointers.
   void* x;

@@ -51,7 +51,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
 
   const index_t r = bidm * ROWS_PER_CTA + warp_m;
   const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
-  const index_t b = r / params.rows_per_sample;
+  const index_t b = r / params.batch_stride % params.batch_size;
 
   Stats stats(params, bidm, bidn, warp_m, warp_n, lane, smem_);
 
@@ -119,7 +119,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
         }
         compute_t b_ij = beta[it].data.elt[jt];
         compute_t temp_output = g_ij * y_ij + b_ij;
-        if (idx == 24576/NUM_ELTS) {
+        if (idx == 458752/NUM_ELTS) {
           printf("%d %d: %f %f %f %f\n", threadIdx.x, blockIdx.x, y_ij, g_ij, b_ij, temp_output);
         }
 
@@ -210,7 +210,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_general_kerne
 
   for (size_t cta_row = bidm * bdimm; cta_row < params.rows; cta_row += gdimm) {
     const int row = cta_row + warp_m;
-    const size_t new_b = row / params.rows_per_sample;
+    const index_t new_b = row / params.batch_stride % params.batch_size;
     if (new_b != b) {
 #pragma unroll
       for (int it = 0, col = gidn * NUM_ELTS; it < LDGS && col < params.cols;
