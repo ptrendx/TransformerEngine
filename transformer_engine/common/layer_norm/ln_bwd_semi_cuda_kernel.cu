@@ -26,6 +26,7 @@ void launch_tuned_(LaunchParams<BwdParams> &launch_params,
     launch_params.params.ctas_per_row = CTAS_PER_ROW;
     launch_params.params.ctas_per_col =
         launch_params.multiprocessorCount * ctas_per_sm / launch_params.params.ctas_per_row;
+    NVTE_CHECK(launch_params.params.ctas_per_col >= launch_params.params.batch_size);
     launch_params.params.ctas_per_col -= launch_params.params.ctas_per_col % launch_params.params.batch_size;
 
     launch_params.barrier_size = 0;

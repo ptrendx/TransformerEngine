@@ -44,14 +44,20 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
   const index_t tidx = threadIdx.x;
   const index_t bidn = blockIdx.x % CTAS_PER_ROW;
   const index_t bidm = blockIdx.x / CTAS_PER_ROW;
+  const index_t blocks_per_sample = params.ctas_per_col / params.batch_size;
+  const index_t b = bidm / blocks_per_sample;
+  const index_t bidb = bidm % blocks_per_sample;
+  const index_t batch_start = params.batch_stride * b;
+  const index_t batch_period = params.batch_stride == 1 ? params.batch_size : 1;
+  const index_t batch_end = params.batch_stride == 1 ? params.rows
+                                                     : params.batch_stride * (b + 1);
   const index_t lane = tidx % THREADS_PER_WARP;
   const index_t warp = tidx / THREADS_PER_WARP;
   const index_t warp_m = warp / WARPS_N;
   const index_t warp_n = warp % WARPS_N;
 
-  const index_t r = bidm * ROWS_PER_CTA + warp_m;
+  const index_t r = (bidb * Ktraits::ROWS_PER_CTA + warp_m) * batch_period + batch_start;
   const index_t c = bidn * THREADS_PER_ROW + warp_n * THREADS_PER_WARP + lane;
-  const index_t b = r / params.batch_stride % params.batch_size;
 
   Stats stats(params, bidm, bidn, warp_m, warp_n, lane, smem_);
 
@@ -76,7 +82,9 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA) void ln_fwd_tuned_kernel(
   }
   compute_t amax = 0;
 
-  for (size_t row = r; row < params.rows; row += params.ctas_per_col * ROWS_PER_CTA) {
+  for (int row = r;
+       row < batch_end;
+       row += blocks_per_sample * ROWS_PER_CTA * batch_period) {
     Ivec x[LDGS];
     index_t idx = row * Ktraits::VEC_COLS + c;
     compute_t xf[LDGS * NUM_ELTS];

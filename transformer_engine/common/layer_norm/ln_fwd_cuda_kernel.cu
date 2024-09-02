@@ -26,6 +26,9 @@ void launch_tuned_(LaunchParams<FwdParams> &launch_params,
     launch_params.params.ctas_per_row = CTAS_PER_ROW;
     launch_params.params.ctas_per_col =
         launch_params.multiprocessorCount * ctas_per_sm / launch_params.params.ctas_per_row;
+    NVTE_CHECK(launch_params.params.ctas_per_col >= launch_params.params.batch_size);
+    launch_params.params.ctas_per_col -= launch_params.params.ctas_per_col %
+                                         launch_params.params.batch_size;
     launch_params.barrier_size = 0;
     launch_params.workspace_bytes = 0;
     if (Kernel_traits::CTAS_PER_ROW > 1) {
@@ -44,6 +47,7 @@ void launch_tuned_(LaunchParams<FwdParams> &launch_params,
   auto stream = launch_params.stream;
   auto ctas_per_col = launch_params.params.ctas_per_col;
   auto ctas_per_row = launch_params.params.ctas_per_row;
+
 
   if (ctas_per_row == 1) {
     kernel<<<ctas_per_col, Kernel_traits::THREADS_PER_CTA, Kernel_traits::SMEM_BYTES_FWD, stream>>>(
