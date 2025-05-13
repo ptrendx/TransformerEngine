@@ -10,6 +10,7 @@
 #include <string>
 
 #include "../common.h"
+#include "ATen/ops/split_with_sizes.h"
 #include "common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
@@ -17,6 +18,7 @@
 #include "pybind.h"
 #include "transformer_engine/transformer_engine.h"
 #include "util.h"
+#include <nvtx3/nvToolsExt.h>
 
 namespace {
 
@@ -76,6 +78,68 @@ bool checkGemmShape(const std::vector<size_t>& expected, const NVTEShape& actual
     if (expected[i] != actual.data[i]) return false;
   }
   return true;
+}
+
+std::pair<std::vector<size_t>, std::vector<size_t>> createSplits(
+    const NVTEShape& full_shape,
+    const std::optional<std::vector<size_t>>& splits_first_dim,
+    const std::optional<std::vector<size_t>>& splits_last_dim,
+    const size_t num_splits, const bool transpose) {
+  std::pair<std::vector<size_t>, std::vector<size_t>> ret;
+  int first_dim_index = transpose ? 1 : 0;
+  int last_dim_index = 1 - first_dim_index;
+  NVTE_CHECK(full_shape.ndim == 2, "Expected 2-dimensional input. Got ",
+             full_shape.ndim, " dimensions.");
+  if (splits_first_dim != std::nullopt) {
+    NVTE_CHECK(splits_first_dim->size() == num_splits,
+               "Provided splits need to be either a list of size num_gemms or None, got ",
+               *splits_first_dim);
+    ret.first = *splits_first_dim;
+  } else {
+    size_t first_dim = full_shape.data[first_dim_index];
+    if (splits_last_dim == std::nullopt && first_dim_index == 0) {
+      // Both splits are None, divide [Nm, k] into N [m, k] matrices
+      NVTE_CHECK(first_dim % num_splits,
+                 "The first dimension ", first_dim, " cannot be split into ",
+                 num_splits, " parts.");
+      ret.first = std::vector<size_t>(num_splits, first_dim / num_splits);
+    } else {
+      // Second split exists or the tensor is transposed,
+      // so the first dimension stays the same
+      ret.first = std::vector<size_t>(num_splits, first_dim);
+    }
+  }
+  if (splits_last_dim != std::nullopt) {
+    NVTE_CHECK(splits_last_dim->size() == num_splits,
+               "Provided splits need to be either a list of size num_gemms or None, got ",
+               *splits_last_dim);
+    ret.second = *splits_last_dim;
+  } else {
+    size_t last_dim = full_shape.data[last_dim_index];
+    if (splits_first_dim == std::nullopt && last_dim_index == 0) {
+      // Both splits are None, divide [Nm, k] into N [m, k] matrices
+      NVTE_CHECK(last_dim % num_splits,
+                 "The last dimension in transposed matrix ", last_dim, " cannot be split into ",
+                 num_splits, " parts.");
+      ret.second = std::vector<size_t>(num_splits, last_dim / num_splits);
+    } else {
+      // If possible, we are splitting the first dimension
+      ret.second = std::vector<size_t>(num_splits, last_dim);
+    }
+  }
+
+  return ret;
+}
+
+std::vector<NVTETensor> makeTransformerEngineTensorSplit(
+    const TensorWrapper& t,
+    const std::vector<size_t>& splits_first_dim,
+    const std::vector<size_t>& splits_last_dim,
+    const size_t num_splits) {
+  std::vector<NVTETensor> ret(num_splits, nullptr);
+  nvte_tensor_split(t.data(), splits_first_dim.data(), splits_last_dim.data(),
+                    num_splits, ret.data());
+  return ret;
 }
 
 }  // namespace detail
@@ -324,6 +388,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
+  nvtxRangePush("te_general_grouped_gemm");
   std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
       te_pre_gelu_out_vector, te_workspace_vector;
   std::vector<TensorWrapper> wrappers;
@@ -439,7 +504,248 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
                                   te_workspace_vector.data(), accumulate, use_split_accumulator,
                                   math_sm_count, at::cuda::getCurrentCUDAStream());
   });
+  nvtxRangePop();
   return bias;
 }
 
 }  // namespace transformer_engine::pytorch
+
+std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
+    const size_t num_gemms,
+    std::optional<std::vector<size_t>> m_splits,
+    std::optional<std::vector<size_t>> n_splits,
+    std::optional<std::vector<size_t>> k_splits,
+    bool single_output,
+    std::vector<at::Tensor> bias,
+    transformer_engine::DType bias_type, std::vector<at::Tensor> pre_gelu_out,
+    bool grad, std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
+    bool use_split_accumulator, int math_sm_count) {
+  using namespace transformer_engine;
+  using namespace transformer_engine::pytorch;
+  using transformer_engine::pytorch::detail::createSplits;
+  using transformer_engine::pytorch::detail::getGemmOutputShape;
+  using transformer_engine::pytorch::detail::makeTransformerEngineTensorSplit;
+
+  nvtxRangePush("te_general_grouped_gemm");
+  std::vector<NVTETensor> te_A, te_B, te_D, te_bias,
+      te_pre_gelu_out, te_workspace;
+  // Keep the swizzled scaling factor tensors alive during the GEMMs.
+  std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
+
+  auto none = py::none();
+  if (m_splits != std::nullopt) {
+    NVTE_CHECK(n_splits == std::nullopt && k_splits == std::nullopt,
+               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
+  } else if (n_splits != std::nullopt) {
+    NVTE_CHECK(m_splits == std::nullopt && k_splits == std::nullopt,
+               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
+  } else if (k_splits != std::nullopt) {
+    NVTE_CHECK(m_splits == std::nullopt && n_splits == std::nullopt,
+               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
+  }
+
+  nvtxRangePush("Prepare A");
+  if (A.size() == num_gemms) {
+    te_A.reserve(num_gemms);
+
+    if (m_splits == std::nullopt) {
+      m_splits = std::vector<size_t>();
+      m_splits->reserve(num_gemms);
+    }
+    if (k_splits == std::nullopt) {
+      k_splits = std::vector<size_t>();
+      k_splits->reserve(num_gemms);
+    }
+    for (size_t i = 0; i < A.size(); ++i) {
+      auto wrapper = makeTransformerEngineTensor(A[i], none);
+      swizzled_scale_inverses_list.emplace_back(swizzle_scaling_factors(wrapper, transa));
+      NVTETensor t = wrapper.owned_data();
+      te_A.emplace_back(t);
+      const NVTEShape& s = nvte_tensor_shape(t);
+      int m_dim = transa ? 0 : 1;
+      int k_dim = 1 - m_dim;
+      if (m_splits->size() <= i) {
+        m_splits->emplace_back(s.data[m_dim]);
+      } else {
+        NVTE_CHECK((*m_splits)[i] == s.data[m_dim]);
+      }
+      if (k_splits->size() <= i) {
+        k_splits->emplace_back(s.data[k_dim]);
+      } else {
+        NVTE_CHECK((*k_splits)[i] == s.data[k_dim]);
+      }
+    }
+  } else {
+    NVTE_CHECK(A.size() == 1,
+                 "Grouped GEMM expects the A input to be a list of either "
+                 "1 or num_gemms tensors. Got ",
+                 A.size(), " elements, while num_gemms is ", num_gemms, ".");
+    const auto& temp_wrapper = makeTransformerEngineTensor(A[0], none);
+    std::tie(k_splits, m_splits) = createSplits(temp_wrapper.shape(), k_splits,
+                                                m_splits, num_gemms, transa);
+    te_A = makeTransformerEngineTensorSplit(temp_wrapper, 
+                                            transa ? *m_splits : *k_splits,
+                                            transa ? *k_splits : *m_splits,
+                                            num_gemms);
+    for (auto& t : te_A) {
+      TensorWrapper wrapper(t);
+      swizzled_scale_inverses_list.emplace_back(swizzle_scaling_factors(wrapper, transa));
+      t = wrapper.owned_data();
+    }
+  }
+  nvtxRangePop();
+  nvtxRangePush("Prepare B");
+  if (B.size() == num_gemms) {
+    te_B.reserve(num_gemms);
+    if (n_splits == std::nullopt) {
+      n_splits = std::vector<size_t>();
+      n_splits->reserve(num_gemms);
+    }
+    if (k_splits == std::nullopt) {
+      k_splits = std::vector<size_t>();
+      k_splits->reserve(num_gemms);
+    }
+    for (size_t i = 0; i < B.size(); ++i) {
+      NVTETensor t = makeTransformerEngineTensor(B[i], none).owned_data();
+      te_B.emplace_back(t);
+      const NVTEShape& s = nvte_tensor_shape(t);
+      int n_dim = transb ? 1 : 0;
+      int k_dim = 1 - n_dim;
+      if (n_splits->size() <= i) {
+        n_splits->emplace_back(s.data[n_dim]);
+      } else {
+        NVTE_CHECK((*n_splits)[i] == s.data[n_dim]);
+      }
+      if (k_splits->size() <= i) {
+        k_splits->emplace_back(s.data[k_dim]);
+      } else {
+        NVTE_CHECK((*k_splits)[i] == s.data[k_dim]);
+      }
+    }
+  } else {
+    NVTE_CHECK(B.size() == 1,
+                 "Grouped GEMM expects the B input to be a list of either "
+                 "1 or num_gemms tensors. Got ",
+                 B.size(), " elements, while num_gemms is ", num_gemms, ".");
+    const auto& temp_wrapper = makeTransformerEngineTensor(B[0], none);
+    std::tie(n_splits, k_splits) = createSplits(temp_wrapper.shape(), n_splits,
+                                                k_splits, num_gemms, transb);
+    te_B = makeTransformerEngineTensorSplit(temp_wrapper,
+                                            transb ? *k_splits : *n_splits,
+                                            transb ? *n_splits : *k_splits,
+                                            num_gemms);
+    for (auto& t : te_B) {
+      TensorWrapper wrapper(t);
+      swizzled_scale_inverses_list.emplace_back(swizzle_scaling_factors(wrapper, !transb));
+      t = wrapper.owned_data();
+    }
+  }
+  nvtxRangePop();
+
+  // m_splits, n_splits, k_splits ready
+  // te_A, te_B ready
+
+  nvtxRangePush("gelu and bias");
+  for (size_t i = 0; i < num_gemms; i++) {
+    te_bias.emplace_back(makeTransformerEngineTensor(bias[i]).owned_data());
+
+    const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
+                                ? std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0))}
+                                : std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0)),
+                                                      static_cast<size_t>(pre_gelu_out[i].size(1))};
+
+    DType gelu_type = bias_type;
+    te_pre_gelu_out.emplace_back(
+        makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type).owned_data());
+  }
+  nvtxRangePop();
+
+  // te_bias, te_pre_gelu_out ready
+
+  nvtxRangePush("workspace");
+  for (size_t i = 0; i < workspace.size(); i++) {
+    auto wsp = makeTransformerEngineTensor(workspace[i].data_ptr(),
+                                           std::vector<size_t>{workspaceSize}, DType::kByte);
+    te_workspace.emplace_back(wsp.owned_data());
+  }
+  nvtxRangePop();
+
+  // te_workspace ready
+
+  std::vector<at::Tensor> D_tensors;
+
+  nvtxRangePush("Prepare output");
+  if (D != std::nullopt) {
+    if (num_gemms == D->size()) {
+      // each output is separate
+      for (const auto& d: *D) {
+        te_D.emplace_back(makeTransformerEngineTensor(d).owned_data());
+      }
+      NVTE_CHECK(num_gemms == 1 || single_output == false);
+    } else {
+      NVTE_CHECK(D->size() == 1,
+                 "Grouped GEMM expects the provided output to be a list of either "
+                 "1 or num_gemms tensors. Got ",
+                 D->size(), " elements, while num_gemms is ", num_gemms, ".");
+      NVTE_CHECK(single_output == true);
+      const auto& temp_wrapper = makeTransformerEngineTensor((*D)[0]);
+
+      te_D = makeTransformerEngineTensorSplit(temp_wrapper, *n_splits, *m_splits, num_gemms);
+    }
+    D_tensors = *D;
+  } else {
+    // TODO: handle single_output
+    int64_t total_size = 0;
+    std::vector<int64_t> splits;
+    splits.reserve(num_gemms);
+    te_D.reserve(num_gemms);
+    for (size_t i = 0; i < num_gemms; ++i) {
+      total_size += (*n_splits)[i] * (*m_splits)[i];
+      splits.push_back((*n_splits)[i] * (*m_splits)[i]);
+    }
+    auto dtype = GetATenDType(D_type);
+    auto opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
+    at::Tensor memory = at::empty(total_size, opts);
+    D_tensors = at::split_with_sizes(memory, splits);
+    for (size_t i = 0; i < num_gemms; ++i) {
+      D_tensors[i] = D_tensors[i].view(std::vector<int64_t>{
+          static_cast<int64_t>((*n_splits)[i]),
+          static_cast<int64_t>((*m_splits)[i])});
+      te_D.emplace_back(makeTransformerEngineTensor(D_tensors[i]).owned_data());
+    }
+  }
+  nvtxRangePop();
+
+  // For now, we only have multi-stream cublas backend.
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_multi_stream_cublas_gemm(te_A.data(), te_B.data(), te_D.data(),
+                                  te_bias.data(), te_pre_gelu_out.data(),
+                                  num_gemms, transa, transb, grad,
+                                  te_workspace.data(), accumulate, use_split_accumulator,
+                                  math_sm_count, at::cuda::getCurrentCUDAStream());
+    nvtxRangePush("Destroy!");
+    for (auto& t : te_A) {
+      nvte_destroy_tensor(t);
+    }
+    for (auto& t : te_B) {
+      nvte_destroy_tensor(t);
+    }
+    for (auto& t : te_D) {
+      nvte_destroy_tensor(t);
+    }
+    for (auto& t : te_bias) {
+      nvte_destroy_tensor(t);
+    }
+    for (auto& t : te_workspace) {
+      nvte_destroy_tensor(t);
+    }
+    for (auto& t : te_pre_gelu_out) {
+      nvte_destroy_tensor(t);
+    }
+    nvtxRangePop();
+    nvtxRangePop();
+  });
+  return {std::move(D_tensors), bias};
+}
