@@ -265,6 +265,31 @@ NVTEBasicTensor nvte_get_tensor_param(const NVTETensor tensor, NVTETensorParam p
  */
 NVTEScalingMode nvte_tensor_scaling_mode(const NVTETensor tensor);
 
+/*! \brief Create an array of views into the 2D tensor, splitting it into pieces.
+ *  Input tensor is treated as a concatenated list of num_splits tensors.
+ *  Output[i] has the shape of [split_first_dim[i], split_last_dim[i]].
+ *
+ *  \param[in] tensor Tensor to be split.
+ *  \param[in] split_first_dim A list of first dimensions of the output tensors.
+ *                             Must be of size num_splits
+ *  \param[in] split_last_dim A list of last dimensions of the output tensors
+ *                            Must be of size num_splits
+ *  \param[in] num_splits Number of pieces to split the tensor into.
+ *
+ *  \return A list of tensors, each with shape [split_first_dim[i], split_last_dim[i]].
+ *          To avoid leaking memory, after calling nvte_destroy_tensor on all elements
+ *          the list itself needs to be deallocated via nvte_tensor_list_destroy.
+ */
+NVTETensor *nvte_tensor_split(const NVTETensor tensor, size_t *split_first_dim,
+                              size_t *split_last_dim, size_t num_splits);
+
+/*! \brief Destroy the list allocated with nvte_tensor_split.
+ *  The tensors held inside the list need to be already deallocated.
+ *
+ *  \param[in] list List to be deallocated.
+ */
+void nvte_tensor_list_destroy(NVTETensor *list);
+
 /*! \struct NVTETensorPack
     \brief Pack of tensors, generally used for auxiliary outputs.
  */
@@ -457,6 +482,12 @@ class TensorWrapper {
   explicit TensorWrapper(const NVTEScalingMode scaling_mode = NVTE_DELAYED_TENSOR_SCALING)
       : tensor_(nvte_create_tensor(scaling_mode)) {}
 
+  /*! \brief Constructs new TensorWrapper packing the raw NVTETensor.
+   *
+   * Create a new TE tensor which gains ownership of the provided NVTETensor.
+   */
+  explicit TensorWrapper(const NVTETensor tensor) : tensor_(tensor) {}
+
   /*! \brief TensorWrapper destructor. */
   ~TensorWrapper() { nvte_destroy_tensor(tensor_); }
 
@@ -473,6 +504,7 @@ class TensorWrapper {
     tensor_ = other.tensor_;
     other.tensor_ = nullptr;
   }
+
 
   /*! \brief Assign the data from existing TensorWrapper.
    *
@@ -553,10 +585,23 @@ class TensorWrapper {
   }
 
   /*! \brief Get an underlying NVTETensor.
+   *  TensorWrapper retains the ownership of it.
    *
    *  \return NVTETensor held by this TensorWrapper.
    */
   NVTETensor data() const noexcept { return tensor_; }
+
+  /*! \brief Get an underlying NVTETensor.
+   *  TensorWrapper does not retain the ownership of it.
+   *  The caller is responsible to call nvte_destroy_tensor.
+   *
+   *  \return NVTETensor held by this TensorWrapper.
+   */
+  NVTETensor owned_data() noexcept {
+    const NVTETensor t = tensor_;
+    tensor_ = nullptr;
+    return t;
+  }
 
   /*! \brief Get the shape of this TensorWrapper.
    *

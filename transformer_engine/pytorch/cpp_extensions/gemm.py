@@ -125,7 +125,6 @@ def general_grouped_gemm(
     use_bias: bool = False,
     use_split_accumulator: bool = False,
     D_dtype: Optional[tex.DType] = None,
-    single_output=False,
 ) -> Tuple[List[torch.Tensor], ...]:
     """
     TN layout Grouped GEMM with fp8 inputs.
@@ -171,7 +170,6 @@ def general_grouped_gemm(
         m_splits,
         grad_bias if grad else bias,
         bias_dtype,
-        single_output,
         gelu_input,  # this is pre_gelu_out
         grad,  # grad
         workspaces,
