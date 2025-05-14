@@ -275,20 +275,13 @@ NVTEScalingMode nvte_tensor_scaling_mode(const NVTETensor tensor);
  *  \param[in] split_last_dim A list of last dimensions of the output tensors
  *                            Must be of size num_splits
  *  \param[in] num_splits Number of pieces to split the tensor into.
+ *  \param[out] output_list An array of num_splits tensors, each with shape
+ *                          [split_first_dim[i], split_last_dim[i]].
  *
- *  \return A list of tensors, each with shape [split_first_dim[i], split_last_dim[i]].
- *          To avoid leaking memory, after calling nvte_destroy_tensor on all elements
- *          the list itself needs to be deallocated via nvte_tensor_list_destroy.
  */
-NVTETensor *nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim,
-                              const size_t *split_last_dim, const size_t num_splits);
-
-/*! \brief Destroy the list allocated with nvte_tensor_split.
- *  The tensors held inside the list need to be already deallocated.
- *
- *  \param[in] list List to be deallocated.
- */
-void nvte_destroy_tensor_list(NVTETensor *list);
+void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim,
+                       const size_t *split_last_dim, const size_t num_splits,
+                       NVTETensor *output_list);
 
 /*! \struct NVTETensorPack
     \brief Pack of tensors, generally used for auxiliary outputs.

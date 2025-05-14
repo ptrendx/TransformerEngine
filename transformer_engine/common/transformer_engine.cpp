@@ -196,6 +196,7 @@ void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empt
 
 NVTETensor nvte_create_tensor(NVTEScalingMode scaling_mode) {
   transformer_engine::Tensor *ret = new transformer_engine::Tensor;
+  NVTE_CHECK(ret != nullptr, "Cannot allocate a new NVTETensor");
   ret->scaling_mode = scaling_mode;
   return ret;
 }
@@ -491,4 +492,73 @@ int nvte_is_non_tn_fp8_gemm_supported() {
   // (remove the note once it's done.)
   return (deviceComputeCapability >= 100 && deviceComputeCapability < 120) ||
          deviceComputeCapability >= 130;
+}
+
+void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, const size_t *split_last_dim, const size_t num_splits, NVTETensor *output_list) {
+  using namespace transformer_engine;
+  if (tensor == nullptr) return;
+  const Tensor& t = *(reinterpret_cast<const Tensor*>(tensor));
+  const size_t num_elements = product(t.shape());
+  switch (t.scaling_mode) {
+    case NVTE_DELAYED_TENSOR_SCALING:
+      {
+        size_t current_num_elements = num_elements;
+        for (size_t i = 0; i < num_splits; ++i) {
+          output_list[i] = nvte_create_tensor(t.scaling_mode);
+          Tensor& out = *(reinterpret_cast<Tensor*>(output_list[i]));
+          // scale, scale_invs and amax are shared with the original tensor
+          out.scale = t.scale;
+          out.amax = t.amax;
+          out.scale_inv = t.scale_inv;
+          out.columnwise_scale_inv = t.columnwise_scale_inv;
+
+          // data
+          if (t.has_data()) {
+            DType dtype = t.data.dtype;
+            out.data.dtype = dtype;
+            size_t current_split_size = split_first_dim[i] * split_last_dim[i];
+
+            if(current_split_size > current_num_elements) {
+              std::vector<std::vector<size_t>> pairs;
+              for (size_t j = 0; j < num_splits; ++j) {
+                pairs[j].push_back(split_first_dim[j]);
+                pairs[j].push_back(split_last_dim[j]);
+              }
+              NVTE_ERROR("Cannot split tensor of shape ", t.shape(),
+                         " into pieces of sizes ", pairs, ".");
+            }
+            out.data.shape.emplace_back(split_first_dim[i]);
+            out.data.shape.emplace_back(split_last_dim[i]);
+            out.data.dptr = (uint8_t*)t.data.dptr + (num_elements - current_num_elements) * typeToSize(dtype);
+            current_num_elements -= current_split_size;
+          }
+
+          // columnwise_data
+          if (t.has_columnwise_data()) {
+            NVTE_ERROR("Splitting of the tensor with columnwise data not implemented yet!");
+          }
+        }
+      }
+      break;
+    case NVTE_MXFP8_1D_SCALING:
+      {
+        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+      }
+      break;
+    case NVTE_BLOCK_SCALING_1D:
+      {
+        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+      }
+      break;
+    case NVTE_BLOCK_SCALING_2D:
+      {
+        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+      }
+      break;
+    case NVTE_INVALID_SCALING:
+      {
+        NVTE_ERROR("Invalid scaling mode");
+      }
+      break;
+  }
 }

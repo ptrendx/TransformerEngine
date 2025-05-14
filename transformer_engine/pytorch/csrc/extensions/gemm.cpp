@@ -137,9 +137,9 @@ std::vector<NVTETensor> makeTransformerEngineTensorSplit(
     const std::vector<size_t>& splits_first_dim,
     const std::vector<size_t>& splits_last_dim,
     const size_t num_splits) {
-  NVTETensor *tensor_list = nvte_tensor_split(t.data(), splits_first_dim.data(), splits_last_dim.data(), num_splits);
-  std::vector<NVTETensor> ret(tensor_list, tensor_list + num_splits);
-  nvte_destroy_tensor_list(tensor_list);
+  std::vector<NVTETensor> ret(num_splits, nullptr);
+  nvte_tensor_split(t.data(), splits_first_dim.data(), splits_last_dim.data(),
+                    num_splits, ret.data());
   return ret;
 }
 
@@ -748,7 +748,9 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
     at::Tensor memory = at::empty(total_size, opts);
     D_tensors = at::split_with_sizes(memory, splits);
     for (size_t i = 0; i < num_gemms; ++i) {
-      D_tensors[i] = D_tensors[i].view(std::vector<int64_t>{n_splits[i], m_splits[i]});
+      D_tensors[i] = D_tensors[i].view(std::vector<int64_t>{
+          static_cast<int64_t>((*n_splits)[i]),
+          static_cast<int64_t>((*m_splits)[i])});
       te_D.emplace_back(makeTransformerEngineTensor(D_tensors[i]));
     }
   }
