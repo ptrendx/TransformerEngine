@@ -373,87 +373,30 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, transformer_engine
                           gemm_producer, te_counter.data(), at::cuda::getCurrentCUDAStream());
 }
 
-std::vector<std::vector<at::Tensor>> te_general_grouped_gemm(
+std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
     std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
-    std::optional<std::vector<int64_t>> m_splits,
-    std::optional<std::vector<int64_t>> n_splits,
-    std::optional<std::vector<int64_t>> k_splits,
-    std::vector<at::Tensor> bias,
-    transformer_engine::DType bias_type, std::vector<at::Tensor> pre_gelu_out,
+    std::vector<int64_t> m_splits, std::vector<at::Tensor> bias,
+    transformer_engine::DType bias_type, bool single_output, std::vector<at::Tensor> pre_gelu_out,
     bool grad, std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
     bool use_split_accumulator, int math_sm_count) {
   using namespace transformer_engine;
   using namespace transformer_engine::pytorch;
-  
   nvtxRangePush("te_general_grouped_gemm");
   std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
       te_pre_gelu_out_vector, te_workspace_vector;
-  auto none = py::none();
-  std::vector<TensorWrapper> A_wrappers, B_wrappers;
-  size_t num_splits = 1;
-  if (m_splits != std::nullopt) {
-    NVTE_CHECK(n_splits == std::nullopt && k_splits == std::nullopt,
-               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
-  } else if (n_splits != std::nullopt) {
-    NVTE_CHECK(m_splits == std::nullopt && k_splits == std::nullopt,
-               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
-  } else if (k_splits != std::nullopt) {
-    NVTE_CHECK(m_splits == std::nullopt && n_splits == std::nullopt,
-               "Out of m_splits, n_splits and k_splits only 1 can be provided!");
-  }
-
-  A_wrappers.reserve(num_splits);
-  B_wrappers.reserve(num_splits);
-  if (A.size() == num_splits) {
-    for (const auto& a : A) {
-      A_wrappers.emplace_back(makeTransformerEngineTensor(a, none));
-    }
-  } else {
-    NVTE_CHECK(A.size() == 1,
-                 "Grouped GEMM expects the A input to be a list of either "
-                 "1 or num_gemms tensors. Got ",
-                 A.size(), " elements, while num_gemms is ", num_splits, ".");
-  }
-  if (B.size() == num_splits) {
-    for (const auto& b : B) {
-      B_wrappers.emplace_back(makeTransformerEngineTensor(b, none));
-    }
-  } else {
-    NVTE_CHECK(B.size() == 1,
-                 "Grouped GEMM expects the B input to be a list of either "
-                 "1 or num_gemms tensors. Got ",
-                 B.size(), " elements, while num_gemms is ", num_splits, ".");
-  }
-  std::vector<at::Tensor> D_tensors;
-  bool single_output = false;
-
-  if (D != std::nullopt) {
-    if (m_splits.size() == D->size()) {
-      // each output is separate
-    } else {
-      NVTE_CHECK(D->size() == 1,
-                 "Grouped GEMM expects the provided output to be a list of either "
-                 "1 or num_gemms tensors. Got ",
-                 D->size(), " elements, while num_gemms is ", num_splits, ".");
-      single_output = true;
-    }
-    D_tensors = *D;
-  } else {
-    D_tensors.reserve(m_splits.size());
-    for (size_t i = 0; i < m_splits.size(); ++i) {
-      const auto& te_A = A_wrappers[i];
-      const auto& te_B = B_wrappers[i];
-
-      // if there is single output
-      at::Tensor out_tensor;
-      auto size_t_shape =
-          pytorch::detail::getGemmOutputShape(te_A.shape(), transa, te_B.shape(), transb);
-      }
-  }
+  std::vector<TensorWrapper> wrappers;
+  std::vector<at::Tensor> D_vectors;
   // Keep the swizzled scaling factor tensors alive during the GEMMs.
   std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
 
+  auto none = py::none();
+
+  std::vector<size_t> single_output_begins;
+  std::vector<size_t> single_output_ends;
+  if (single_output && D == std::nullopt) {
+    NVTE_ERROR("not implemented, D should be allocated for single output case.");
+  }
 
   void* output_data_ptr = nullptr;
   if (single_output) {
@@ -461,8 +404,8 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm(
   }
 
   for (size_t i = 0; i < A.size(); i++) {
-    const auto& te_A = A_wrappers[i];
-    const auto& te_B = B_wrappers[i];
+    auto te_A = makeTransformerEngineTensor(A[i], none);
+    auto te_B = makeTransformerEngineTensor(B[i], none);
 
     // if there is single output
     at::Tensor out_tensor;
@@ -554,7 +497,7 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm(
                                 te_workspace_vector.data(), accumulate, use_split_accumulator,
                                 math_sm_count, at::cuda::getCurrentCUDAStream());
   nvtxRangePop();
-  return {std::move(D_tensors), bias};
+  return bias;
 }
 
 std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
