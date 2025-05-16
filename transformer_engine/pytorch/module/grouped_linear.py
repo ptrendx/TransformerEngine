@@ -84,9 +84,14 @@ class _GroupedLinear2(torch.autograd.Function):
         is_grad_enabled = non_tensor_args["is_grad_enabled"];
         module = non_tensor_args["module"];
         skip_fp8_weight_update = non_tensor_args["skip_fp8_weight_update"];
+        single_weight = non_tensor_args["single_weight"]
         num_gemms = len(splits)
-        weights = weights_and_biases[:num_gemms]
-        biases = weights_and_biases[num_gemms:]
+        if single_weight:
+            weights = weights_and_biases[:1]
+            biases = weights_and_biases[1:]
+        else:
+            weights = weights_and_biases[:num_gemms]
+            biases = weights_and_biases[num_gemms:]
         device = inp.device
 
         # Make sure input dimensions are compatible
@@ -146,11 +151,18 @@ class _GroupedLinear2(torch.autograd.Function):
 
         biases = [cast_if_needed(bias, bias_dtype) for bias in biases] if use_bias else biases
 
-        out = torch.empty(
-            [sum(splits), weights_fp8[0].size(0)],
-            dtype=activation_dtype,
-            device=device,
-        )
+        if single_weight:
+            out = torch.empty(
+                [sum(splits), weights_fp8[0].size(0) // num_gemms],
+                dtype=activation_dtype,
+                device=device,
+            )
+        else:
+            out = torch.empty(
+                [sum(splits), weights_fp8[0].size(0)],
+                dtype=activation_dtype,
+                device=device,
+            )
 
         _, _, _ = general_grouped_gemm2(
             num_gemms,
@@ -216,6 +228,7 @@ class _GroupedLinear2(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.requires_dgrad = inp.requires_grad
             ctx.reduce_and_update_bwd_fp8_tensors = False
+            ctx.single_weight = single_weight
             if ctx.fp8 and requires_grad(inp, weights[0], biases[0]):
                 ctx.reduce_and_update_bwd_fp8_tensors = (
                     ctx.reduce_and_update_bwd_fp8_tensors
@@ -234,47 +247,53 @@ class _GroupedLinear2(torch.autograd.Function):
             saved_tensors = restore_from_saved(ctx.tensor_objects, ctx.saved_tensors)
             N = ctx.num_gemms
             inputmat = saved_tensors[0]
-            weights = saved_tensors[N : 2 * N]
-            origin_weights = saved_tensors[2 * N : 3 * N]
-            biases = saved_tensors[3 * N : 4 * N]
+            if ctx.single_weight:
+                weights = [saved_tensors[1]]
+                origin_weights = [saved_tensors[2]]
+                biases = [saved_tensors[3]]
+            else:
+                weights = saved_tensors[N : 2 * N]
+                origin_weights = saved_tensors[2 * N : 3 * N]
+                biases = saved_tensors[3 * N : 4 * N]
             main_grads = ctx.main_grads
 
             if ctx.cpu_offloading and ctx.fuse_wgrad_accumulation:  # TOSO
-                for i in ctx.num_gemms:
+                num_gemms = 1 if ctx.single_weight else ctx.num_gemms
+                for i in range(num_gemms):
                     w = torch.nn.Parameter(weights[i], weights[i].requires_grad)
                     w.main_grad = main_grads[i]
                     weights[i] = w
 
             # preprocess grad_output
 
-            grad_output = grad_output.contiguous()
-            grad_output_mats = torch.split(
-                grad_output.view(-1, grad_output.shape[-1]), ctx.m_splits
-            )
-            grad_output = [None] * ctx.num_gemms
-            grad_biases = [None] * ctx.num_gemms
+            grad_output_list = [grad_output.contiguous()]
+            if ctx.single_weight:
+                grad_biases = [None]
+            else:
+                grad_biases = [None] * ctx.num_gemms
             if ctx.fp8:
                 if ctx.use_bias:
+                    grad_output_list = list(torch.split(
+                        grad_output.view(-1, grad_output.shape[-1]), ctx.m_splits
+                    ))
                     # unfuse bgrad for now until cast_transpose + dgrad calculation is ready
                     # for Float8BlockQuantizer.
                     if ctx.fp8_recipe.float8_block_scaling():
                         for i in range(ctx.num_gemms):
-                            grad_biases[i] = grad_output_mats[i].sum(dim=0)
-                            grad_output[i] = ctx.grad_output_quantizers[i](grad_output_mats[i])
+                            grad_biases[i] = grad_output_list[i].sum(dim=0)
+                            grad_output_list[i] = ctx.grad_output_quantizers[i](grad_output_list[i])
                     else:
                         for i in range(ctx.num_gemms):
-                            grad_biases[i], grad_output[i] = tex.bgrad_quantize(
-                                grad_output_mats[i], ctx.grad_output_quantizers[i]
+                            grad_biases[i], grad_output_list[i] = tex.bgrad_quantize(
+                                grad_output_list[i], ctx.grad_output_quantizers[i]
                             )
                 else:
-                    grad_output = tex.fused_multi_quantize(
-                        grad_output_mats,
+                    grad_output_list = tex.fused_multi_quantize(
+                        grad_output_list,
                         None,
                         ctx.grad_output_quantizers,
                         TE_DType[ctx.activation_dtype],
                     )
-            else:
-                grad_output = grad_output_mats
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -307,7 +326,7 @@ class _GroupedLinear2(torch.autograd.Function):
                 general_grouped_gemm2(
                     ctx.num_gemms,
                     weights,
-                    grad_output,
+                    grad_output_list,
                     [dgrad],
                     ctx.activation_dtype,
                     get_multi_stream_cublas_workspace(),
@@ -344,14 +363,15 @@ class _GroupedLinear2(torch.autograd.Function):
                     bias=biases,
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate_wgrad_into_param_main_grad,
+                    single_output=ctx.single_weight,
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                    ctx.wgrad_store.put([ctx.num_gemms, [inputmat], grad_output, wgrad_list], grouped_gemm_wgrad)
+                    ctx.wgrad_store.put([ctx.num_gemms, [inputmat], grad_output_list, wgrad_list], grouped_gemm_wgrad)
                 else:
-                    _, grad_biases_, _ = grouped_gemm_wgrad(ctx.num_gemms, [inputmat], grad_output, wgrad_list)
+                    _, grad_biases_, _ = grouped_gemm_wgrad(ctx.num_gemms, [inputmat], grad_output_list, wgrad_list)
 
-                    for i in range(ctx.num_gemms):
+                    for i in range(len(grad_biases)):
                         if grad_biases[i] is None:
                             grad_biases[i] = grad_biases_[i]
                     del grad_biases_
@@ -846,6 +866,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         ub_overlap_ag: bool = False,
         ub_name: Optional[str] = None,
         delay_wgrad_compute: bool = False,
+        single_weight: bool = False,
     ) -> None:
         super().__init__()
 
@@ -865,6 +886,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         ), "GroupedLinear doesn't support Userbuffer overlap."
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
+        self.single_weight = single_weight
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute)
 
@@ -901,13 +923,13 @@ class GroupedLinear(TransformerEngineBaseModule):
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
 
-        for i in range(self.num_gemms):
+        if self.single_weight:
             # Construct weight parameter
             self.register_parameter(
-                f"weight{i}",
+                f"weight",
                 torch.nn.Parameter(
                     torch.empty(
-                        self.out_features,
+                        self.num_gemms * self.out_features,
                         self.in_features,
                         device=device,
                         dtype=params_dtype,
@@ -915,16 +937,16 @@ class GroupedLinear(TransformerEngineBaseModule):
                 ),
                 init_fn=init_method,
                 get_rng_state_tracker=get_rng_state_tracker,
-                fp8_meta_index=self._offsets["weight"] + i * self._num_fp8_tensors_per_gemm["fwd"],
+                fp8_meta_index=self._offsets["weight"],
             )
 
             # Construct bias parameters if needed
             if self.use_bias:
                 self.register_parameter(
-                    f"bias{i}",
+                    f"bias",
                     torch.nn.Parameter(
                         torch.empty(
-                            self.out_features,
+                            self.num_gemms * self.out_features,
                             device=device,
                             dtype=params_dtype,
                         ),
@@ -932,8 +954,41 @@ class GroupedLinear(TransformerEngineBaseModule):
                     init_fn=init_method_constant(0.0),
                 )
             else:
-                bias = torch.Tensor().to(dtype=params_dtype, device=device)
-                setattr(self, f"bias{i}", bias)
+                self.bias = None
+        else:
+            for i in range(self.num_gemms):
+                # Construct weight parameter
+                self.register_parameter(
+                    f"weight{i}",
+                    torch.nn.Parameter(
+                        torch.empty(
+                            self.out_features,
+                            self.in_features,
+                            device=device,
+                            dtype=params_dtype,
+                        ),
+                    ),
+                    init_fn=init_method,
+                    get_rng_state_tracker=get_rng_state_tracker,
+                    fp8_meta_index=self._offsets["weight"] + i * self._num_fp8_tensors_per_gemm["fwd"],
+                )
+
+                # Construct bias parameters if needed
+                if self.use_bias:
+                    self.register_parameter(
+                        f"bias{i}",
+                        torch.nn.Parameter(
+                            torch.empty(
+                                self.out_features,
+                                device=device,
+                                dtype=params_dtype,
+                            ),
+                        ),
+                        init_fn=init_method_constant(0.0),
+                    )
+                else:
+                    bias = torch.Tensor().to(dtype=params_dtype, device=device)
+                    setattr(self, f"bias{i}", bias)
 
         if self.primary_weights_in_fp8:
             self.init_fp8_metadata(num_gemms=self.num_gemms)
@@ -956,27 +1011,45 @@ class GroupedLinear(TransformerEngineBaseModule):
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)
 
-        if not defer_init:
-            # Set parallelism attributes for linear weights
-            for i in range(self.num_gemms):
+        if self.single_weight:
+            if not defer_init:
+                # Set parallelism attributes for linear weights
                 set_tensor_model_parallel_attributes(
-                    tensor=getattr(self, f"weight{i}"),
+                    tensor=self.weight,
                     is_parallel=True,
                     dim=1 if self.parallel_mode == "row" else 0,
                     stride=1,
                 )
 
-            # Set parallelism attributes for linear biases
-            if self.use_bias:
-                for i in range(self.num_gemms):
+                # Set parallelism attributes for linear biases
+                if self.use_bias:
+                    assert self.bias is not None
                     if self.parallel_mode == "row":
-                        setattr(
-                            getattr(self, f"bias{i}"),
-                            "sequence_parallel",
-                            self.sequence_parallel,
-                        )
+                        self.bias.sequence_parallel = self.sequence_parallel
                     elif self.parallel_mode == "column":
-                        set_tensor_model_parallel_attributes(getattr(self, f"bias{i}"), True, 0, 1)
+                        set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+        else:
+            if not defer_init:
+                # Set parallelism attributes for linear weights
+                for i in range(self.num_gemms):
+                    set_tensor_model_parallel_attributes(
+                        tensor=getattr(self, f"weight{i}"),
+                        is_parallel=True,
+                        dim=1 if self.parallel_mode == "row" else 0,
+                        stride=1,
+                    )
+
+                # Set parallelism attributes for linear biases
+                if self.use_bias:
+                    for i in range(self.num_gemms):
+                        if self.parallel_mode == "row":
+                            setattr(
+                                getattr(self, f"bias{i}"),
+                                "sequence_parallel",
+                                self.sequence_parallel,
+                            )
+                        elif self.parallel_mode == "column":
+                            set_tensor_model_parallel_attributes(getattr(self, f"bias{i}"), True, 0, 1)
 
     @no_torch_dynamo()
     def forward(
@@ -1020,8 +1093,12 @@ class GroupedLinear(TransformerEngineBaseModule):
         with self.prepare_forward(inp, num_gemms=self.num_gemms) as inp:
 
             torch.cuda.nvtx.range_push("Weights")
-            weight_tensors = [getattr(self, f"weight{i}") for i in range(self.num_gemms)]
-            bias_tensors = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
+            if self.single_weight:
+                weight_tensors = [self.weight]
+                bias_tensors = [self.bias]
+            else:
+                weight_tensors = [getattr(self, f"weight{i}") for i in range(self.num_gemms)]
+                bias_tensors = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
             if not self.fp8 and any(isinstance(w, QuantizedTensorBase) for w in weight_tensors):
                 warnings.warn(
                     "You are using quantized weights without quantized compute. "
@@ -1090,6 +1167,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 "is_grad_enabled": torch.is_grad_enabled(),
                 "module": self,
                 "skip_fp8_weight_update": skip_fp8_weight_update,
+                "single_weight": self.single_weight,
             }
 
             args += (
