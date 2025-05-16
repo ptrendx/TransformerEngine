@@ -542,17 +542,17 @@ void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, c
       break;
     case NVTE_MXFP8_1D_SCALING:
       {
-        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+        NVTE_ERROR("Not implemented scaling mode ", to_string(t.scaling_mode));
       }
       break;
     case NVTE_BLOCK_SCALING_1D:
       {
-        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+        NVTE_ERROR("Not implemented scaling mode ", to_string(t.scaling_mode));
       }
       break;
     case NVTE_BLOCK_SCALING_2D:
       {
-        NVTE_ERROR("Not implemented scaling mode ", t.scaling_mode);
+        NVTE_ERROR("Not implemented scaling mode ", to_string(t.scaling_mode));
       }
       break;
     case NVTE_INVALID_SCALING:

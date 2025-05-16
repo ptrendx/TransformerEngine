@@ -93,10 +93,23 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, transformer_engine
                     bool use_split_accumulator, int math_sm_count, int m_split, int n_split,
                     bool gemm_producer, at::Tensor counter);
 
-std::vector<std::vector<at::Tensor>> te_general_grouped_gemm(
+std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
     std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
     std::vector<int64_t> m_splits, std::vector<at::Tensor> bias,
+    transformer_engine::DType bias_type, bool single_output, std::vector<at::Tensor> pre_gelu_out,
+    bool grad, std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
+    bool use_split_accumulator, int math_sm_count);
+
+std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
+    const size_t num_gemms,
+    std::optional<std::vector<size_t>> m_splits,
+    std::optional<std::vector<size_t>> n_splits,
+    std::optional<std::vector<size_t>> k_splits,
+    bool single_output,
+    std::vector<at::Tensor> bias,
     transformer_engine::DType bias_type, std::vector<at::Tensor> pre_gelu_out,
     bool grad, std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
     bool use_split_accumulator, int math_sm_count);

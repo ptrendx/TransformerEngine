@@ -94,7 +94,7 @@ std::pair<std::vector<size_t>, std::vector<size_t>> createSplits(
   if (splits_first_dim != std::nullopt) {
     NVTE_CHECK(splits_first_dim->size() == num_splits,
                "Provided splits need to be either a list of size num_gemms or None, got ",
-               splits_first_dim);
+               *splits_first_dim);
     ret.first = *splits_first_dim;
   } else {
     size_t first_dim = full_shape.data[first_dim_index];
@@ -113,7 +113,7 @@ std::pair<std::vector<size_t>, std::vector<size_t>> createSplits(
   if (splits_last_dim != std::nullopt) {
     NVTE_CHECK(splits_last_dim->size() == num_splits,
                "Provided splits need to be either a list of size num_gemms or None, got ",
-               splits_last_dim);
+               *splits_last_dim);
     ret.second = *splits_last_dim;
   } else {
     size_t last_dim = full_shape.data[last_dim_index];
@@ -536,6 +536,7 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
                "Out of m_splits, n_splits and k_splits only 1 can be provided!");
   }
 
+  nvtxRangePush("Prepare A");
   if (A.size() == num_gemms) {
     te_A.reserve(num_gemms);
 
@@ -584,6 +585,8 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
       t = wrapper.owned_data();
     }
   }
+  nvtxRangePop();
+  nvtxRangePush("Prepare B");
   if (B.size() == num_gemms) {
     te_B.reserve(num_gemms);
     if (n_splits == std::nullopt) {
@@ -629,36 +632,41 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
       t = wrapper.owned_data();
     }
   }
+  nvtxRangePop();
 
   // m_splits, n_splits, k_splits ready
   // te_A, te_B ready
 
+  nvtxRangePush("gelu and bias");
   for (size_t i = 0; i < num_gemms; i++) {
     te_bias.emplace_back(makeTransformerEngineTensor(bias[i]).owned_data());
-    auto t = makeTransformerEngineTensor(pre_gelu_out[i]);
 
     const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
-                                ? std::vector<size_t>{static_cast<size_t>(t.size(0))}
-                                : std::vector<size_t>{static_cast<size_t>(t.size(0)),
-                                                      static_cast<size_t>(t.size(1))};
+                                ? std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0))}
+                                : std::vector<size_t>{static_cast<size_t>(pre_gelu_out[i].size(0)),
+                                                      static_cast<size_t>(pre_gelu_out[i].size(1))};
 
     DType gelu_type = bias_type;
     te_pre_gelu_out.emplace_back(
         makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type).owned_data());
   }
+  nvtxRangePop();
 
   // te_bias, te_pre_gelu_out ready
 
+  nvtxRangePush("workspace");
   for (size_t i = 0; i < workspace.size(); i++) {
     auto wsp = makeTransformerEngineTensor(workspace[i].data_ptr(),
                                            std::vector<size_t>{workspaceSize}, DType::kByte);
     te_workspace.emplace_back(wsp.owned_data());
   }
+  nvtxRangePop();
 
   // te_workspace ready
 
   std::vector<at::Tensor> D_tensors;
 
+  nvtxRangePush("Prepare output");
   if (D != std::nullopt) {
     if (num_gemms == D->size()) {
       // each output is separate
@@ -678,6 +686,7 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
     }
     D_tensors = *D;
   } else {
+    // TODO: handle single_output
     int64_t total_size = 0;
     std::vector<int64_t> splits;
     splits.reserve(num_gemms);
@@ -694,9 +703,10 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
       D_tensors[i] = D_tensors[i].view(std::vector<int64_t>{
           static_cast<int64_t>((*n_splits)[i]),
           static_cast<int64_t>((*m_splits)[i])});
-      te_D.emplace_back(makeTransformerEngineTensor(D_tensors[i]));
+      te_D.emplace_back(makeTransformerEngineTensor(D_tensors[i]).owned_data());
     }
   }
+  nvtxRangePop();
 
   // For now, we only have multi-stream cublas backend.
   nvte_multi_stream_cublas_gemm(te_A.data(), te_B.data(), te_D.data(),
@@ -704,6 +714,7 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
                                 num_gemms, transa, transb, grad,
                                 te_workspace.data(), accumulate, use_split_accumulator,
                                 math_sm_count, at::cuda::getCurrentCUDAStream());
+  nvtxRangePush("Destroy!");
   for (auto& t : te_A) {
     nvte_destroy_tensor(t);
   }
@@ -722,6 +733,7 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
   for (auto& t : te_pre_gelu_out) {
     nvte_destroy_tensor(t);
   }
+  nvtxRangePop();
   nvtxRangePop();
 
   return {std::move(D_tensors), bias};
