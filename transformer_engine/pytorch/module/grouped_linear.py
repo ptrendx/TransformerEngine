@@ -86,8 +86,12 @@ class _GroupedLinear2(torch.autograd.Function):
         skip_fp8_weight_update = non_tensor_args["skip_fp8_weight_update"];
         single_weight = non_tensor_args["single_weight"]
         num_gemms = len(splits)
-        weights = weights_and_biases[:num_gemms]
-        biases = weights_and_biases[num_gemms:]
+        if single_weight:
+            weights = weights_and_biases[:1]
+            biases = weights_and_biases[1:]
+        else:
+            weights = weights_and_biases[:num_gemms]
+            biases = weights_and_biases[num_gemms:]
         device = inp.device
 
         # Make sure input dimensions are compatible
@@ -147,11 +151,18 @@ class _GroupedLinear2(torch.autograd.Function):
 
         biases = [cast_if_needed(bias, bias_dtype) for bias in biases] if use_bias else biases
 
-        out = torch.empty(
-            [sum(splits), weights_fp8[0].size(0)],
-            dtype=activation_dtype,
-            device=device,
-        )
+        if single_weight:
+            out = torch.empty(
+                [sum(splits), weights_fp8[0].size(0) // num_gemms],
+                dtype=activation_dtype,
+                device=device,
+            )
+        else:
+            out = torch.empty(
+                [sum(splits), weights_fp8[0].size(0)],
+                dtype=activation_dtype,
+                device=device,
+            )
 
         _, _, _ = general_grouped_gemm2(
             num_gemms,
@@ -217,6 +228,7 @@ class _GroupedLinear2(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.requires_dgrad = inp.requires_grad
             ctx.reduce_and_update_bwd_fp8_tensors = False
+            ctx.single_weight = single_weight
             if ctx.fp8 and requires_grad(inp, weights[0], biases[0]):
                 ctx.reduce_and_update_bwd_fp8_tensors = (
                     ctx.reduce_and_update_bwd_fp8_tensors
@@ -226,6 +238,11 @@ class _GroupedLinear2(torch.autograd.Function):
 
         torch.cuda.nvtx.range_pop()
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
+        print("Output")
+        print(out.view(-1, *inp.shape[1:-1], out.shape[-1]).shape)
+        print(inp.shape)
+        print(weights[0].shape)
+
         return out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
     @staticmethod
@@ -235,47 +252,50 @@ class _GroupedLinear2(torch.autograd.Function):
             saved_tensors = restore_from_saved(ctx.tensor_objects, ctx.saved_tensors)
             N = ctx.num_gemms
             inputmat = saved_tensors[0]
-            weights = saved_tensors[N : 2 * N]
-            origin_weights = saved_tensors[2 * N : 3 * N]
-            biases = saved_tensors[3 * N : 4 * N]
+            if ctx.single_weight:
+                weights = [saved_tensors[1]]
+                origin_weights = [saved_tensors[2]]
+                biases = [saved_tensors[3]]
+            else:
+                weights = saved_tensors[N : 2 * N]
+                origin_weights = saved_tensors[2 * N : 3 * N]
+                biases = saved_tensors[3 * N : 4 * N]
             main_grads = ctx.main_grads
 
             if ctx.cpu_offloading and ctx.fuse_wgrad_accumulation:  # TOSO
-                for i in ctx.num_gemms:
+                num_gemms = 1 if ctx.single_weight else ctx.num_gemms
+                for i in range(num_gemms):
                     w = torch.nn.Parameter(weights[i], weights[i].requires_grad)
                     w.main_grad = main_grads[i]
                     weights[i] = w
 
             # preprocess grad_output
 
-            grad_output = grad_output.contiguous()
-            grad_output_mats = torch.split(
-                grad_output.view(-1, grad_output.shape[-1]), ctx.m_splits
-            )
-            grad_output = [None] * ctx.num_gemms
+            grad_output_list = [grad_output.contiguous()]
             grad_biases = [None] * ctx.num_gemms
             if ctx.fp8:
                 if ctx.use_bias:
+                    grad_output_list = list(torch.split(
+                        grad_output.view(-1, grad_output.shape[-1]), ctx.m_splits
+                    ))
                     # unfuse bgrad for now until cast_transpose + dgrad calculation is ready
                     # for Float8BlockQuantizer.
                     if ctx.fp8_recipe.float8_block_scaling():
                         for i in range(ctx.num_gemms):
-                            grad_biases[i] = grad_output_mats[i].sum(dim=0)
-                            grad_output[i] = ctx.grad_output_quantizers[i](grad_output_mats[i])
+                            grad_biases[i] = grad_output_list[i].sum(dim=0)
+                            grad_output_list[i] = ctx.grad_output_quantizers[i](grad_output_list[i])
                     else:
                         for i in range(ctx.num_gemms):
-                            grad_biases[i], grad_output[i] = tex.bgrad_quantize(
-                                grad_output_mats[i], ctx.grad_output_quantizers[i]
+                            grad_biases[i], grad_output_list[i] = tex.bgrad_quantize(
+                                grad_output_list[i], ctx.grad_output_quantizers[i]
                             )
                 else:
-                    grad_output = tex.fused_multi_quantize(
-                        grad_output_mats,
+                    grad_output_list = tex.fused_multi_quantize(
+                        grad_output_list,
                         None,
                         ctx.grad_output_quantizers,
                         TE_DType[ctx.activation_dtype],
                     )
-            else:
-                grad_output = grad_output_mats
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -308,7 +328,7 @@ class _GroupedLinear2(torch.autograd.Function):
                 general_grouped_gemm2(
                     ctx.num_gemms,
                     weights,
-                    grad_output,
+                    grad_output_list,
                     [dgrad],
                     ctx.activation_dtype,
                     get_multi_stream_cublas_workspace(),
@@ -334,6 +354,10 @@ class _GroupedLinear2(torch.autograd.Function):
                         torch.empty(w.size(), dtype=ctx.activation_dtype, device=ctx.device)
                         for w in weights
                     ]
+                print(wgrad_list[0].shape)
+                print(grad_output_list)
+                print(grad_output_list[0].shape)
+                print(inputmat.shape)
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm2,
                     out_dtype=ctx.activation_dtype,
@@ -345,12 +369,13 @@ class _GroupedLinear2(torch.autograd.Function):
                     bias=biases,
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate_wgrad_into_param_main_grad,
+                    single_output=ctx.single_weight,
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                    ctx.wgrad_store.put([ctx.num_gemms, [inputmat], grad_output, wgrad_list], grouped_gemm_wgrad)
+                    ctx.wgrad_store.put([ctx.num_gemms, [inputmat], grad_output_list, wgrad_list], grouped_gemm_wgrad)
                 else:
-                    _, grad_biases_, _ = grouped_gemm_wgrad(ctx.num_gemms, [inputmat], grad_output, wgrad_list)
+                    _, grad_biases_, _ = grouped_gemm_wgrad(ctx.num_gemms, [inputmat], grad_output_list, wgrad_list)
 
                     for i in range(ctx.num_gemms):
                         if grad_biases[i] is None:

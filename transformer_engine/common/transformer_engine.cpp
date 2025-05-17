@@ -499,6 +499,7 @@ void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, c
   if (tensor == nullptr) return;
   const Tensor& t = *(reinterpret_cast<const Tensor*>(tensor));
   const size_t num_elements = product(t.shape());
+  NVTE_CHECK(split_last_dim != nullptr, "split_last_dim cannot be NULL.");
   switch (t.scaling_mode) {
     case NVTE_DELAYED_TENSOR_SCALING:
       {
@@ -516,18 +517,27 @@ void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, c
           if (t.has_data()) {
             DType dtype = t.data.dtype;
             out.data.dtype = dtype;
-            size_t current_split_size = split_first_dim[i] * split_last_dim[i];
+            size_t current_split_size;
+            if (split_first_dim == nullptr) {
+              current_split_size = split_last_dim[i];
+            } else {
+              current_split_size = split_first_dim[i] * split_last_dim[i];
+            }
 
             if(current_split_size > current_num_elements) {
-              std::vector<std::vector<size_t>> pairs;
+              std::vector<std::vector<size_t>> pairs(num_splits);
               for (size_t j = 0; j < num_splits; ++j) {
-                pairs[j].push_back(split_first_dim[j]);
+                if (split_first_dim != nullptr) {
+                  pairs[j].push_back(split_first_dim[j]);
+                }
                 pairs[j].push_back(split_last_dim[j]);
               }
               NVTE_ERROR("Cannot split tensor of shape ", t.shape(),
                          " into pieces of sizes ", pairs, ".");
             }
-            out.data.shape.emplace_back(split_first_dim[i]);
+            if (split_first_dim != nullptr) {
+              out.data.shape.emplace_back(split_first_dim[i]);
+            }
             out.data.shape.emplace_back(split_last_dim[i]);
             out.data.dptr = (uint8_t*)t.data.dptr + (num_elements - current_num_elements) * typeToSize(dtype);
             current_num_elements -= current_split_size;
