@@ -218,9 +218,14 @@ def general_grouped_gemm2(
 
     sm_count = get_sm_count()
     if grad and use_bias:
-        grad_bias = [
-            torch.empty(b.shape[1], dtype=out[0].dtype, device="cuda") for b in B
-        ]
+        if single_output:
+            grad_bias = [
+                torch.empty(b.shape[1] * num_gemms, dtype=out[0].dtype, device="cuda") for b in B
+            ]
+        else:
+            grad_bias = [
+                torch.empty(b.shape[1], dtype=out[0].dtype, device="cuda") for b in B
+            ]
     else:
         grad_bias = empty_tensors
     bias = bias if use_bias else empty_tensors

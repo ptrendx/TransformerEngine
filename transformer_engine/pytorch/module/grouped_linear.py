@@ -238,11 +238,6 @@ class _GroupedLinear2(torch.autograd.Function):
 
         torch.cuda.nvtx.range_pop()
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
-        print("Output")
-        print(out.view(-1, *inp.shape[1:-1], out.shape[-1]).shape)
-        print(inp.shape)
-        print(weights[0].shape)
-
         return out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
     @staticmethod
@@ -272,7 +267,10 @@ class _GroupedLinear2(torch.autograd.Function):
             # preprocess grad_output
 
             grad_output_list = [grad_output.contiguous()]
-            grad_biases = [None] * ctx.num_gemms
+            if ctx.single_weight:
+                grad_biases = [None]
+            else:
+                grad_biases = [None] * ctx.num_gemms
             if ctx.fp8:
                 if ctx.use_bias:
                     grad_output_list = list(torch.split(
@@ -354,10 +352,6 @@ class _GroupedLinear2(torch.autograd.Function):
                         torch.empty(w.size(), dtype=ctx.activation_dtype, device=ctx.device)
                         for w in weights
                     ]
-                print(wgrad_list[0].shape)
-                print(grad_output_list)
-                print(grad_output_list[0].shape)
-                print(inputmat.shape)
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm2,
                     out_dtype=ctx.activation_dtype,
@@ -377,7 +371,7 @@ class _GroupedLinear2(torch.autograd.Function):
                 else:
                     _, grad_biases_, _ = grouped_gemm_wgrad(ctx.num_gemms, [inputmat], grad_output_list, wgrad_list)
 
-                    for i in range(ctx.num_gemms):
+                    for i in range(len(grad_biases)):
                         if grad_biases[i] is None:
                             grad_biases[i] = grad_biases_[i]
                     del grad_biases_
