@@ -594,7 +594,7 @@ int nvte_is_non_tn_fp8_gemm_supported() {
 void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, const size_t *split_last_dim, const size_t num_splits, NVTETensor *output_list) {
   using namespace transformer_engine;
   if (tensor == nullptr) return;
-  const Tensor& t = *(reinterpret_cast<const Tensor*>(tensor));
+  const Tensor& t = *convertNVTETensorCheck(tensor);
   const size_t num_elements = product(t.shape());
   NVTE_CHECK(split_last_dim != nullptr, "split_last_dim cannot be NULL.");
   switch (t.scaling_mode) {
@@ -603,7 +603,7 @@ void nvte_tensor_split(const NVTETensor tensor, const size_t *split_first_dim, c
         size_t current_num_elements = num_elements;
         for (size_t i = 0; i < num_splits; ++i) {
           output_list[i] = nvte_create_tensor(t.scaling_mode);
-          Tensor& out = *(reinterpret_cast<Tensor*>(output_list[i]));
+          Tensor& out = *(convertNVTETensorCheck(output_list[i]));
           // scale, scale_invs and amax are shared with the original tensor
           out.scale = t.scale;
           out.amax = t.amax;
