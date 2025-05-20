@@ -513,8 +513,6 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   return bias;
 }
 
-}  // namespace transformer_engine::pytorch
-
 std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
     std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
     std::optional<std::vector<at::Tensor>> D, transformer_engine::DType D_type,
@@ -766,3 +764,5 @@ std::vector<std::vector<at::Tensor>> te_general_grouped_gemm2(
   });
   return {std::move(D_tensors), bias};
 }
+
+}  // namespace transformer_engine::pytorch
