@@ -560,8 +560,7 @@ constexpr int32_t blackwellComputeCapability = 100;
         break; \
         SWITCH_FP4_TYPE_HANDLE(type, __VA_ARGS__) \
         default: \
-            printf("dtype: %d\n", static_cast<int>(dtype)); \
-            NVTE_ERROR("Invalid type MARKED TEST."); \
+            NVTE_ERROR("Invalid type ", dtype, "."); \
     }
 
 #define TRANSFORMER_ENGINE_TYPE_SWITCH_FP8_ONLY(dtype, type, ...) \
@@ -580,7 +579,7 @@ constexpr int32_t blackwellComputeCapability = 100;
             } \
         break; \
         default: \
-            NVTE_ERROR("Invalid type MARKED TEST 2."); \
+            NVTE_ERROR("Invalid type ", dtype, "."); \
     }
 
 #define TRANSFORMER_ENGINE_TYPE_SWITCH_FP4_ONLY(dtype, type, ...) \
@@ -588,7 +587,7 @@ constexpr int32_t blackwellComputeCapability = 100;
         using namespace transformer_engine; \
         SWITCH_FP4_HANDLE(type, __VA_ARGS__) \
         default: \
-            NVTE_ERROR("Invalid type MARKED TEST 3."); \
+            NVTE_ERROR("Invalid type ", dtype, "."); \
     }
 
 #define TRANSFORMER_ENGINE_TYPE_SWITCH_FP16_FP32_ONLY(dtype, type, ...) \
@@ -613,5 +612,5 @@ constexpr int32_t blackwellComputeCapability = 100;
             } \
         break; \
         default: \
-            NVTE_ERROR("Invalid type MARKED TEST 4."); \
+            NVTE_ERROR("Invalid type ", dtype, "."); \
     }
