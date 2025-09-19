@@ -393,16 +393,16 @@ void fp4_dequantize(const Tensor &input, Tensor *output, cudaStream_t stream) {
   const size_t threads = 512;
   const size_t blocks = DIVUP(total, threads);
 
-  TRANSFORMER_ENGINE_TYPE_SWITCH_FP4x2_ONLY(
-      input.data.dtype, IType,
-      TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
-          output->data.dtype, OType,
+  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+      output->data.dtype, OType,
 
-          dequantize_fp4_kernel<<<blocks, threads, 0, stream>>>(
-            input.data.dptr, output->data.dptr, input.scale_inv.dptr, input.amax.dptr,
-            N, Mread);
-      );  // NOLINT(*)
-  ); // NOLINT(*)
+      dequantize_fp4_kernel<<<blocks, threads, 0, stream>>>(
+        input.data.dptr,
+        reinterpret_cast<OType*>(output->data.dptr),
+        reinterpret_cast<fp8e4m3*>(input.scale_inv.dptr),
+        reinterpret_cast<float*>(input.amax.dptr),
+        N, Mread);
+  );  // NOLINT(*)
   NVTE_CHECK_CUDA(cudaGetLastError());
 #else
   NVTE_ERROR("CUDA 12.8 or higher is needed for FP4 calculation!");
