@@ -8,7 +8,6 @@ import pytest
 import torch
 import warnings
 
-from tests.pytorch.test_numerics import assert_allclose
 import transformer_engine.common.recipe
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
@@ -529,4 +528,4 @@ def test_fp4_dequantize(dtype, M, N):
     new_tensor = q(dequantized_tensor)
     assert torch.all(new_tensor._rowwise_data == starting_tensor._rowwise_data).item()
     new_dequantized_tensor = new_tensor.dequantize()
-    assert_allclose([dequantized_tensor], [new_dequantized_tensor])
+    torch.testing.assert_close(dequantized_tensor, new_dequantized_tensor)
