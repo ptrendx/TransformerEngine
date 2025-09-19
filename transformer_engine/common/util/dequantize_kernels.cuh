@@ -17,6 +17,7 @@
 #include <transformer_engine/cast.h>
 
 #include <cfloat>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -351,8 +352,8 @@ dequantize_fp4_kernel(const void *const input, OType *output, const fp8e4m3 *con
   const uint64_t *const input_vectorized = reinterpret_cast<const uint64_t*>(input);
   OVec *output_vec = reinterpret_cast<OVec*>(output);
 
-  const my_index = x + y * M;
-  const my_output_index = (x + y * M) * 4;
+  const size_t my_index = x + y * M;
+  const size_t my_output_index = (x + y * M) * 4;
   fp4vec value;
   value.vec = input_vectorized[my_index];
   fp8e4m3 scale = scales[my_index];
