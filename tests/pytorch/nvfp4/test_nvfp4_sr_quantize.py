@@ -2,7 +2,6 @@
 #
 # See LICENSE for license information.
 
-import math
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
@@ -10,7 +9,7 @@ from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 
 recipe_available, reason_for_no_recipe = FP8GlobalStateManager.is_nvfp4_available()
 
-seed = 0
+seed = 12345
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
@@ -82,8 +81,8 @@ def quantize_fp4(x: torch.Tensor, use_stochastic_rounding: bool) -> torch.Tensor
 
 def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: int) -> None:
     device = "cuda"
-    torch.manual_seed(0)
-    n_iters = 1000
+    torch.manual_seed(seed)
+    n_iters = 50
 
     # List of per-step signed mean error
     # Absolute error for each iteration
@@ -93,32 +92,28 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
     # represent to true mean.
     mean_err_sr, mean_err_rn = [], []
 
+    x = torch.randn((M, N), dtype=x_dtype, device=device) * 2 - 1
+    amax = torch.max(torch.abs(x)).float()
+    q_rn, s_rn = quantize_fp4(x, use_stochastic_rounding=False)
+    dq_rn = dequantize_fp4(q_rn, s_rn, amax)
+    error_rn = (dq_rn - x).float()
+    me_rn = torch.sqrt((error_rn * error_rn).mean())
+    sr_result = torch.zeros_like(x).float()
     for _ in range(n_iters):
-        x = torch.randn((M, N), dtype=x_dtype, device=device) * 2 - 1
-        amax = torch.max(torch.abs(x)).float()
-
-        q_rn, s_rn = quantize_fp4(x, use_stochastic_rounding=False)
         q_sr, s_sr = quantize_fp4(x, use_stochastic_rounding=True)
 
-        dq_rn = dequantize_fp4(q_rn, s_rn, amax)
         dq_sr = dequantize_fp4(q_sr, s_sr, amax)
 
-        me_sr = (dq_sr - x).float().mean()
-        me_rn = (dq_rn - x).float().mean()
+        sr_result += dq_sr.float()
 
-        mean_err_sr.append(me_sr)
-        mean_err_rn.append(me_rn)
+    # Get the mean result of the stochastic rounding
+    # It should be more accurate than the RN result
+    sr_result /= n_iters
+    error_sr = (sr_result - x).float()
+    me_sr = torch.sqrt((error_sr * error_sr).mean())
 
-    # Add up signed means for all steps. With SR, the
-    # accumulation errors should cancel out and give
-    # a lower error w.r.t. true mean.
-    mean_err_sr = torch.stack(mean_err_sr)
-    mean_err_rn = torch.stack(mean_err_rn)
-    m_sr = mean_err_sr.mean().abs().item()
-    m_rn = mean_err_rn.mean().abs().item()
-
-    print(f"Signed mean error SR: {m_sr:.3e} | Signed mean error RN: {m_rn:.3e}")
-    assert m_sr < m_rn, "Stochastic rounding failed."
+    print(f"RMSE SR: {me_sr:.3e} | RMSE RN: {me_rn:.3e}")
+    assert me_sr < me_rn, "Stochastic rounding failed - error is larger than the rount to nearest."
 
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
