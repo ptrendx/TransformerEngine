@@ -184,8 +184,8 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
 
     print(f"RMSE SR: {me_sr:.3e} | RMSE RN: {me_rn:.3e}")
     print(f"RMSE SR_t: {me_t_sr:.3e} | RMSE RN_t: {me_t_rn:.3e}")
-    assert me_sr < me_rn, "Stochastic rounding failed - error is larger than the rount to nearest."
-    assert me_t_sr < me_t_rn, "Stochastic rounding failed - error is larger than the rount to nearest."
+    assert me_sr < me_rn, "Stochastic rounding failed - error larger than the round to nearest."
+    assert me_t_sr < me_t_rn, "Stochastic rounding failed - error larger than the round to nearest."
 
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
