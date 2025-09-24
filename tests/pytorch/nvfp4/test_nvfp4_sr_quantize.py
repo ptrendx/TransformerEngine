@@ -54,7 +54,9 @@ def fp4_to_fp32(fp4: torch.Tensor) -> torch.Tensor:
 
 def dequantize_fp4(qx: torch.Tensor, sx: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
     sf = sx.repeat_interleave(16, dim=1).view(torch.float8_e4m3fn).to(torch.float32)
-    dequant = fp4_to_fp32(unpack_fp4(qx)) * sf * (amax / (6.0 * 448))
+    dqx = fp4_to_fp32(unpack_fp4(qx))
+    sf = sf[:dqx.shape[0], :dqx.shape[1]]
+    dequant = dqx * sf * (amax / (6.0 * 448))
     return dequant
 
 
@@ -142,7 +144,7 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
     ],
 )
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=str)
-@pytest.mark.parametrize("use_2D", [False], ids=str)
+@pytest.mark.parametrize("use_2D", [False, True], ids=str)
 @pytest.mark.parametrize("use_RHT", [False], ids=str)
 def test_quantization_block_tiling_versus_reference(
     x_dtype: torch.dtype,
