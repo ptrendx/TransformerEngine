@@ -59,6 +59,50 @@ def dequantize_fp4(qx: torch.Tensor, sx: torch.Tensor, amax: torch.Tensor) -> to
     dequant = dqx * sf * (amax / (6.0 * 448))
     return dequant
 
+def RHT(x: torch.Tensor) -> torch.Tensor:
+    def get_wgrad_sign_vector() -> torch.Tensor:
+        """Hard-coded signs for Hadamard transform"""
+        return torch.tensor(
+            [1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0],
+            dtype=torch.float32,
+        )
+    def _build_hadamard_matrix(
+        size: int, device: torch.device, dtype: torch.dtype, with_random_sign_mask: bool = True
+    ) -> torch.Tensor:
+        """Construct a Hadamard matrix of given power-of-two size with entries +-1.
+
+        Uses Sylvester construction to avoid SciPy dependency.
+        """
+        assert (size & (size - 1)) == 0, "Hadamard size must be a power of two"
+        h = torch.ones((1, 1), device=device, dtype=torch.float32)
+        while h.shape[0] < size:
+            h = torch.cat(
+                [
+                    torch.cat([h, h], dim=1),
+                    torch.cat([h, -h], dim=1),
+                ],
+                dim=0,
+            )
+        if with_random_sign_mask:
+            sign_mat = get_wgrad_sign_vector().to(device) * torch.eye(
+                size, device=device, dtype=torch.float32
+            )
+            h = sign_mat @ h
+        return h.to(dtype)
+
+    rht_dim = 16
+    # Build H and scale
+    H = _build_hadamard_matrix(rht_dim, x.device, x.dtype)
+    scale = 1.0 / float(rht_dim) ** 0.5
+
+    # Perform blockwise transform along the last dimension
+    original_shape = x.shape
+    x_mat = x.contiguous().view(-1, rht_dim)
+    # Random sign matrix is identity in this reference (no sign flipping)
+    transform = H * scale
+    out = x_mat @ transform
+    return out.view(original_shape)
+
 
 def quantize_fp4(x: torch.Tensor,
                  use_stochastic_rounding: bool,
