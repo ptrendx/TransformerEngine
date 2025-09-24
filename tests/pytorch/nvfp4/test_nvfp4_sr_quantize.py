@@ -154,7 +154,7 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
     me_t_rn = torch.sqrt((error_t_rn * error_t_rn).mean())
     sr_result = torch.zeros_like(x).float()
     sr_t_result = torch.zeros_like(x).float().t().contiguous()
-    for _ in range(n_iters):
+    for i in range(n_iters):
         q_sr, s_sr, q_t_sr, s_t_sr = quantize_fp4(x, use_stochastic_rounding=True,
                                                   use_2D=use_2D, use_RHT=use_RHT)
 
@@ -163,6 +163,15 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
 
         sr_result += dq_sr.float()
         sr_t_result += dq_t_sr.float()
+
+        # sr_result_tmp = sr_result / (i + 1)
+        # error_sr = (sr_result_tmp - x).float()
+        # me_sr = torch.sqrt((error_sr * error_sr).mean())
+        # sr_t_result_tmp = sr_t_result / (i + 1)
+        # error_t_sr = (sr_t_result_tmp - y).float()
+        # me_t_sr = torch.sqrt((error_t_sr * error_t_sr).mean())
+        # print(f"Iteration {i}: RMSE SR: {me_sr:.3e} | RMSE RN: {me_rn:.3e}")
+        # print(f"Iteration {i}: RMSE SR_t: {me_t_sr:.3e} | RMSE RN_t: {me_t_rn:.3e}")
 
     # Get the mean result of the stochastic rounding
     # It should be more accurate than the RN result
@@ -189,7 +198,7 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
 )
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=str)
 @pytest.mark.parametrize("use_2D", [False, True], ids=str)
-@pytest.mark.parametrize("use_RHT", [False], ids=str)
+@pytest.mark.parametrize("use_RHT", [False, True], ids=str)
 def test_quantization_block_tiling_versus_reference(
     x_dtype: torch.dtype,
     use_2D: bool,
@@ -197,6 +206,8 @@ def test_quantization_block_tiling_versus_reference(
     M: int,
     N: int,
 ) -> None:
+    if x_dtype == torch.float32 and use_RHT:
+        pytest.skip("RHT is only supported with bfloat16")
     check_quantization_nvfp4_versus_reference(
         x_dtype=x_dtype,
         use_2D=use_2D,
