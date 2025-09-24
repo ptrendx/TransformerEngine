@@ -58,15 +58,19 @@ def dequantize_fp4(qx: torch.Tensor, sx: torch.Tensor, amax: torch.Tensor) -> to
     return dequant
 
 
-def quantize_fp4(x: torch.Tensor, use_stochastic_rounding: bool) -> torch.Tensor:
+def quantize_fp4(x: torch.Tensor,
+                 use_stochastic_rounding: bool,
+                 use_2D: bool,
+                 use_RHT: bool) -> torch.Tensor:
     nvfp4_quantizer = NVFP4Quantizer(
         rowwise=True,
-        columnwise=False,
+        columnwise=True,
         with_amax_reduction=False,
         amax_reduction_group=None,
-        with_rht=False,
-        with_post_rht_amax=False,
+        with_rht=use_RHT,
+        with_post_rht_amax=True,
         stochastic_rounding=use_stochastic_rounding,
+        with_2d_quantization=use_2D,
     )
 
     x_nvfp4_sut = nvfp4_quantizer(x)
@@ -75,45 +79,58 @@ def quantize_fp4(x: torch.Tensor, use_stochastic_rounding: bool) -> torch.Tensor
     qx: torch.Tensor = x_nvfp4_sut._rowwise_data.view(dtype=torch.uint8)
     assert x_nvfp4_sut._rowwise_scale_inv is not None
     sx: torch.Tensor = x_nvfp4_sut._rowwise_scale_inv
+    assert x_nvfp4_sut._columnwise_data is not None
+    qx_t: torch.Tensor = x_nvfp4_sut._columnwise_data.view(dtype=torch.uint8)
+    assert x_nvfp4_sut._columnwise_scale_inv is not None
+    sx_t: torch.Tensor = x_nvfp4_sut._columnwise_scale_inv
 
-    return qx, sx
+    return qx, sx, qx_t, sx_t
 
 
-def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: int) -> None:
+def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: int,
+                                              use_2D: bool, use_RHT: bool) -> None:
     device = "cuda"
     torch.manual_seed(seed)
     n_iters = 50
 
-    # List of per-step signed mean error
-    # Absolute error for each iteration
-    # is expected to be worse for SR. But
-    # when signed errors are summed over
-    # a larger interval, SR should better
-    # represent to true mean.
-    mean_err_sr, mean_err_rn = [], []
-
     x = torch.randn((M, N), dtype=x_dtype, device=device) * 2 - 1
+    y = x.t().contiguous()
+    if use_RHT:
+        y = RHT(y)
     amax = torch.max(torch.abs(x)).float()
-    q_rn, s_rn = quantize_fp4(x, use_stochastic_rounding=False)
+    q_rn, s_rn, q_t_rn, s_t_rn = quantize_fp4(x, use_stochastic_rounding=False,
+                                              use_2D=use_2D, use_RHT=use_RHT)
     dq_rn = dequantize_fp4(q_rn, s_rn, amax)
+    dq_t_rn = dequantize_fp4(q_t_rn, s_t_rn, amax)
     error_rn = (dq_rn - x).float()
     me_rn = torch.sqrt((error_rn * error_rn).mean())
+    error_t_rn = (dq_t_rn - y).float()
+    me_t_rn = torch.sqrt((error_t_rn * error_t_rn).mean())
     sr_result = torch.zeros_like(x).float()
+    sr_t_result = torch.zeros_like(x).float().t().contiguous()
     for _ in range(n_iters):
-        q_sr, s_sr = quantize_fp4(x, use_stochastic_rounding=True)
+        q_sr, s_sr, q_t_sr, s_t_sr = quantize_fp4(x, use_stochastic_rounding=True,
+                                                  use_2D=use_2D, use_RHT=use_RHT)
 
         dq_sr = dequantize_fp4(q_sr, s_sr, amax)
+        dq_t_sr = dequantize_fp4(q_t_sr, s_t_sr, amax)
 
         sr_result += dq_sr.float()
+        sr_t_result += dq_t_sr.float()
 
     # Get the mean result of the stochastic rounding
     # It should be more accurate than the RN result
     sr_result /= n_iters
     error_sr = (sr_result - x).float()
     me_sr = torch.sqrt((error_sr * error_sr).mean())
+    sr_t_result /= n_iters
+    error_t_sr = (sr_t_result - y).float()
+    me_t_sr = torch.sqrt((error_t_sr * error_t_sr).mean())
 
     print(f"RMSE SR: {me_sr:.3e} | RMSE RN: {me_rn:.3e}")
+    print(f"RMSE SR_t: {me_t_sr:.3e} | RMSE RN_t: {me_t_rn:.3e}")
     assert me_sr < me_rn, "Stochastic rounding failed - error is larger than the rount to nearest."
+    assert me_t_sr < me_t_rn, "Stochastic rounding failed - error is larger than the rount to nearest."
 
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
@@ -121,16 +138,23 @@ def check_quantization_nvfp4_versus_reference(x_dtype: torch.dtype, M: int, N: i
     "M, N",
     [
         (8192, 8192),
+        (8192, 8256), # to test the nonfused RHT path
     ],
 )
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=str)
+@pytest.mark.parametrize("use_2D", [False], ids=str)
+@pytest.mark.parametrize("use_RHT", [False], ids=str)
 def test_quantization_block_tiling_versus_reference(
     x_dtype: torch.dtype,
+    use_2D: bool,
+    use_RHT: bool,
     M: int,
     N: int,
 ) -> None:
     check_quantization_nvfp4_versus_reference(
         x_dtype=x_dtype,
+        use_2D=use_2D,
+        use_RHT=use_RHT,
         M=M,
         N=N,
     )
