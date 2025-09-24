@@ -865,7 +865,7 @@ class QuantizationConfigWrapper {
   /*! \brief Set stochastic rounding state */
   void set_rng_state(NVTETensor rng_state) {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigRNGState, &rng_state,
-                                           sizeof(size_t));
+                                           sizeof(NVTETensor));
   }
 
   /*! \brief Set whether to use 2D block scaling for NVFP4 */
