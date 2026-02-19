@@ -620,11 +620,11 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
 
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
-    NVTE_CHECK(dbias->data.shape == std::vector<size_t>{cols}, "Wrong shape of DBias.");
+    NVTE_CHECK(dbias->data.shape == make_nvte_shape({cols}), "Wrong shape of DBias.");
     NVTE_CHECK(workspace != nullptr, "Workspace must be a tensor.");
 
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {dbias_rows, dbias_cols};
+      workspace->data.shape = make_nvte_shape({dbias_rows, dbias_cols});
       workspace->data.dtype = DType::kFloat32;
       return;
     }

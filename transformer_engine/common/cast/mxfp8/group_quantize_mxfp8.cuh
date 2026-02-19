@@ -852,11 +852,11 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
                "DBias is only supported for tensors with the const last dimension.");
     NVTE_CHECK(dbias->data.dtype == input->dtype(),
                "DBias must have the same type as input_tensor.");
-    NVTE_CHECK(dbias->data.shape == std::vector<size_t>{last_logical_dim}, "Wrong shape of DBias.");
+    NVTE_CHECK(dbias->data.shape == make_nvte_shape({last_logical_dim}), "Wrong shape of DBias.");
     NVTE_CHECK(workspace != nullptr, "Workspace must be a tensor.");
 
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {dbias_rows, dbias_cols};
+      workspace->data.shape = make_nvte_shape({dbias_rows, dbias_cols});
       workspace->data.dtype = DType::kFloat32;
       return;
     }

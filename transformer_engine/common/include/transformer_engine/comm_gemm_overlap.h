@@ -96,10 +96,10 @@ class CommOverlapCore {
   }
 
   TensorWrapper get_tensor_chunk(const TensorWrapper &source, size_t offset,
-                                 const std::vector<size_t> &shape);
+                                 const NVTEShape &shape);
 
   TensorWrapper get_buffer_chunk_like(const TensorWrapper &source, size_t offset,
-                                      const std::vector<size_t> &shape);
+                                      const NVTEShape &shape);
 
   int get_tp_size() { return _tp_size; }
 

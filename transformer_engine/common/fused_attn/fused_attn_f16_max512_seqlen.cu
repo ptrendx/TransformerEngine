@@ -1244,7 +1244,7 @@ void fused_attn_max_512_fwd(size_t batch, size_t num_head, size_t q_max_seqlen,
     Aux_CTX_Tensors->size = 1;
     Tensor *output_S = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[0]);
     output_S->data.dptr = nullptr;
-    output_S->data.shape = {batch, num_head, q_max_seqlen, kv_max_seqlen};
+    output_S->data.shape = make_nvte_shape({batch, num_head, q_max_seqlen, kv_max_seqlen});
     output_S->data.dtype = q_type;
   } else if (Aux_CTX_Tensors->size == 1) {
     Tensor *output_S = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[0]);
@@ -1272,12 +1272,12 @@ void fused_attn_max_512_fwd(size_t batch, size_t num_head, size_t q_max_seqlen,
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   } else {
@@ -1329,12 +1329,12 @@ void fused_attn_max_512_bwd(size_t batch, size_t num_head, size_t q_max_seqlen,
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   } else {

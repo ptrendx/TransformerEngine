@@ -120,7 +120,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
   } else {
     if (t.scaling_mode == NVTE_MXFP8_1D_SCALING) {
       // Need (4, 128) alignment even for e8 scaling factor
-      auto block_alignment = std::vector<size_t>{128ul, 4ul};
+      size_t block_alignment[] = {128ul, 4ul};
       size_t expected_x, expected_y, alignment;
       const size_t block_size_rowwise = 32;
       const size_t block_size_colwise = 32;
@@ -134,7 +134,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
             DIVUP(DIVUP(t.flat_last_dim(), static_cast<size_t>(block_size_rowwise)), alignment) *
             alignment;
 
-        const auto &expected = std::vector<size_t>{expected_x, expected_y};
+        const auto expected = make_nvte_shape({expected_x, expected_y});
         NVTE_CHECK(t.scale_inv.shape == expected, "Tensor \"", name,
                    "\" has invalid scale_inv shape (expected ", expected, ", got ",
                    t.scale_inv.shape, ")");
@@ -147,7 +147,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
         alignment = block_alignment[0];
         expected_y = DIVUP(DIVUP(t.flat_last_dim(), static_cast<size_t>(1)), alignment) * alignment;
 
-        const auto &expected = std::vector<size_t>{expected_x, expected_y};
+        const auto expected = make_nvte_shape({expected_x, expected_y});
         NVTE_CHECK(t.columnwise_scale_inv.shape == expected, "Tensor \"", name,
                    "\"  has invalid columnwise_scale_inv shape (expected ", expected, ", got ",
                    t.columnwise_scale_inv.shape, ")");
@@ -156,7 +156,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
       if (t.has_data()) {
         const size_t expected_y = DIVUP_TO_MULTIPLE(t.flat_first_dim(), 128);
         const size_t expected_x = DIVUP_TO_MULTIPLE(DIVUP(t.flat_last_dim(), 16lu), 4);
-        const auto &expected = std::vector<size_t>{expected_y, expected_x};
+        const auto expected = make_nvte_shape({expected_y, expected_x});
         NVTE_CHECK(t.scale_inv.shape == expected, "Tensor \"", name,
                    "\" has invalid scale_inv shape (expected ", expected, ", got ",
                    t.scale_inv.shape, ")");
@@ -164,7 +164,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
       if (t.has_columnwise_data()) {
         const size_t expected_y = DIVUP_TO_MULTIPLE(t.flat_last_dim(), 128);
         const size_t expected_x = DIVUP_TO_MULTIPLE(DIVUP(t.flat_first_dim(), 16lu), 4);
-        const auto &expected = std::vector<size_t>{expected_y, expected_x};
+        const auto expected = make_nvte_shape({expected_y, expected_x});
         NVTE_CHECK(t.columnwise_scale_inv.shape == expected, "Tensor \"", name,
                    "\"  has invalid columnwise_scale_inv shape (expected ", expected, ", got ",
                    t.columnwise_scale_inv.shape, ")");
@@ -654,9 +654,7 @@ NVTEShape nvte_tensor_shape(const NVTETensor tensor) {
   }
 
   // Determine tensor shape depending on tensor format
-  const std::vector<size_t> &shape = t->shape();
-
-  return nvte_make_shape(shape.data(), shape.size());
+  return t->shape();
 }
 
 NVTEShape nvte_tensor_columnwise_shape(const NVTETensor tensor) {
@@ -664,8 +662,7 @@ NVTEShape nvte_tensor_columnwise_shape(const NVTETensor tensor) {
   if (t == nullptr) {
     NVTE_ERROR("Invalid tensor");
   }
-  const std::vector<size_t> &shape = t->columnwise_data.shape;
-  return nvte_make_shape(shape.data(), shape.size());
+  return t->columnwise_data.shape;
 }
 
 size_t nvte_tensor_ndims(const NVTETensor tensor) { return nvte_tensor_shape(tensor).ndim; }
@@ -751,7 +748,7 @@ NVTEShape nvte_tensor_scale_inv_shape(const NVTETensor tensor) {
   if (t == nullptr) {
     return nvte_make_shape(nullptr, 1);
   }
-  return nvte_make_shape(t->scale_inv.shape.data(), t->scale_inv.shape.size());
+  return t->scale_inv.shape;
 }
 
 void nvte_set_tensor_param(NVTETensor *tensor, NVTETensorParam param_name,

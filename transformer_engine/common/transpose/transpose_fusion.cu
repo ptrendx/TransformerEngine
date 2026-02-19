@@ -378,7 +378,7 @@ void populate_transpose_dbias_workspace_config(const Tensor &input, /*cast*/
 
   if (workspace->data.dptr == nullptr) {
     // Set workspace size
-    workspace->data.shape = {num_rows_partial_dbias, row_length};
+    workspace->data.shape = make_nvte_shape({num_rows_partial_dbias, row_length});
     workspace->data.dtype = DType::kFloat32;
   } else {
     // Check that workspace matches expected size
@@ -433,7 +433,7 @@ void fp8_transpose_dbias(const Tensor &input, Tensor *transposed_output, Tensor 
 
   NVTE_CHECK(transposed_output->data.dtype == input.data.dtype,
              "T output must have the same type as input.");
-  NVTE_CHECK(dbias->data.shape == std::vector<size_t>{row_length}, "Wrong shape of DBias.");
+  NVTE_CHECK(dbias->data.shape == make_nvte_shape({row_length}), "Wrong shape of DBias.");
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
       dbias->data.dtype, BiasType,

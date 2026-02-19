@@ -1129,46 +1129,46 @@ void fused_attn_arbitrary_seqlen_fwd(
       Tensor *output_Max = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
       output_Max->data.dptr = nullptr;
       if (q_format == NVTE_QKV_Format::NVTE_THD && cudnn_runtime_version >= 90600) {
-        output_Max->data.shape = {num_tokens_q, num_attn_heads, 1};
+        output_Max->data.shape = make_nvte_shape({num_tokens_q, num_attn_heads, 1});
       } else {
-        output_Max->data.shape = {batch, num_attn_heads, max_seqlen_q, 1};
+        output_Max->data.shape = make_nvte_shape({batch, num_attn_heads, max_seqlen_q, 1});
       }
       output_Max->data.dtype = DType::kFloat32;
       Tensor *output_Sum_Exp = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
       output_Sum_Exp->data.dptr = nullptr;
       if (q_format == NVTE_QKV_Format::NVTE_THD && cudnn_runtime_version >= 90600) {
-        output_Sum_Exp->data.shape = {num_tokens_q, num_attn_heads, 1};
+        output_Sum_Exp->data.shape = make_nvte_shape({num_tokens_q, num_attn_heads, 1});
       } else {
-        output_Sum_Exp->data.shape = {batch, num_attn_heads, max_seqlen_q, 1};
+        output_Sum_Exp->data.shape = make_nvte_shape({batch, num_attn_heads, max_seqlen_q, 1});
       }
       output_Sum_Exp->data.dtype = DType::kFloat32;
     } else {
       Tensor *output_S = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
       output_S->data.dptr = nullptr;
       if (q_format == NVTE_QKV_Format::NVTE_THD && cudnn_runtime_version >= 90600) {
-        output_S->data.shape = {num_tokens_q, num_attn_heads, 1};
+        output_S->data.shape = make_nvte_shape({num_tokens_q, num_attn_heads, 1});
       } else {
-        output_S->data.shape = {batch, num_attn_heads, max_seqlen_q, 1};
+        output_S->data.shape = make_nvte_shape({batch, num_attn_heads, max_seqlen_q, 1});
       }
       output_S->data.dtype = DType::kFloat32;
     }
 
     Tensor *output_rng_state = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
     output_rng_state->data.dptr = nullptr;
-    output_rng_state->data.shape = {2};
+    output_rng_state->data.shape = make_nvte_shape({2});
     output_rng_state->data.dtype = DType::kInt64;
 
     if ((bias_type != NVTE_NO_BIAS) && (bias_type != NVTE_ALIBI)) {
       Tensor *output_bias = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
       output_bias->data.dptr = nullptr;
-      output_bias->data.shape = {bias_b, bias_h, bias_sq, bias_skv};
+      output_bias->data.shape = make_nvte_shape({bias_b, bias_h, bias_sq, bias_skv});
       output_bias->data.dtype = QKV_type;
     }
 
     if (softmax_type != NVTE_VANILLA_SOFTMAX) {
       Tensor *output_softmax_offset = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[i++]);
       output_softmax_offset->data.dptr = nullptr;
-      output_softmax_offset->data.shape = {1, num_attn_heads, 1, 1};
+      output_softmax_offset->data.shape = make_nvte_shape({1, num_attn_heads, 1, 1});
       output_softmax_offset->data.dtype = DType::kFloat32;
     }
 
@@ -1216,12 +1216,12 @@ void fused_attn_arbitrary_seqlen_fwd(
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   } else {
@@ -1314,12 +1314,12 @@ void fused_attn_arbitrary_seqlen_bwd(
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   } else {

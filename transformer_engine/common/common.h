@@ -74,29 +74,45 @@ inline size_t product(const std::vector<size_t> &shape) {
   return ret;
 }
 
+inline size_t product(const NVTEShape &shape) {
+  size_t ret = 1;
+  for (size_t i = 0; i < shape.ndim; ++i) {
+    ret *= shape.data[i];
+  }
+  return ret;
+}
+
+inline size_t product(const NVTEShape &shape, size_t begin, size_t end) {
+  NVTE_CHECK(begin <= end && end <= shape.ndim, "Attempted to access entries ", begin, " to ", end,
+             " in a shape with ", shape.ndim, " entries");
+  size_t ret = 1;
+  for (size_t i = begin; i < end; ++i) {
+    ret *= shape.data[i];
+  }
+  return ret;
+}
+
 size_t get_buffer_size_bytes(const size_t N, const DType buffer_dtype);
 size_t get_buffer_size_bytes(const size_t dim_first, const size_t dim_last,
                              const DType buffer_dtype);
 
 struct SimpleTensor {
   void *dptr;
-  std::vector<size_t> shape;
+  NVTEShape shape;
   DType dtype;
 
-  SimpleTensor(void *dptr, std::vector<size_t> shape, DType dtype)
-      : dptr{dptr}, shape{std::move(shape)}, dtype{dtype} {}
+  SimpleTensor(void *dptr, NVTEShape shape, DType dtype)
+      : dptr{dptr}, shape{shape}, dtype{dtype} {}
+
+  SimpleTensor(void *dptr, const std::vector<size_t> &shape, DType dtype)
+      : dptr{dptr}, shape{nvte_make_shape(shape.data(), shape.size())}, dtype{dtype} {}
 
   SimpleTensor(const NVTEBasicTensor &tensor)  // NOLINT
-      : dptr(tensor.data_ptr),
-        shape(tensor.shape.data, tensor.shape.data + tensor.shape.ndim),
-        dtype(static_cast<DType>(tensor.dtype)) {}
+      : dptr(tensor.data_ptr), shape(tensor.shape), dtype(static_cast<DType>(tensor.dtype)) {}
 
-  SimpleTensor() : SimpleTensor(nullptr, std::vector<size_t>{0}, DType::kFloat32) {}
+  SimpleTensor() : dptr{nullptr}, shape{make_nvte_shape({0})}, dtype{DType::kFloat32} {}
 
-  operator NVTEBasicTensor() const {
-    return {dptr, static_cast<NVTEDType>(dtype),
-            nvte_make_shape(this->shape.data(), this->shape.size())};
-  }
+  operator NVTEBasicTensor() const { return {dptr, static_cast<NVTEDType>(dtype), shape}; }
 
   /*! Number of tensor elements. */
   size_t numel() const { return product(shape); }
@@ -214,7 +230,7 @@ struct Tensor {
    *  different shape, e.g. the column-wise data for some tensor
    *  formats are transposed.
    */
-  std::vector<size_t> shape() const {
+  NVTEShape shape() const {
     // Each tensor format interprets its data differently
     switch (scaling_mode) {
       case NVTE_DELAYED_TENSOR_SCALING:
@@ -224,13 +240,13 @@ struct Tensor {
         // Row-wise data shape matches tensor logical shape,
         // column-wise data shape is transpose of logical shape
         if (!has_data() && has_columnwise_data()) {
-          std::vector<size_t> ret;
+          NVTEShape ret{};
           if (!columnwise_data.shape.empty()) {
-            ret.reserve(columnwise_data.shape.size());
-            for (size_t i = 1; i < columnwise_data.shape.size(); i++) {
-              ret.push_back(columnwise_data.shape[i]);
+            ret.ndim = columnwise_data.shape.ndim;
+            for (size_t i = 1; i < columnwise_data.shape.ndim; i++) {
+              ret.data[i - 1] = columnwise_data.shape[i];
             }
-            ret.push_back(columnwise_data.shape.front());
+            ret.data[ret.ndim - 1] = columnwise_data.shape.front();
           }
           return ret;
         }
@@ -351,9 +367,9 @@ struct GroupedTensor {
         scale(),
         scaling_mode(scaling_mode),
         num_tensors(num_tensors),
-        first_dims(nullptr, std::vector<size_t>{0}, DType::kInt64),
-        last_dims(nullptr, std::vector<size_t>{0}, DType::kInt64),
-        tensor_offsets(nullptr, std::vector<size_t>{0}, DType::kInt64),
+        first_dims(nullptr, make_nvte_shape({0}), DType::kInt64),
+        last_dims(nullptr, make_nvte_shape({0}), DType::kInt64),
+        tensor_offsets(nullptr, make_nvte_shape({0}), DType::kInt64),
         logical_shape(nvte_make_shape(nullptr, 1)),
         nvte_tensor(0) {}
 

@@ -495,7 +495,7 @@ void quantize_transpose_square_blockwise(const SimpleTensor& input, SimpleTensor
   const size_t row_length = input.shape.size() > 0 ? input.shape.back() : 1;
   size_t num_rows = 1;
   for (size_t i = 0; (i < input.shape.size() - 1) && (input.shape.size() > 0); ++i) {
-    num_rows *= input.shape.at(i);
+    num_rows *= input.shape[i];
   }
 
   NVTE_CHECK(scale_inv.shape.size() == 2, "scale_inv must have 2 dimensions.");

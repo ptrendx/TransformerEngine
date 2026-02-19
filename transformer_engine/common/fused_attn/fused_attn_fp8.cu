@@ -2446,13 +2446,13 @@ void fused_attn_fp8_fwd(size_t batch, size_t num_attn_heads, size_t num_gqa_grou
     Tensor* output_ZInv = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[1]);
     Tensor* output_rng_state = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[2]);
     output_M->data.dptr = nullptr;
-    output_M->data.shape = {batch, num_attn_heads, max_seqlen_q, 1};
+    output_M->data.shape = make_nvte_shape({batch, num_attn_heads, max_seqlen_q, 1});
     output_M->data.dtype = DType::kFloat32;
     output_ZInv->data.dptr = nullptr;
-    output_ZInv->data.shape = {batch, num_attn_heads, max_seqlen_q, 1};
+    output_ZInv->data.shape = make_nvte_shape({batch, num_attn_heads, max_seqlen_q, 1});
     output_ZInv->data.dtype = DType::kFloat32;
     output_rng_state->data.dptr = nullptr;
-    output_rng_state->data.shape = {2};
+    output_rng_state->data.shape = make_nvte_shape({2});
     output_rng_state->data.dtype = DType::kInt64;
   } else if (Aux_CTX_Tensors->size == 3) {
     Tensor* output_M = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[0]);
@@ -2505,12 +2505,12 @@ void fused_attn_fp8_fwd(size_t batch, size_t num_attn_heads, size_t num_gqa_grou
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   }
@@ -2604,12 +2604,12 @@ void fused_attn_fp8_bwd(size_t batch, size_t num_attn_heads, size_t num_gqa_grou
 
   if (workspace_size > 0) {
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {workspace_size};
+      workspace->data.shape = make_nvte_shape({workspace_size});
       workspace->data.dtype = DType::kByte;
       return;
     }
   } else if (workspace_size == 0) {
-    workspace->data.shape = {1};
+    workspace->data.shape = make_nvte_shape({1});
     workspace->data.dtype = DType::kByte;
     return;
   }

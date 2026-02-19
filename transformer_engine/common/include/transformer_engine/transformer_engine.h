@@ -45,6 +45,28 @@ struct NVTEShape {
   size_t data[15];
   /*! \brief Number of dimensions. */
   size_t ndim;
+#ifdef __cplusplus
+  size_t& operator[](size_t i) { return data[i]; }
+  const size_t& operator[](size_t i) const { return data[i]; }
+  size_t size() const { return ndim; }
+  bool empty() const { return ndim == 0; }
+  size_t& front() { return data[0]; }
+  const size_t& front() const { return data[0]; }
+  size_t& back() { return data[ndim - 1]; }
+  const size_t& back() const { return data[ndim - 1]; }
+  size_t* begin() { return data; }
+  const size_t* begin() const { return data; }
+  size_t* end() { return data + ndim; }
+  const size_t* end() const { return data + ndim; }
+  bool operator==(const NVTEShape& o) const {
+    if (ndim != o.ndim) return false;
+    for (size_t i = 0; i < ndim; ++i)
+      if (data[i] != o.data[i]) return false;
+    return true;
+  }
+  bool operator!=(const NVTEShape& o) const { return !(*this == o); }
+  void resize(size_t n) { ndim = n; }
+#endif
 };
 
 /*! \struct NVTEBasicTensor
@@ -538,7 +560,17 @@ NVTEShape nvte_get_grouped_tensor_logical_shape(const NVTEGroupedTensor tensor);
 #ifdef __cplusplus
 }  // extern "C"
 
+#include <initializer_list>
 #include <vector>
+
+/*! \brief Create an NVTEShape from an initializer list of dimensions. */
+inline NVTEShape make_nvte_shape(std::initializer_list<size_t> dims) {
+  NVTEShape s{};
+  s.ndim = dims.size();
+  size_t i = 0;
+  for (auto d : dims) s.data[i++] = d;
+  return s;
+}
 
 /*! \namespace transformer_engine
  *  \brief Namespace containing C++ API of Transformer Engine.

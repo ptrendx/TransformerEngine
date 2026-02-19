@@ -60,11 +60,11 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
         Tensor transpose_in, transpose_out, dummy;
         transpose_in.scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
         transpose_in.data.dptr = output->data.dptr;
-        transpose_in.data.shape = {output->flat_first_dim(), output->flat_last_dim()};
+        transpose_in.data.shape = make_nvte_shape({output->flat_first_dim(), output->flat_last_dim()});
         transpose_in.data.dtype = output->data.dtype;
         transpose_out.scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
         transpose_out.data.dptr = output->columnwise_data.dptr;
-        transpose_out.data.shape = {output->flat_last_dim(), output->flat_first_dim()};
+        transpose_out.data.shape = make_nvte_shape({output->flat_last_dim(), output->flat_first_dim()});
         transpose_out.data.dtype = output->data.dtype;
         detail::transpose(transpose_in, /*noop=*/dummy, &transpose_out, stream);
       }
@@ -150,11 +150,11 @@ void quantize_gated_bwd_helper(const NVTETensor nvte_grad, const NVTETensor nvte
         Tensor transpose_in, transpose_out, dummy;
         transpose_in.scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
         transpose_in.data.dptr = output->data.dptr;
-        transpose_in.data.shape = {output->flat_first_dim(), output->flat_last_dim()};
+        transpose_in.data.shape = make_nvte_shape({output->flat_first_dim(), output->flat_last_dim()});
         transpose_in.data.dtype = output->data.dtype;
         transpose_out.scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
         transpose_out.data.dptr = output->columnwise_data.dptr;
-        transpose_out.data.shape = {output->flat_last_dim(), output->flat_first_dim()};
+        transpose_out.data.shape = make_nvte_shape({output->flat_last_dim(), output->flat_first_dim()});
         transpose_out.data.dtype = output->data.dtype;
         detail::transpose(transpose_in, /*noop=*/dummy, &transpose_out, stream);
       }

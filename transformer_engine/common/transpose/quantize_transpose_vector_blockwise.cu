@@ -535,12 +535,12 @@ void quantize_transpose_vector_blockwise(const SimpleTensor& input, SimpleTensor
                "with MXFP8, which requires using power of two scaling factors.");
   }
 
-  const size_t row_length = input.shape.size() > 0 ? input.shape.at(input.shape.size() - 1) : 1u;
+  const size_t row_length = input.shape.size() > 0 ? input.shape[input.shape.size() - 1] : 1u;
   size_t num_elements = row_length;
   size_t num_rows = 1;
   for (size_t i = 0; (i < input.shape.size() - 1) && (input.shape.size() > 0); ++i) {
-    num_rows *= input.shape.at(i);
-    num_elements *= input.shape.at(i);
+    num_rows *= input.shape[i];
+    num_elements *= input.shape[i];
   }
 
   // Early return if the input tensor is empty
@@ -574,7 +574,7 @@ void quantize_transpose_vector_blockwise(const SimpleTensor& input, SimpleTensor
       if (columnwise_option == FP8BlockwiseColumnwiseOption::COLUMNWISE_GEMM_READY) {
         NVTE_CHECK(output_t.shape[0] == row_length, "Wrong dimension 0 of output_t.");
         for (size_t i = 1; i < output_t.shape.size(); ++i) {
-          NVTE_CHECK(output_t.shape.at(i) == input.shape.at(i - 1), "Wrong dimension in output_t");
+          NVTE_CHECK(output_t.shape[i] == input.shape[i - 1], "Wrong dimension in output_t");
         }
       } else {
         NVTE_CHECK(columnwise_option == FP8BlockwiseColumnwiseOption::COLUMNWISE_COMPACT,

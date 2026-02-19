@@ -188,7 +188,7 @@ void populate_cast_transpose_dbias_workspace_config(const Tensor &cast_output, /
   const size_t num_rows_partial_dbias = DIVUP(num_rows, tile_size_y);
 
   if (workspace->data.dptr == nullptr) {
-    workspace->data.shape = {num_rows_partial_dbias, row_length};
+    workspace->data.shape = make_nvte_shape({num_rows_partial_dbias, row_length});
     workspace->data.dtype = DType::kFloat32;
   } else {
     // Check that workspace matches expected size
@@ -549,7 +549,7 @@ void cast_transpose_fused(const Tensor &input, const Tensor *act_input, Tensor *
 
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.data.dtype, "DBias must have the same type as input.");
-    NVTE_CHECK(dbias->data.shape == std::vector<size_t>{row_length}, "Wrong shape of DBias.");
+    NVTE_CHECK(dbias->data.shape == make_nvte_shape({row_length}), "Wrong shape of DBias.");
   }
   if constexpr (IS_DACT) {
     NVTE_CHECK(input.dtype() == act_input->dtype(), "Types of both inputs must match.");

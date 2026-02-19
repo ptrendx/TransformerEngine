@@ -721,12 +721,12 @@ void quantize_transpose_vector_blockwise_fp4(
   NVTE_CHECK(return_identity || !use_2d_quantization,
              "2D block quantization is only supported when return_identity is true.");
 
-  const size_t row_length = input.shape.size() > 0 ? input.shape.at(input.shape.size() - 1) : 1u;
+  const size_t row_length = input.shape.size() > 0 ? input.shape[input.shape.size() - 1] : 1u;
   size_t num_elements = row_length;
   size_t num_rows = 1;
   for (size_t i = 0; (i < input.shape.size() - 1) && (input.shape.size() > 0); ++i) {
-    num_rows *= input.shape.at(i);
-    num_elements *= input.shape.at(i);
+    num_rows *= input.shape[i];
+    num_elements *= input.shape[i];
   }
 
   // Early return if the input tensor is empty
@@ -763,7 +763,7 @@ void quantize_transpose_vector_blockwise_fp4(
     Tensor& rng_state_te_tensor = *convertNVTETensor(rng_state_tensor);
     NVTE_CHECK(rng_state_te_tensor.dtype() == DType::kInt64,
                "RNG state should contain 2 64-bit values.");
-    NVTE_CHECK(rng_state_te_tensor.data.shape == std::vector<size_t>{2},
+    NVTE_CHECK(rng_state_te_tensor.data.shape == make_nvte_shape({2}),
                "Shape of the RNG state should be [2], but got ", rng_state_te_tensor.data.shape);
     rng_state = reinterpret_cast<const size_t*>(rng_state_te_tensor.data.dptr);
   }
