@@ -101,10 +101,11 @@ inline std::vector<size_t> generateShape(std::mt19937_64& rng,
         switch (strategy) {
             case kAllNice:
                 dim = niceDim(rng);
-                // Keep nice alignment when capping
                 dim = capDim(dim, total, max_total);
-                if (dim > 0 && dim < 128) dim = 128;
-                if (dim >= 128) dim = (dim / 128) * 128;
+                // Round down to nearest multiple of 128
+                dim = (dim / 128) * 128;
+                // If budget doesn't allow even 128, use 1
+                if (dim == 0) dim = 1;
                 break;
             case kMixedNice:
                 dim = (d == nice_pos) ? niceDim(rng) : randomDim(rng);
