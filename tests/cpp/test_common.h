@@ -565,6 +565,8 @@ GroupedBuffers build_grouped_tensor(const std::vector<Tensor*>& tensors,
 
 }  // namespace test
 
+#include "test_random_shapes.h"
+
 #if FP4_TYPE_SUPPORTED
 #define SWITCH_FP4_TYPE_HANDLE(type, ...) \
   case DType::kFloat4E2M1: {              \

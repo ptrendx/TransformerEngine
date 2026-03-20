@@ -55,30 +55,30 @@ void performTest(const size_t N, const size_t H) {
   compareResults("output", output, ref_output.get(), true, atol, rtol);
 }
 
-std::vector<std::pair<size_t, size_t>> test_cases = {{2048, 12288},
-                                                     {768, 1024},
-                                                     {256, 65536},
-                                                     {65536, 128},
-                                                     {256, 256},
-                                                     {120, 2080},
-                                                     {8, 8},
-                                                     {1223, 1583}, // Primes 200, 250
-                                                     {1, 541},     // Prime 100
-                                                     {1987, 1}};   // Prime 300
+std::vector<std::vector<size_t>> test_cases = {{2048, 12288},
+                                               {768, 1024},
+                                               {256, 65536},
+                                               {65536, 128},
+                                               {256, 256},
+                                               {120, 2080},
+                                               {8, 8},
+                                               {1223, 1583}, // Primes 200, 250
+                                               {1, 541},     // Prime 100
+                                               {1987, 1}};   // Prime 300
 }  // namespace
 
 class TTestSuite : public ::testing::TestWithParam<std::tuple<transformer_engine::DType,
-                                                              std::pair<size_t, size_t>>> {};
+                                                              std::vector<size_t>>> {};
 
 TEST_P(TTestSuite, TestTranspose) {
   using namespace transformer_engine;
   using namespace test;
 
   const DType type = std::get<0>(GetParam());
-  const auto size = std::get<1>(GetParam());
+  const auto& size = std::get<1>(GetParam());
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(type, T,
-    performTest<T>(size.first, size.second);
+    performTest<T>(size[0], size[1]);
   );
 }
 
@@ -91,8 +91,22 @@ INSTANTIATE_TEST_SUITE_P(
       ::testing::ValuesIn(test::all_fp_types),
       ::testing::ValuesIn(test_cases)),
   [](const testing::TestParamInfo<TTestSuite::ParamType>& info) {
+    const auto& shape = std::get<1>(info.param);
     std::string name = test::typeName(std::get<0>(info.param)) + "X" +
-                       std::to_string(std::get<1>(info.param).first) + "X" +
-                       std::to_string(std::get<1>(info.param).second);
+                       std::to_string(shape[0]) + "X" +
+                       std::to_string(shape[1]);
     return name;
   });
+
+TEST(OperatorTest, TestTranspose_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 2, 2);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION(
+      performTest<bf16>(shape[0], shape[1]);
+    );
+  }
+}

@@ -22,6 +22,24 @@
 #include <transformer_engine/transformer_engine.h>
 #include "util/logging.h"
 
+// Prints the random shape seed after all tests finish, so it's easy to find
+// in the output regardless of how many tests ran.
+class SeedPrinterEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override { printSeed(); }
+  void TearDown() override { printSeed(); }
+
+ private:
+  static void printSeed() {
+    std::cerr << "[RandomShapes] seed=" << test::getTestSeed()
+              << " (reproduce with NVTE_TEST_SEED=" << test::getTestSeed() << ")"
+              << std::endl;
+  }
+};
+
+static auto* seed_printer_env_ =
+    ::testing::AddGlobalTestEnvironment(new SeedPrinterEnvironment());
+
 namespace test {
 
 size_t create_seed_from_tensor_name(const std::string& tensor_name) {

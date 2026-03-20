@@ -38,6 +38,7 @@ void compute_ref_stats(NormType norm_type,
                        const InputType *data, float *mu, float *rsigma,
                        const size_t N, const size_t H, const double epsilon){
   using compute_t = float;
+  if (H == 0) return;
   compute_t current, m;
   for (size_t i = 0; i < N; ++i) {
     compute_t sum = 0;
@@ -146,6 +147,7 @@ void compute_ref_backward(const NormType norm_type, const OutputType *output_gra
                           const bool zero_centered_gamma, const bool use_cudnn,
                           const bool cudnn_zero_centered_gamma_in_weight_dtype) {
   using compute_t = float;
+  if (H == 0) return;
   std::vector<compute_t> dgamma(H, 0.f);
   std::vector<compute_t> dbeta(H, 0.f);
 

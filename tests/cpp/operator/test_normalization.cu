@@ -226,7 +226,7 @@ void performTest(const size_t N, const size_t H, const bool zero_centered_gamma,
   compareResults("dbeta", dbeta, ref_dbeta.get(), true, atol_bwd, rtol_bwd);
 }
 
-std::vector<std::pair<size_t, size_t>> test_cases = {
+std::vector<std::vector<size_t>> test_cases = {
   {71, 229},
   {29, 541},
   {768, 6144},
@@ -239,7 +239,7 @@ class NormTestSuite : public ::testing::TestWithParam<std::tuple<bool,
                                                                  NormType,
                                                                  transformer_engine::DType,
                                                                  transformer_engine::DType,
-                                                                 std::pair<size_t, size_t>,
+                                                                 std::vector<size_t>,
                                                                  bool,
                                                                  bool,
                                                                  bool>> {};
@@ -252,7 +252,7 @@ TEST_P(NormTestSuite, TestNorm) {
   const NormType norm_type = std::get<1>(GetParam());
   const DType input_type = std::get<2>(GetParam());
   const DType output_type = std::get<3>(GetParam());
-  const auto size = std::get<4>(GetParam());
+  const auto& size = std::get<4>(GetParam());
   const bool zero_centered_gamma = std::get<5>(GetParam());
   const bool cudnn_zero_centered_gamma_in_weight_dtype = std::get<6>(GetParam());
   const bool fused_bwd_add = std::get<7>(GetParam());
@@ -260,8 +260,8 @@ TEST_P(NormTestSuite, TestNorm) {
   TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
       performTest<InputType, OutputType>(
-        size.first,
-        size.second,
+        size[0],
+        size[1],
         zero_centered_gamma,
         norm_type,
         use_cudnn,
@@ -286,15 +286,34 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(false, true)),
   [](const testing::TestParamInfo<NormTestSuite::ParamType>& info) {
     auto backend = std::get<0>(info.param) == false ? "Te" : "Cudnn";
+    const auto& shape = std::get<4>(info.param);
     std::string name =
       backend +
       normToString.at(std::get<1>(info.param)) + "_" +
       test::typeName(std::get<2>(info.param)) + "X" +
       test::typeName(std::get<3>(info.param)) + "X" +
-      std::to_string(std::get<4>(info.param).first) + "X" +
-      std::to_string(std::get<4>(info.param).second) + "X" +
+      std::to_string(shape[0]) + "X" +
+      std::to_string(shape[1]) + "X" +
       std::to_string(std::get<5>(info.param)) + "X" +
       std::to_string(std::get<6>(info.param)) + "X" +
       std::to_string(std::get<7>(info.param));
     return name;
   });
+
+TEST(OperatorTest, TestNorm_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 2, 2);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION(
+      performTest<bf16, bf16>(shape[0], shape[1],
+                              false,              // zero_centered_gamma
+                              NormType::RMSNorm,
+                              false,              // use_cudnn
+                              false,              // zero_centered_gamma_in_weight_dtype
+                              false);             // fused_bwd_add
+    );
+  }
+}

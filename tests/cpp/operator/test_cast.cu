@@ -108,7 +108,6 @@ TEST_P(CastTestSuite, TestCast) {
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(input_type, InputType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_ALL(output_type, OutputType,
-      // delayed tensor scaling
       performTest<InputType, OutputType>(size);
     );
   );
@@ -132,3 +131,16 @@ INSTANTIATE_TEST_SUITE_P(
     }
     return name;
   });
+
+TEST(OperatorTest, TestCast_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 1, 4);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION(
+      performTest<bf16, fp8e4m3>(shape);
+    );
+  }
+}
