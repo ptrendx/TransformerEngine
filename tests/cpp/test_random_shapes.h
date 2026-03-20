@@ -131,6 +131,13 @@ inline std::vector<size_t> generateShape(std::mt19937_64& rng,
 
 }  // namespace detail
 
+// Returns total number of elements for a shape.
+inline size_t totalElements(const std::vector<size_t>& shape) {
+    size_t total = 1;
+    for (auto d : shape) total *= d;
+    return total;
+}
+
 // Generates random shapes at runtime.
 //
 // count              — number of shapes to generate
@@ -153,12 +160,18 @@ inline std::vector<std::vector<size_t>> generateRandomShapes(
     std::uniform_int_distribution<int> strategy_dist(0, detail::kNumStrategies - 1);
     std::uniform_int_distribution<size_t> ndim_dist(min_dims, max_dims);
 
+    static const char* strategy_names[] = {"AllNice", "MixedNice", "Random", "EdgeCase"};
+
     std::vector<std::vector<size_t>> result;
     result.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         auto strategy = static_cast<detail::Strategy>(strategy_dist(rng));
         size_t ndim = ndim_dist(rng);
-        result.push_back(detail::generateShape(rng, strategy, ndim, max_total_elements));
+        auto shape = detail::generateShape(rng, strategy, ndim, max_total_elements);
+        std::cerr << "  [RandomShapes] shape[" << i << "]=" << shapeToString(shape)
+                  << " (" << totalElements(shape) << " elements, "
+                  << strategy_names[strategy] << ")" << std::endl;
+        result.push_back(std::move(shape));
     }
     return result;
 }
@@ -211,10 +224,16 @@ inline std::vector<std::vector<size_t>> generateRandomShapes(
         throw;                                                                  \
     }
 
-// Adds a SCOPED_TRACE with the seed and shape for reproducibility.
+// Adds a SCOPED_TRACE with the seed and shape for reproducibility,
+// and prints verbose info to stderr so progress is visible in real time.
 // On failure, GTest output will show e.g.:
 //   Google Test trace:
 //   NVTE_TEST_SEED=8374291 shape={11, 0}
 #define NVTE_TRACE_RANDOM_SHAPE(shape)                                         \
+    do {                                                                        \
+        std::cerr << "  Testing shape=" << test::shapeToString(shape)          \
+                  << " (" << test::totalElements(shape) << " elements)"        \
+                  << std::endl;                                                \
+    } while (0);                                                               \
     SCOPED_TRACE("NVTE_TEST_SEED=" + std::to_string(test::getTestSeed()) +     \
                  " shape=" + test::shapeToString(shape))
