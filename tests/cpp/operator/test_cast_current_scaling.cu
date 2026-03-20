@@ -219,7 +219,7 @@ TEST(OperatorTest, TestCastCS_RandomShapes) {
   const auto shapes = generateRandomShapes(5, 1, 4);
   for (const auto& shape : shapes) {
     NVTE_TRACE_RANDOM_SHAPE(shape);
-    NVTE_TEST_ALLOW_EXCEPTION(
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
       performTest<bf16, fp8e4m3>(shape);
     );
   }

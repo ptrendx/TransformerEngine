@@ -166,3 +166,16 @@ INSTANTIATE_TEST_SUITE_P(
                          std::to_string(std::get<2>(info.param).second);
       return name;
     });
+
+TEST(OperatorTest, TestCastTransposeDBias_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 2, 2);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
+      performTest<bf16, fp8e4m3>(shape[0], shape[1]);
+    );
+  }
+}

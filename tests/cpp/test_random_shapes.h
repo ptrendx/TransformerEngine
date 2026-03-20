@@ -172,6 +172,10 @@ inline std::vector<std::vector<size_t>> generateRandomShapes(
 // so they still fail the test — those indicate real bugs, not unsupported
 // shapes.  Crashes (segfaults) and wrong numerical results also still fail.
 //
+// NOTE: Use this only outside loops. Inside a loop over shapes, use
+// NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP which logs and continues instead of
+// skipping the entire test.
+//
 // Usage:
 //   NVTE_TEST_ALLOW_EXCEPTION(performTest<T>(shape));
 #define NVTE_TEST_ALLOW_EXCEPTION(...)                                          \
@@ -186,6 +190,26 @@ inline std::vector<std::vector<size_t>> generateRandomShapes(
             throw;                                                              \
         }                                                                       \
     } while (0)
+
+// Loop-friendly variant: logs unsupported configurations and continues
+// to the next iteration instead of skipping the entire test.
+//
+// Usage (inside a for loop):
+//   for (const auto& shape : shapes) {
+//     NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(performTest<T>(shape));
+//   }
+#define NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(...)                                  \
+    try {                                                                       \
+        __VA_ARGS__;                                                            \
+    } catch (const std::exception& e) {                                         \
+        const std::string msg_ = e.what();                                      \
+        if (msg_.find("Assertion failed:") != std::string::npos) {              \
+            std::cerr << "  [SKIP] Unsupported configuration: " << msg_         \
+                      << std::endl;                                             \
+            continue;                                                           \
+        }                                                                       \
+        throw;                                                                  \
+    }
 
 // Adds a SCOPED_TRACE with the seed and shape for reproducibility.
 // On failure, GTest output will show e.g.:

@@ -307,7 +307,7 @@ TEST(OperatorTest, TestNorm_RandomShapes) {
   const auto shapes = generateRandomShapes(5, 2, 2);
   for (const auto& shape : shapes) {
     NVTE_TRACE_RANDOM_SHAPE(shape);
-    NVTE_TEST_ALLOW_EXCEPTION(
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
       performTest<bf16, bf16>(shape[0], shape[1],
                               false,              // zero_centered_gamma
                               NormType::RMSNorm,

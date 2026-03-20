@@ -410,3 +410,19 @@ INSTANTIATE_TEST_SUITE_P(
                          std::to_string(std::get<2>(info.param).second);
       return name;
     });
+
+TEST(OperatorTest, TestAct_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 2, 2);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
+      performTest<gelu, dgelu, nvte_gelu, nvte_dgelu, bf16, bf16>(shape[0], shape[1]);
+    );
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
+      performTestGLU<gelu, dgelu, nvte_geglu, nvte_dgeglu, bf16, bf16>(shape[0], shape[1]);
+    );
+  }
+}

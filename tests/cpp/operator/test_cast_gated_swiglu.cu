@@ -163,3 +163,16 @@ INSTANTIATE_TEST_SUITE_P(
       }
       return name;
     });
+
+TEST(OperatorTest, TestCastGatedSwiGLU_RandomShapes) {
+  using namespace transformer_engine;
+  using namespace test;
+
+  const auto shapes = generateRandomShapes(5, 1, 4);
+  for (const auto& shape : shapes) {
+    NVTE_TRACE_RANDOM_SHAPE(shape);
+    NVTE_TEST_ALLOW_EXCEPTION_IN_LOOP(
+      performTest<bf16, fp8e4m3>(shape);
+    );
+  }
+}
