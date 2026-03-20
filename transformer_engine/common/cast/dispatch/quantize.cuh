@@ -54,6 +54,9 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
                "Stochastic rounding is only supported for NVFP4 quantization.");
   }
 
+  // Nothing to do for empty tensors
+  if (input_tensor->numel() == 0) return;
+
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
              "Either rowwise or columnwise output data need to be allocated.");
 
@@ -198,6 +201,9 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
     NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
                "Stochastic rounding is only supported for NVFP4 quantization.");
   }
+
+  // Nothing to do for empty tensors
+  if (grad_tensor->numel() == 0) return;
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
              "Either rowwise or columnwise output data need to be allocated.");

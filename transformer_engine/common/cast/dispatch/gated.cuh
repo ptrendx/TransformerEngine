@@ -31,6 +31,9 @@ void quantize_gated_fwd_helper(const NVTETensor nvte_input, NVTETensor nvte_outp
   CheckInputTensor(input, "input");
   CheckOutputTensor(*output, "output", /*allow_empty=*/false);
 
+  // Nothing to do for empty tensors
+  if (input.numel() == 0) return;
+
   const size_t rows = input.flat_first_dim();
   const size_t cols = input.flat_last_dim() / 2;
 
@@ -106,6 +109,9 @@ void quantize_gated_bwd_helper(const NVTETensor nvte_grad, const NVTETensor nvte
   CheckInputTensor(grad, "grad");
   CheckInputTensor(gated_input, "gated_input");
   CheckOutputTensor(*output, "output", /*allow_empty=*/false);
+
+  // Nothing to do for empty tensors
+  if (grad.numel() == 0) return;
 
   NVTE_CHECK(gated_input.flat_last_dim() % 2 == 0, "Number of columns must be even, but got ",
              gated_input.flat_last_dim(), ".");

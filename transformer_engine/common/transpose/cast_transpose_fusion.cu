@@ -541,6 +541,9 @@ void cast_transpose_fused(const Tensor &input, const Tensor *act_input, Tensor *
   const size_t row_length = input.flat_last_dim();
   const size_t num_rows = input.flat_first_dim();
 
+  // Nothing to do for empty tensors
+  if (row_length == 0 || num_rows == 0) return;
+
   // Check that cast and transposed output data matches
   NVTE_CHECK(output->data.dtype == output->columnwise_data.dtype,
              "Cast and transposed output types must match.");

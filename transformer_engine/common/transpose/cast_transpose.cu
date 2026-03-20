@@ -235,6 +235,9 @@ void cast_transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cu
              ", output=", output.data.shape);
   const size_t row_length = input.flat_last_dim();
   const size_t num_rows = input.flat_first_dim();
+
+  // Nothing to do for empty tensors
+  if (row_length == 0 || num_rows == 0) return;
   NVTE_CHECK(output.flat_first_dim() == num_rows && output.flat_last_dim() == row_length,
              "Invalid output dimensions (expected ", std::vector<size_t>{num_rows, row_length},
              ", got ", std::vector<size_t>{output.flat_first_dim(), output.flat_last_dim()}, ")");

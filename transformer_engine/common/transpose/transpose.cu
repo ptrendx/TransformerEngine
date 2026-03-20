@@ -203,6 +203,9 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
   NVTE_CHECK(output.data.shape[0] == row_length, "Wrong dimension of output.");
   NVTE_CHECK(output.data.shape[1] == num_rows, "Wrong dimension of output.");
 
+  // Nothing to do for empty tensors
+  if (row_length == 0 || num_rows == 0) return;
+
   NVTE_CHECK(input.data.dptr != nullptr, "Input is not allocated.");
   NVTE_CHECK(output.data.dptr != nullptr, "Output is not allocated.");
   NVTE_CHECK(input.data.dtype == output.data.dtype, "Input (dtype=", to_string(input.data.dtype),
