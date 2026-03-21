@@ -66,6 +66,7 @@ void performTest(const size_t N, const size_t H) {
   cudaDeviceSynchronize();
   auto err = cudaGetLastError();
   ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+  if (N == 0 || H == 0) return;  // No data to compare
   if (isFp8Type(otype)) {
     auto [atol_amax, rtol_amax] = getTolerances(DType::kFloat32);
     compareResults("amax", output.amax(), ref_amax, atol_amax, rtol_amax);
