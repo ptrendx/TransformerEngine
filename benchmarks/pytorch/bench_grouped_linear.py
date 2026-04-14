@@ -78,6 +78,6 @@ def test_bench_grouped_linear(
         recipe=recipe_name,
         direction=direction,
         regime=size_cfg.regime,
-        total_flops=2 * m * k * n * num_gemms * (2 if direction == "fwd_bwd" else 1),
+        total_flops=2 * m * k * n * (2 if direction == "fwd_bwd" else 1),
     )
     benchmark_reporter.report(result)
