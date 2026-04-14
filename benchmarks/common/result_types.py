@@ -91,7 +91,7 @@ def collect_metadata() -> Dict[str, str]:
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             meta["gpu_model"] = props.name
-            meta["gpu_memory_gb"] = f"{props.total_mem / 1024**3:.1f}"
+            meta["gpu_memory_gb"] = f"{props.total_memory / 1024**3:.1f}"
             meta["cuda_version"] = torch.version.cuda or "unknown"
             meta["gpu_count"] = str(torch.cuda.device_count())
             meta["compute_capability"] = f"{props.major}.{props.minor}"
