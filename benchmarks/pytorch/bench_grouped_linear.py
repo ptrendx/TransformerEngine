@@ -48,6 +48,7 @@ def test_bench_grouped_linear(
     x = torch.randn(
         m, k, dtype=torch.bfloat16, device="cuda", requires_grad=(direction == "fwd_bwd")
     )
+    m_splits = [m // num_gemms] * num_gemms
     grad = (
         torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
         if direction == "fwd_bwd"
@@ -59,11 +60,11 @@ def test_bench_grouped_linear(
         with ctx:
             if direction == "fwd_only":
                 with torch.no_grad():
-                    layer(x)
+                    layer(x, m_splits=m_splits)
             else:
                 layer.zero_grad()
                 x.grad = None
-                y = layer(x)
+                y = layer(x, m_splits=m_splits)
                 y.backward(grad)
 
     result = benchmark_timer.measure(

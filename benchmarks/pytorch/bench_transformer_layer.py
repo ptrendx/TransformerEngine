@@ -39,7 +39,7 @@ def test_bench_transformer_layer(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         bias=False,
-        attn_mask_type="causal",
+        self_attn_mask_type="causal",
         params_dtype=torch.bfloat16,
     ).cuda()
 
