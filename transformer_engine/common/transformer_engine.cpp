@@ -318,16 +318,17 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, const std::string &na
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate backing data covers logical_shape. Grouped tensors may use a larger static
+  // allocation than the logical work size, so padding is allowed but undersized buffers are not.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    NVTE_CHECK(t.data.numel() >= expected_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must be at least logical_shape size (", expected_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    NVTE_CHECK(t.columnwise_data.numel() >= expected_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must be at least logical_shape size (", expected_numel, ")");
   }
 }
 
@@ -384,10 +385,18 @@ void CheckOutputGroupedTensor(const GroupedTensor &t, const std::string &name, b
 
   // Only perform dtype-specific validation if data is allocated
   if (t.has_data() || t.has_columnwise_data()) {
-    // Amax validation for delayed scaling
+    // Amax validation for delayed/current FP8 tensor scaling. Current scaling can pass
+    // precomputed scales with no amax buffer, while delayed scaling updates per-tensor amaxes.
     if (is_fp8_dtype(t.dtype()) && t.scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-      NVTE_CHECK(t.amax.has_data(), "Output ", name, " amax must be allocated");
-      NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Output ", name, " amax must be Float32");
+      NVTE_CHECK(t.scale.has_data(), "Output ", name, " scale must be allocated");
+      NVTE_CHECK(t.scale.dtype == DType::kFloat32, "Output ", name, " scale must be Float32");
+      NVTE_CHECK(t.scale.numel() == 1 || t.scale.numel() == t.num_tensors, "Output ", name,
+                 " scale must have 1 or num_tensors entries");
+      if (t.amax.has_data()) {
+        NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Output ", name, " amax must be Float32");
+        NVTE_CHECK(t.amax.numel() == t.num_tensors, "Output ", name,
+                   " amax must have num_tensors entries");
+      }
     }
     CheckGroupedScaleInv(t, name, true);
   }

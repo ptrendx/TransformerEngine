@@ -361,7 +361,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
   std::optional<at::Tensor> columnwise_data;
   std::optional<at::Tensor> rowwise_scale_inv;
   std::optional<at::Tensor> columnwise_scale_inv;
-  at::Tensor amax = at::empty({static_cast<int64_t>(num_tensors)}, float_opts);
+  at::Tensor amax = at::zeros({static_cast<int64_t>(num_tensors)}, float_opts);
 
   if (rowwise_usage) {
     rowwise_data = at::empty({total_elements}, uint8_opts);
@@ -384,6 +384,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
     out_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat32,
                                      getTensorShape(*columnwise_scale_inv));
   }
+  out_cpp.set_scale(scale.data_ptr(), GetTransformerEngineDType(scale.scalar_type()),
+                    getTensorShape(scale));
   out_cpp.set_amax(amax.data_ptr(), DType::kFloat32, getTensorShape(amax));
   if (first_dims.has_value()) {
     out_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
@@ -410,7 +412,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
   kwargs["columnwise_scale_inv"] = maybe_tensor_to_py(columnwise_scale_inv);
   kwargs["amax"] = amax;
   kwargs["columnwise_amax"] = py::none();
-  kwargs["scale"] = py::none();
+  kwargs["scale"] = scale;
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
