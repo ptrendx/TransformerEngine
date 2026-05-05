@@ -384,6 +384,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
     out_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat32,
                                      getTensorShape(*columnwise_scale_inv));
   }
+  out_cpp.set_scale(this->scale.data_ptr(), GetTransformerEngineDType(this->scale.scalar_type()),
+                    getTensorShape(this->scale));
   out_cpp.set_amax(amax.data_ptr(), DType::kFloat32, getTensorShape(amax));
   if (first_dims.has_value()) {
     out_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
