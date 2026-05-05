@@ -318,16 +318,17 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, const std::string &na
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate data capacity covers logical_shape. Grouped tensors may use backing
+  // allocations larger than their logical payload.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    NVTE_CHECK(t.data.numel() >= expected_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must be at least logical_shape size (", expected_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    NVTE_CHECK(t.columnwise_data.numel() >= expected_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must be at least logical_shape size (", expected_numel, ")");
   }
 }
 
@@ -369,6 +370,30 @@ static void CheckGroupedScaleInv(const GroupedTensor &t, const std::string &name
   }
 }
 
+static constexpr const char *kGroupedFP8TensorScalingColumnwiseUnsupported =
+    "Grouped FP8 tensor-scaling quantize currently supports rowwise output only; columnwise output "
+    "is not implemented.";
+
+static void CheckGroupedFP8TensorScalingVector(const SimpleTensor &tensor, const std::string &name,
+                                               const char *param_name, size_t num_tensors) {
+  NVTE_CHECK(tensor.has_data() && tensor.dptr != nullptr, "Output ", name, " ", param_name,
+             " must be allocated");
+  NVTE_CHECK(tensor.dtype == DType::kFloat32, "Output ", name, " ", param_name,
+             " must be Float32");
+  NVTE_CHECK(tensor.shape.size() == 1 && tensor.shape[0] == num_tensors, "Output ", name, " ",
+             param_name, " has invalid shape (expected {", num_tensors, "}, got ", tensor.shape,
+             ")");
+}
+
+static void CheckGroupedFP8TensorScalingOutput(const GroupedTensor &t, const std::string &name) {
+  NVTE_CHECK(!t.has_columnwise_data(), kGroupedFP8TensorScalingColumnwiseUnsupported);
+  NVTE_CHECK(t.has_data() && t.data.dptr != nullptr, "Output ", name,
+             " rowwise data must be allocated");
+  CheckGroupedFP8TensorScalingVector(t.scale, name, "scale", t.num_tensors);
+  CheckGroupedFP8TensorScalingVector(t.amax, name, "amax", t.num_tensors);
+  CheckGroupedFP8TensorScalingVector(t.scale_inv, name, "rowwise scale_inv", t.num_tensors);
+}
+
 void CheckInputGroupedTensor(const GroupedTensor &t, const std::string &name) {
   NVTE_CHECK(t.has_data() || t.has_columnwise_data(), "Input grouped tensor ", name,
              " not allocated");
@@ -384,10 +409,8 @@ void CheckOutputGroupedTensor(const GroupedTensor &t, const std::string &name, b
 
   // Only perform dtype-specific validation if data is allocated
   if (t.has_data() || t.has_columnwise_data()) {
-    // Amax validation for delayed scaling
     if (is_fp8_dtype(t.dtype()) && t.scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-      NVTE_CHECK(t.amax.has_data(), "Output ", name, " amax must be allocated");
-      NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Output ", name, " amax must be Float32");
+      CheckGroupedFP8TensorScalingOutput(t, name);
     }
     CheckGroupedScaleInv(t, name, true);
   }
@@ -1043,6 +1066,9 @@ void nvte_get_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigUseFastMath:
       bool_to_uint8(config_.use_fast_math, buf);
       break;
+    case kNVTEQuantizationConfigComputeScaleFromAmax:
+      bool_to_uint8(config_.compute_scale_from_amax, buf);
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }
@@ -1097,6 +1123,9 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
       break;
     case kNVTEQuantizationConfigUseFastMath:
       uint8_to_bool(buf, config_.use_fast_math);
+      break;
+    case kNVTEQuantizationConfigComputeScaleFromAmax:
+      uint8_to_bool(buf, config_.compute_scale_from_amax);
       break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
