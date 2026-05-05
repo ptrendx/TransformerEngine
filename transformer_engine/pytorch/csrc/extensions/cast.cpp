@@ -31,6 +31,13 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+static constexpr const char *kGroupedFP8TensorScalingColumnwiseUnsupported =
+    "Grouped FP8 tensor-scaling quantize currently supports rowwise output only; columnwise output "
+    "is not implemented.";
+
+static constexpr const char *kGroupedFP8CurrentScalingAmaxReductionUnsupported =
+    "Grouped FP8 current-scaling quantize does not support amax reduction.";
+
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -158,7 +165,18 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
 
   bool empty_input_buffer = logical_first_dim == 0 || logical_last_dim == 0;
 
+  if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr()) &&
+      quantizer.attr("with_amax_reduction").cast<bool>()) {
+    NVTE_ERROR(kGroupedFP8CurrentScalingAmaxReductionUnsupported);
+  }
+
   auto quantizer_cpp = convert_quantizer(quantizer);
+
+  if ((detail::IsFloat8Quantizers(quantizer.ptr()) ||
+       detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) &&
+      quantizer_cpp->columnwise_usage) {
+    NVTE_ERROR(kGroupedFP8TensorScalingColumnwiseUnsupported);
+  }
 
   // Create input GroupedTensor.
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
@@ -173,13 +191,17 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
 
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {
+    FP8_GROUPED_QUANTIZE,
     MXFP8_GROUPED_QUANTIZE,
     NVFP4_GROUPED_QUANTIZE,
     INVALID_FOR_GROUPED_QUANTIZE
   };
   GroupedQuantizationMode grouped_quantization_mode =
       GroupedQuantizationMode::INVALID_FOR_GROUPED_QUANTIZE;
-  if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
+  if (detail::IsFloat8Quantizers(quantizer.ptr()) ||
+      detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
+    grouped_quantization_mode = GroupedQuantizationMode::FP8_GROUPED_QUANTIZE;
+  } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     grouped_quantization_mode = GroupedQuantizationMode::MXFP8_GROUPED_QUANTIZE;
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     grouped_quantization_mode = GroupedQuantizationMode::NVFP4_GROUPED_QUANTIZE;
@@ -200,6 +222,21 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
                                 nvfp4_quantizer_cpp, at::cuda::getCurrentCUDAStream());
       break;
     }
+    case GroupedQuantizationMode::FP8_GROUPED_QUANTIZE: {
+      QuantizationConfigWrapper quant_config_cpp;
+      if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
+        auto *fp8_quantizer_cpp =
+            static_cast<Float8CurrentScalingQuantizer *>(quantizer_cpp.get());
+        quant_config_cpp.set_compute_scale_from_amax(true);
+        quant_config_cpp.set_force_pow_2_scales(fp8_quantizer_cpp->force_pow_2_scales);
+        quant_config_cpp.set_amax_epsilon(fp8_quantizer_cpp->amax_epsilon);
+      }
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
+                            quant_config_cpp, at::cuda::getCurrentCUDAStream());
+      });
+      break;
+    }
     case GroupedQuantizationMode::MXFP8_GROUPED_QUANTIZE: {
       QuantizationConfigWrapper quant_config_cpp;
       NVTE_SCOPED_GIL_RELEASE({
@@ -210,7 +247,7 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
     }
     case GroupedQuantizationMode::INVALID_FOR_GROUPED_QUANTIZE:
     default:
-      NVTE_ERROR("group_quantize: only support NVFP4 or MXFP8 quantizer.");
+      NVTE_ERROR("group_quantize: only support FP8, NVFP4, or MXFP8 quantizer.");
       break;
   }
 

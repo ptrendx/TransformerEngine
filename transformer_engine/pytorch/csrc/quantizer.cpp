@@ -98,6 +98,31 @@ py::handle grouped_tensor_python_class(const bool internal) {
   return py::handle(reinterpret_cast<PyObject*>(cls));
 }
 
+at::Tensor make_grouped_float8_scale(const at::Tensor& source_scale, const size_t num_tensors) {
+  NVTE_CHECK(source_scale.defined(), "Float8Quantizer grouped quantize scale must be defined.");
+  NVTE_CHECK(source_scale.is_cuda(), "Float8Quantizer grouped quantize scale must be on CUDA.");
+  NVTE_CHECK(source_scale.scalar_type() == at::kFloat,
+             "Float8Quantizer grouped quantize scale must have dtype float32.");
+
+  const std::vector<int64_t> grouped_shape = {static_cast<int64_t>(num_tensors)};
+  if (source_scale.dim() == 1 && static_cast<size_t>(source_scale.size(0)) == num_tensors) {
+    return source_scale.is_contiguous() ? source_scale : source_scale.contiguous();
+  }
+
+  if (source_scale.numel() == 1) {
+    const std::vector<int64_t> scalar_shape = {1};
+    return source_scale.reshape(scalar_shape).expand(grouped_shape).contiguous();
+  }
+
+  if (static_cast<size_t>(source_scale.numel()) == num_tensors) {
+    return source_scale.reshape(grouped_shape).contiguous();
+  }
+
+  NVTE_ERROR("Float8Quantizer grouped quantize scale must be scalar or have shape {", num_tensors,
+             "}.");
+  return at::Tensor();
+}
+
 }  // namespace
 
 constexpr size_t NVFP4_BLOCK_SIZE = 16;
@@ -361,6 +386,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
   std::optional<at::Tensor> columnwise_data;
   std::optional<at::Tensor> rowwise_scale_inv;
   std::optional<at::Tensor> columnwise_scale_inv;
+  at::Tensor grouped_scale = make_grouped_float8_scale(scale, num_tensors);
   at::Tensor amax = at::empty({static_cast<int64_t>(num_tensors)}, float_opts);
 
   if (rowwise_usage) {
@@ -384,6 +410,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
     out_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat32,
                                      getTensorShape(*columnwise_scale_inv));
   }
+  out_cpp.set_scale(grouped_scale.data_ptr(), DType::kFloat32, getTensorShape(grouped_scale));
   out_cpp.set_amax(amax.data_ptr(), DType::kFloat32, getTensorShape(amax));
   if (first_dims.has_value()) {
     out_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
@@ -410,7 +437,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8Quantizer::create_grouped_tens
   kwargs["columnwise_scale_inv"] = maybe_tensor_to_py(columnwise_scale_inv);
   kwargs["amax"] = amax;
   kwargs["columnwise_amax"] = py::none();
-  kwargs["scale"] = py::none();
+  kwargs["scale"] = grouped_scale;
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
