@@ -92,7 +92,8 @@ void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t strea
 /*! \brief Casts input grouped tensor.
  *         The type of quantized tensor in the output depends on the scaling mode of the output
  *         tensor. See file level comments.
- *         For grouped tensors with a varying last dimension, the last dimension must be a multiple of 128.
+ *         FP8 tensor scaling and MXFP8 grouped tensors are supported. For MXFP8 grouped tensors
+ *         with a varying last dimension, the last dimension must be a multiple of 128.
  *
  *  \param[in]     input            Input grouped tensor to be cast.
  *  \param[in,out] output           Output grouped tensor.

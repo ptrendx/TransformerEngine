@@ -318,16 +318,17 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, const std::string &na
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate data capacity covers logical_shape. Grouped tensors may use an overallocated
+  // backing buffer, but kernels must only process the logical region.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    NVTE_CHECK(t.data.numel() >= expected_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must be at least logical_shape size (", expected_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    NVTE_CHECK(t.columnwise_data.numel() >= expected_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must be at least logical_shape size (", expected_numel, ")");
   }
 }
 
@@ -1043,6 +1044,9 @@ void nvte_get_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigUseFastMath:
       bool_to_uint8(config_.use_fast_math, buf);
       break;
+    case kNVTEQuantizationConfigComputeScaleFromAmax:
+      bool_to_uint8(config_.compute_scale_from_amax, buf);
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }
@@ -1097,6 +1101,9 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
       break;
     case kNVTEQuantizationConfigUseFastMath:
       uint8_to_bool(buf, config_.use_fast_math);
+      break;
+    case kNVTEQuantizationConfigComputeScaleFromAmax:
+      uint8_to_bool(buf, config_.compute_scale_from_amax);
       break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");

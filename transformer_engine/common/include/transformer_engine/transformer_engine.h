@@ -368,8 +368,10 @@ enum NVTEQuantizationConfigAttribute {
    *
    *  Optimizations are kernel-specific and they may be applied
    *  inconsistently between kernels.
-   */
+  */
   kNVTEQuantizationConfigUseFastMath = 7,
+  /*! Whether to compute FP8 tensor scales from amax before quantizing */
+  kNVTEQuantizationConfigComputeScaleFromAmax = 8,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1294,6 +1296,13 @@ class QuantizationConfigWrapper {
     const auto val = static_cast<uint8_t>(use_fast_math);
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigUseFastMath, &val,
                                            sizeof(val));
+  }
+
+  /*! \brief Set whether FP8 tensor scales are computed from amax before quantizing */
+  void set_compute_scale_from_amax(bool compute_scale_from_amax) {
+    const auto val = static_cast<uint8_t>(compute_scale_from_amax);
+    nvte_set_quantization_config_attribute(
+        config_, kNVTEQuantizationConfigComputeScaleFromAmax, &val, sizeof(val));
   }
 
  private:

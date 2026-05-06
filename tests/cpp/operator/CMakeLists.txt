@@ -8,6 +8,7 @@ add_executable(test_operator
                test_cast_dbias.cu
                test_cast_dbias_dgelu.cu
                test_cast_gated_swiglu.cu
+               test_cast_fp8_grouped.cu
                test_cast_mxfp8_gated_swiglu.cu
                test_qdq.cu
                test_cast_mxfp8.cu
