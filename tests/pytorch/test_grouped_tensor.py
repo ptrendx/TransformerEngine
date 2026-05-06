@@ -4,6 +4,7 @@
 
 """Tests for GroupedTensor class"""
 
+import gc
 from typing import List, Tuple
 import pytest
 import torch
@@ -52,6 +53,16 @@ _quantization_params = [
         marks=pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4),
     ),
 ]
+
+
+def poison_small_cuda_allocations(value: float, num_blocks: int = 16) -> None:
+    """Seed cached small CUDA blocks with a stale value before at::empty allocations."""
+    poison = [
+        torch.full((128,), value, dtype=torch.float32, device="cuda") for _ in range(num_blocks)
+    ]
+    torch.cuda.synchronize()
+    del poison
+    gc.collect()
 
 
 def make_quantizer(quantization: str, num_tensors: int, shape: List[Tuple[int, int]]) -> Quantizer:
@@ -430,6 +441,71 @@ class TestGroupedTensor:
 
         assert dbias.shape == (num_tensors, last_dim)
         assert torch.all(dbias == 0)
+
+    @pytest.mark.parametrize("quantizer_kind", ["delayed", "current"])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_first_dims_overallocated(self, quantizer_kind: str) -> None:
+        """Test FP8 grouped quantization with first_dims and extra input capacity."""
+        num_tensors = 3
+        cols = 17
+        first_dims_values = [2, 3, 1]
+        actual_rows = sum(first_dims_values)
+        allocation_rows = actual_rows + 4
+
+        grouped_input = torch.empty((allocation_rows, cols), dtype=torch.float32, device="cuda")
+        logical_values = (
+            torch.arange(actual_rows * cols, dtype=torch.float32, device="cuda")
+            .reshape(actual_rows, cols)
+            .remainder(23)
+            .sub(11)
+            .mul(0.125)
+        )
+        grouped_input[:actual_rows].copy_(logical_values)
+        grouped_input[actual_rows:].fill_(4096.0)
+
+        first_dims = torch.tensor(first_dims_values, dtype=torch.int64, device="cuda")
+        if quantizer_kind == "delayed":
+            quantizer = Float8Quantizer(
+                scale=torch.ones(num_tensors, dtype=torch.float32, device="cuda"),
+                amax=torch.zeros(num_tensors, dtype=torch.float32, device="cuda"),
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=False,
+            )
+        else:
+            quantizer = Float8CurrentScalingQuantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                device=torch.device("cuda"),
+                rowwise=True,
+                columnwise=False,
+            )
+
+        poison_small_cuda_allocations(8192.0)
+        grouped_output = tex.group_quantize(
+            grouped_input,
+            quantizer,
+            num_tensors,
+            first_dims,
+        )
+
+        assert grouped_output.logical_shape == (allocation_rows, cols)
+        assert grouped_output.rowwise_data.numel() == allocation_rows * cols
+        assert torch.equal(grouped_output.first_dims, first_dims)
+        expected_offsets = torch.tensor(
+            [0, 2 * cols, 5 * cols, actual_rows * cols],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        assert torch.equal(grouped_output.tensor_offsets, expected_offsets)
+
+        expected_amax = []
+        offset = 0
+        for rows in first_dims_values:
+            expected_amax.append(grouped_input[offset : offset + rows].abs().max())
+            offset += rows
+        expected_amax = torch.stack(expected_amax)
+        torch.testing.assert_close(grouped_output.amax, expected_amax, rtol=0.0, atol=0.0)
+        assert torch.all(grouped_output.amax < 4096.0)
 
     @pytest.mark.parametrize("output_dbias", [False, True])
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)

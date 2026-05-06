@@ -129,9 +129,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) grouped_amax_kernel(
   }
 }
 
-__global__ void __launch_bounds__(THREADS_PER_BLOCK)
-    grouped_init_amax_kernel(float *const __restrict__ amax, const float *const __restrict__ noop,
-                             const size_t num_tensors) {
+__launch_bounds__(THREADS_PER_BLOCK) __global__ static void grouped_init_amax_kernel(
+    float *const __restrict__ amax, const float *const __restrict__ noop,
+    const size_t num_tensors) {
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
   }
@@ -167,7 +167,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) grouped_compute_scale_kerne
   }
 }
 
-__global__ void __launch_bounds__(THREADS_PER_BLOCK) grouped_update_scale_inv_kernel(
+__launch_bounds__(THREADS_PER_BLOCK) __global__ static void grouped_update_scale_inv_kernel(
     const float *const __restrict__ scale, float *const __restrict__ scale_inv,
     float *const __restrict__ columnwise_scale_inv, const float *const __restrict__ noop,
     const size_t num_tensors, const size_t scale_numel, const size_t scale_inv_numel,
@@ -412,6 +412,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                           last_logical_dim, offsets_ptr, first_dims_ptr, last_dims_ptr,
                           output->scale.numel());
                 } else {
+                  grouped_init_amax_kernel<<<tensor_grid, block, 0, stream>>>(
+                      amax_ptr, noop_ptr, num_tensors);
                   grouped_update_scale_inv_kernel<<<tensor_grid, block, 0, stream>>>(
                       scale_ptr, scale_inv_ptr, columnwise_scale_inv_ptr, noop_ptr, num_tensors,
                       output->scale.numel(), use_rowwise ? output->scale_inv.numel() : 0,

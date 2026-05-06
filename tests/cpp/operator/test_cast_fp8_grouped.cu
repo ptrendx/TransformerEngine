@@ -61,7 +61,7 @@ std::vector<float> per_tensor_amax(const std::vector<float> &input,
   return expected;
 }
 
-TEST(GroupedFP8QuantizeTest, DelayedScalingStopsAtLogicalTotal) {
+TEST(GroupedFP8QuantizeTest, DelayedScalingClearsStaleAmaxAndStopsAtLogicalTotal) {
   constexpr size_t num_tensors = 3;
   constexpr int64_t cols = 17;
   const std::vector<int64_t> first_dims = {2, 3, 1};
@@ -83,7 +83,7 @@ TEST(GroupedFP8QuantizeTest, DelayedScalingStopsAtLogicalTotal) {
   }
 
   const std::vector<float> scale_h = {1.0f, 0.5f, 2.0f};
-  std::vector<float> amax_h(num_tensors, 0.0f);
+  std::vector<float> amax_h(num_tensors, 8192.0f);
   std::vector<float> scale_inv_h(num_tensors, 0.0f);
   const std::vector<uint8_t> sentinel_h(allocation_elements, 0x5a);
 

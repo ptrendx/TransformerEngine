@@ -31,6 +31,24 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+void copy_grouped_shape_metadata(const GroupedTensorWrapper &src, GroupedTensorWrapper &dst) {
+  const auto first_dims = src.get_first_dims();
+  if (first_dims.data_ptr != nullptr) {
+    dst.set_first_dims(first_dims.data_ptr, static_cast<DType>(first_dims.dtype),
+                       first_dims.shape);
+  }
+  const auto last_dims = src.get_last_dims();
+  if (last_dims.data_ptr != nullptr) {
+    dst.set_last_dims(last_dims.data_ptr, static_cast<DType>(last_dims.dtype),
+                      last_dims.shape);
+  }
+  const auto tensor_offsets = src.get_tensor_offsets();
+  if (tensor_offsets.data_ptr != nullptr) {
+    dst.set_tensor_offsets(tensor_offsets.data_ptr, static_cast<DType>(tensor_offsets.dtype),
+                           tensor_offsets.shape);
+  }
+}
+
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -170,6 +188,7 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
       num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
       py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
       logical_last_dim);
+  copy_grouped_shape_metadata(grouped_output_tensor_cpp, grouped_input_tensor);
 
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {
