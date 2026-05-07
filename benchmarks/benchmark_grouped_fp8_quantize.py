@@ -10,8 +10,8 @@ from pathlib import Path
 import torch
 import torch.utils.benchmark as benchmark
 
-import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
+import transformer_engine_torch as tex
 
 
 def run_case(num_tensors, cols, first_dims, allocation_rows, min_run_time):
