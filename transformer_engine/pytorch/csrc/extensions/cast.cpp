@@ -177,11 +177,17 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   bool empty_input_buffer = logical_first_dim == 0 || logical_last_dim == 0;
 
   auto quantizer_cpp = convert_quantizer(quantizer);
+  const bool flatten_grouped_input_data = detail::IsFloat8Quantizers(quantizer.ptr()) ||
+                                          detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr());
+  const std::vector<size_t> input_data_shape =
+      flatten_grouped_input_data
+          ? std::vector<size_t>{static_cast<size_t>(tensor.numel())}
+          : getTensorShape(tensor);
 
   // Create input GroupedTensor.
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), input_data_shape);
 
   // Create output GroupedTensor.
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
