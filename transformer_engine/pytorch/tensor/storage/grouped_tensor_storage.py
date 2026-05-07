@@ -141,7 +141,7 @@ class GroupedTensorStorage:
         # Logical shape: conceptual 2D shape of the grouped data (REQUIRED)
         # Represents how the 1D flattened data should be interpreted as 2D
         # Always 2D with positive dimensions
-        instance.logical_shape = shape
+        instance.logical_shape = tuple(shape)
 
         # Hold a reference to the quantized tensors that occupy same storage as the GroupedTensor.
         # Used as a convenience.

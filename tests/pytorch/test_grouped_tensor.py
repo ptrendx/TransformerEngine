@@ -488,6 +488,7 @@ class TestGroupedTensor:
             first_dims,
         )
 
+        assert isinstance(grouped_output.logical_shape, tuple)
         assert grouped_output.logical_shape == (allocation_rows, cols)
         assert grouped_output.rowwise_data.numel() == allocation_rows * cols
         assert torch.equal(grouped_output.first_dims, first_dims)
