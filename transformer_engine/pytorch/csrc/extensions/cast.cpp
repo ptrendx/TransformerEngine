@@ -31,6 +31,10 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+std::vector<size_t> get_flat_tensor_shape(const at::Tensor &tensor) {
+  return {static_cast<size_t>(tensor.numel())};
+}
+
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -163,7 +167,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   // Create input GroupedTensor.
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()),
+      get_flat_tensor_shape(tensor));
 
   // Create output GroupedTensor.
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
@@ -251,7 +256,8 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
 
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()),
+      get_flat_tensor_shape(tensor));
 
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
       num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
@@ -273,7 +279,7 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
                 tensor.options());
   grouped_dbias.set_rowwise_data(dbias_torch.data_ptr(),
                                  GetTransformerEngineDType(tensor.scalar_type()),
-                                 getTensorShape(dbias_torch));
+                                 get_flat_tensor_shape(dbias_torch));
   TensorWrapper workspace_nvte;
   auto stream = at::cuda::getCurrentCUDAStream();
   NVTE_SCOPED_GIL_RELEASE({

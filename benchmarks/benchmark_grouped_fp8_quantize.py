@@ -48,7 +48,8 @@ def main() -> None:
     logical_rows = args.rows * args.num_tensors
     logical_elements = logical_rows * args.cols
 
-    x = torch.randn((logical_rows, args.cols), dtype=dtype, device=device)
+    x_storage = torch.randn((logical_elements,), dtype=dtype, device=device)
+    x = x_storage.view(logical_rows, args.cols)
     scales = torch.full((args.num_tensors,), 1.0, dtype=torch.float32, device=device)
     amax = torch.zeros((args.num_tensors,), dtype=torch.float32, device=device)
     quantizer = Float8Quantizer(scales, amax, tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
@@ -67,14 +68,24 @@ def main() -> None:
     torch.cuda.synchronize()
 
     elapsed_ms = start.elapsed_time(end) / args.iters
-    logical_input_bytes = logical_elements * _dtype_nbytes(dtype)
-    logical_output_bytes = logical_elements
-    logical_scale_bytes = args.num_tensors * _dtype_nbytes(torch.float32) * 2
+    logical_input_elements = logical_elements
+    logical_output_elements = logical_elements
+    logical_scale_elements = args.num_tensors * 2
+    logical_total_elements = (
+        logical_input_elements + logical_output_elements + logical_scale_elements
+    )
+    logical_input_bytes = logical_input_elements * _dtype_nbytes(dtype)
+    logical_output_bytes = logical_output_elements * _dtype_nbytes(torch.uint8)
+    logical_scale_bytes = logical_scale_elements * _dtype_nbytes(torch.float32)
     logical_total_bytes = logical_input_bytes + logical_output_bytes + logical_scale_bytes
-    allocation_input_elements = x.numel()
+    allocation_input_elements = x_storage.numel()
     allocation_output_elements = out.rowwise_data.numel()
     allocation_input_bytes = allocation_input_elements * _dtype_nbytes(dtype)
-    allocation_output_bytes = allocation_output_elements
+    allocation_output_bytes = allocation_output_elements * _dtype_nbytes(torch.uint8)
+    capacity_input_elements = allocation_input_elements
+    capacity_output_elements = allocation_output_elements
+    capacity_input_bytes = allocation_input_bytes
+    capacity_output_bytes = allocation_output_bytes
     bandwidth_gbps = logical_total_bytes / (elapsed_ms / 1.0e3) / 1.0e9
 
     report: Dict[str, Any] = {
@@ -83,17 +94,42 @@ def main() -> None:
         "num_tensors": args.num_tensors,
         "rows_per_tensor": args.rows,
         "cols": args.cols,
+        "input_logical_shape": [logical_rows, args.cols],
+        "input_data_shape": [allocation_input_elements],
         "logical_elements": logical_elements,
+        "logical_input_elements": logical_input_elements,
+        "logical_output_elements": logical_output_elements,
+        "logical_scale_elements": logical_scale_elements,
+        "logical_total_elements": logical_total_elements,
         "allocation_input_elements": allocation_input_elements,
         "allocation_output_elements": allocation_output_elements,
+        "capacity_input_elements": capacity_input_elements,
+        "capacity_output_elements": capacity_output_elements,
         "logical_input_bytes": logical_input_bytes,
         "logical_output_bytes": logical_output_bytes,
         "logical_scale_bytes": logical_scale_bytes,
         "logical_total_bytes": logical_total_bytes,
         "allocation_input_bytes": allocation_input_bytes,
         "allocation_output_bytes": allocation_output_bytes,
+        "capacity_input_bytes": capacity_input_bytes,
+        "capacity_output_bytes": capacity_output_bytes,
         "elapsed_ms": elapsed_ms,
         "bandwidth_GBps_actual_bytes": bandwidth_gbps,
+        "measurements": [
+            {
+                "name": "grouped_fp8_tensor_scaling_quantize",
+                "metric": "bandwidth_GBps_actual_bytes",
+                "value": bandwidth_gbps,
+                "unit": "GB/s",
+                "elapsed_ms": elapsed_ms,
+                "logical_total_elements": logical_total_elements,
+                "logical_total_bytes": logical_total_bytes,
+                "allocation_input_elements": allocation_input_elements,
+                "allocation_output_elements": allocation_output_elements,
+                "capacity_input_elements": capacity_input_elements,
+                "capacity_output_elements": capacity_output_elements,
+            }
+        ],
         "dtype": str(dtype),
         "fp8_dtype": "kFloat8E4M3",
         "rowwise": True,
@@ -103,6 +139,7 @@ def main() -> None:
         "iters": args.iters,
         "notes": [
             "Bandwidth denominator uses logical bytes.",
+            "Grouped tensor data is backed by a flattened 1D allocation.",
             (
                 "The Python grouped quantize API allocates output at logical size; allocation "
                 "fields are included so capacity-backed benchmark variants can be audited with "
