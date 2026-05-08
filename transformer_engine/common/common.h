@@ -358,7 +358,8 @@ struct GroupedTensor {
   SimpleTensor last_dims;   // Device pointer to int64_t array of length num_tensors (or empty)
 
   // Offsets for indexing into contiguous 1D layout (OPTIONAL - not needed if all_same_shape())
-  // tensor_offsets[i] = element offset to start of tensor i (cumulative sum of numel for tensors 0..i-1)
+  // tensor_offsets[i] = element offset to start of tensor i. Offsets may include allocation padding
+  // between logical tensors.
   // Usage: tensor_i_ptr = (char*)data.dptr + tensor_offsets[i] * element_size
   // If empty and all_same_shape(): offset[i] = i * M * N (where M, N are common dimensions)
   SimpleTensor tensor_offsets;  // Device pointer to int64_t array of length num_tensors (or empty)

@@ -318,16 +318,17 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, const std::string &na
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate data capacity covers logical_shape. Grouped tensors may be backed by
+  // a larger allocation than the logical tensor payload.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    NVTE_CHECK(t.data.numel() >= expected_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must be at least logical_shape size (", expected_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    NVTE_CHECK(t.columnwise_data.numel() >= expected_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must be at least logical_shape size (", expected_numel, ")");
   }
 }
 
@@ -384,10 +385,12 @@ void CheckOutputGroupedTensor(const GroupedTensor &t, const std::string &name, b
 
   // Only perform dtype-specific validation if data is allocated
   if (t.has_data() || t.has_columnwise_data()) {
-    // Amax validation for delayed scaling
+    // Amax validation for delayed scaling. Current-scaling callers precompute
+    // scale and may intentionally clear amax before the final quantize pass.
     if (is_fp8_dtype(t.dtype()) && t.scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-      NVTE_CHECK(t.amax.has_data(), "Output ", name, " amax must be allocated");
-      NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Output ", name, " amax must be Float32");
+      if (t.amax.has_data()) {
+        NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Output ", name, " amax must be Float32");
+      }
     }
     CheckGroupedScaleInv(t, name, true);
   }
