@@ -196,6 +196,41 @@ __device__ __forceinline__ float compute_vector_amax(
   return thread_amax;
 }
 
+template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
+          int ELEMS_PER_THREAD>
+__device__ __forceinline__ float compute_vector_amax_full(
+    const Vec<IType, ELEMS_PER_THREAD> &input_vec) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+  if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
+                ELEMS_PER_THREAD % 2 == 0) {
+    using IType2 = typename ptx::FPx2<IType>;
+    IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_THREAD; i += 2) {
+      const auto in_2x = *reinterpret_cast<const IType2 *>(&input_vec.data.elt[i]);
+      ptx::abs_max_2x(thread_amax_2x, thread_amax_2x, in_2x);
+    }
+
+    return static_cast<float>(__hmax(__habs(thread_amax_2x.x), __habs(thread_amax_2x.y)));
+  }
+#endif
+
+  float thread_amax = 0.0f;
+
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+    float elt = static_cast<float>(input_vec.data.elt[i]);
+    if constexpr (IS_ACT) {
+      elt = OP(elt, {});
+    }
+    __builtin_assume(thread_amax >= 0.0f);
+    thread_amax = fmaxf(thread_amax, fabsf(elt));
+  }
+
+  return thread_amax;
+}
+
 template <typename IType, int ELEMS_PER_THREAD>
 __device__ __forceinline__ void accumulate_vector_amax_2x(
     const Vec<IType, ELEMS_PER_THREAD> &input_vec, typename ptx::FPx2<IType> *thread_amax_2x) {
@@ -254,6 +289,37 @@ __device__ __forceinline__ void cast_scaled_vector(
       }
       output_vec->data.elt[i] = static_cast<OType>(elt * scale);
     }
+  }
+}
+
+template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
+          typename OType, int ELEMS_PER_THREAD>
+__device__ __forceinline__ void cast_scaled_vector_full(
+    const Vec<IType, ELEMS_PER_THREAD> &input_vec, Vec<OType, ELEMS_PER_THREAD> *output_vec,
+    const float scale) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr (!IS_ACT && ELEMS_PER_THREAD % 4 == 0 &&
+                (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16> ||
+                 std::is_same_v<IType, float>) &&
+                (std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>)) {
+    const ptx::floatx2 scale_2x{scale, scale};
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_THREAD; i += 4) {
+      const auto in_4x = *reinterpret_cast<const ptx::FPx4<IType> *>(&input_vec.data.elt[i]);
+      ptx::FPx4<OType> out_4x;
+      ptx::mul_cvt_4x(out_4x, in_4x, scale_2x);
+      *reinterpret_cast<ptx::FPx4<OType> *>(&output_vec->data.elt[i]) = out_4x;
+    }
+    return;
+  }
+#endif
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+    float elt = static_cast<float>(input_vec.data.elt[i]);
+    if constexpr (IS_ACT) {
+      elt = OP(elt, {});
+    }
+    output_vec->data.elt[i] = static_cast<OType>(elt * scale);
   }
 }
 
@@ -323,26 +389,82 @@ static __global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK) grouped_rowb
   if (shared_single_tensor) {
     float thread_amax = 0.0f;
     if (valid_column) {
+      const bool full_rowblock =
+          row_end - row_start == static_cast<size_t>(ROWWISE_ROWS_PER_BLOCK);
+      const bool full_column = count == static_cast<size_t>(ELEMS_PER_THREAD);
+      const IType *const full_input_base =
+          input + shared_start_tensor_start + shared_start_row_in_tensor * last_dim + column;
+      const bool aligned_full_vector =
+          full_rowblock && full_column &&
+          (reinterpret_cast<uintptr_t>(full_input_base) % Vec<IType, ELEMS_PER_THREAD>::BYTES ==
+           0) &&
+          ((last_dim * sizeof(IType)) % Vec<IType, ELEMS_PER_THREAD>::BYTES == 0);
+      if (aligned_full_vector) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-      if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
-                    ELEMS_PER_THREAD % 2 == 0) {
-        if (count == static_cast<size_t>(ELEMS_PER_THREAD)) {
+        if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
+                      ELEMS_PER_THREAD % 2 == 0) {
           using IType2 = typename ptx::FPx2<IType>;
           IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
 
 #pragma unroll 4
           for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
-            if (row_start + static_cast<size_t>(row_idx) < row_end) {
-              Vec<IType, ELEMS_PER_THREAD> input_vec;
-              input_vec.load_from_elts(input + shared_start_tensor_start +
-                                           (shared_start_row_in_tensor + row_idx) * last_dim,
-                                       column, count);
-              accumulate_vector_amax_2x<IType, ELEMS_PER_THREAD>(input_vec, &thread_amax_2x);
-            }
+            Vec<IType, ELEMS_PER_THREAD> input_vec;
+            input_vec.load_from(full_input_base + row_idx * last_dim);
+            accumulate_vector_amax_2x<IType, ELEMS_PER_THREAD>(input_vec, &thread_amax_2x);
           }
 
           thread_amax = packed_amax_to_float<IType>(thread_amax_2x);
-        } else {
+        } else
+#endif
+        {
+#pragma unroll 4
+          for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+            Vec<IType, ELEMS_PER_THREAD> input_vec;
+            input_vec.load_from(full_input_base + row_idx * last_dim);
+            thread_amax = fmaxf(
+                thread_amax,
+                compute_vector_amax_full<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(
+                    input_vec));
+          }
+        }
+      } else {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+        if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
+                      ELEMS_PER_THREAD % 2 == 0) {
+          if (count == static_cast<size_t>(ELEMS_PER_THREAD)) {
+            using IType2 = typename ptx::FPx2<IType>;
+            IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+
+#pragma unroll 4
+            for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+              if (row_start + static_cast<size_t>(row_idx) < row_end) {
+                Vec<IType, ELEMS_PER_THREAD> input_vec;
+                input_vec.load_from_elts(input + shared_start_tensor_start +
+                                             (shared_start_row_in_tensor + row_idx) * last_dim,
+                                         column, count);
+                accumulate_vector_amax_2x<IType, ELEMS_PER_THREAD>(input_vec, &thread_amax_2x);
+              }
+            }
+
+            thread_amax = packed_amax_to_float<IType>(thread_amax_2x);
+          } else {
+#pragma unroll 4
+            for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+              if (row_start + static_cast<size_t>(row_idx) < row_end) {
+                Vec<IType, ELEMS_PER_THREAD> input_vec;
+                input_vec.load_from_elts(input + shared_start_tensor_start +
+                                             (shared_start_row_in_tensor + row_idx) * last_dim,
+                                         column, count);
+                thread_amax = fmaxf(
+                    thread_amax,
+                    compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec,
+                                                                                      count));
+              }
+            }
+          }
+        } else
+#endif
+        {
 #pragma unroll 4
           for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
             if (row_start + static_cast<size_t>(row_idx) < row_end) {
@@ -355,22 +477,6 @@ static __global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK) grouped_rowb
                   compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec,
                                                                                     count));
             }
-          }
-        }
-      } else
-#endif
-      {
-#pragma unroll 4
-        for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
-          if (row_start + static_cast<size_t>(row_idx) < row_end) {
-            Vec<IType, ELEMS_PER_THREAD> input_vec;
-            input_vec.load_from_elts(input + shared_start_tensor_start +
-                                         (shared_start_row_in_tensor + row_idx) * last_dim,
-                                     column, count);
-            thread_amax = fmaxf(
-                thread_amax,
-                compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec,
-                                                                                  count));
           }
         }
       }
@@ -490,6 +596,34 @@ static __global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK)
                            : static_cast<size_t>(ELEMS_PER_THREAD);
 
   if (shared_single_tensor) {
+    const bool full_rowblock =
+        row_end - row_start == static_cast<size_t>(ROWWISE_ROWS_PER_BLOCK);
+    const bool full_column = count == static_cast<size_t>(ELEMS_PER_THREAD);
+    const size_t first_row_offset =
+        shared_start_tensor_start + shared_start_row_in_tensor * last_dim;
+    const IType *const full_input_base = input + first_row_offset + column;
+    OType *const full_output_base = output + first_row_offset + column;
+    const bool aligned_full_vector =
+        full_rowblock && full_column &&
+        (reinterpret_cast<uintptr_t>(full_input_base) % Vec<IType, ELEMS_PER_THREAD>::BYTES ==
+         0) &&
+        (reinterpret_cast<uintptr_t>(full_output_base) % Vec<OType, ELEMS_PER_THREAD>::BYTES ==
+         0) &&
+        ((last_dim * sizeof(IType)) % Vec<IType, ELEMS_PER_THREAD>::BYTES == 0) &&
+        ((last_dim * sizeof(OType)) % Vec<OType, ELEMS_PER_THREAD>::BYTES == 0);
+    if (aligned_full_vector) {
+#pragma unroll 4
+      for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+        Vec<IType, ELEMS_PER_THREAD> input_vec;
+        Vec<OType, ELEMS_PER_THREAD> output_vec;
+        input_vec.load_from(full_input_base + row_idx * last_dim);
+        cast_scaled_vector_full<IS_ACT, ParamOP, OP, IType, OType, ELEMS_PER_THREAD>(
+            input_vec, &output_vec, shared_start_scale);
+        output_vec.store_to(full_output_base + row_idx * last_dim);
+      }
+      return;
+    }
+
 #pragma unroll 4
     for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
       if (row_start + static_cast<size_t>(row_idx) < row_end) {
