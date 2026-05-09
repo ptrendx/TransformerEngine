@@ -85,6 +85,25 @@ std::optional<at::Tensor> build_grouped_tensor_offsets(const size_t num_tensors,
   return tensor_offsets;
 }
 
+std::pair<std::optional<at::Tensor>, std::optional<at::Tensor>>
+allocate_grouped_tensor_offsets(const size_t num_tensors,
+                                const std::optional<at::Tensor>& first_dims) {
+  if (!first_dims.has_value()) {
+    return {std::nullopt, std::nullopt};
+  }
+
+  const auto& first_dims_tensor = first_dims.value();
+  NVTE_CHECK(first_dims_tensor.is_cuda(), "first_dims must be on CUDA.");
+  NVTE_CHECK(first_dims_tensor.scalar_type() == at::kLong, "first_dims must have dtype int64.");
+  NVTE_CHECK(static_cast<size_t>(first_dims_tensor.numel()) == num_tensors,
+             "first_dims must have length ", num_tensors, ".");
+
+  auto first_dims_contiguous = first_dims_tensor.contiguous();
+  auto tensor_offsets =
+      at::empty({static_cast<int64_t>(num_tensors) + 1}, first_dims_contiguous.options());
+  return {std::move(first_dims_contiguous), std::move(tensor_offsets)};
+}
+
 at::TensorOptions grouped_tensor_data_options(const DType dtype) {
   return at::TensorOptions().dtype(GetATenDType(dtype)).device(torch::kCUDA);
 }
@@ -658,8 +677,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8CurrentScalingQuantizer::creat
     const size_t logical_first_dim, const size_t logical_last_dim) const {
   using namespace pybind11::literals;
 
-  const auto tensor_offsets =
-      build_grouped_tensor_offsets(num_tensors, first_dims, logical_last_dim);
+  const auto [first_dims_contiguous, tensor_offsets] =
+      allocate_grouped_tensor_offsets(num_tensors, first_dims);
   const int64_t total_elements =
       static_cast<int64_t>(logical_first_dim) * static_cast<int64_t>(logical_last_dim);
 
@@ -696,8 +715,9 @@ std::pair<GroupedTensorWrapper, py::object> Float8CurrentScalingQuantizer::creat
   }
   out_cpp.set_scale(scale.data_ptr(), DType::kFloat32, getTensorShape(scale));
   out_cpp.set_amax(amax.data_ptr(), DType::kFloat32, getTensorShape(amax));
-  if (first_dims.has_value()) {
-    out_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
+  if (first_dims_contiguous.has_value()) {
+    out_cpp.set_first_dims(first_dims_contiguous->data_ptr(), DType::kInt64,
+                           getTensorShape(*first_dims_contiguous));
   }
   if (tensor_offsets.has_value()) {
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
@@ -722,7 +742,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8CurrentScalingQuantizer::creat
   kwargs["amax"] = amax;
   kwargs["columnwise_amax"] = py::none();
   kwargs["scale"] = scale;
-  kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
+  kwargs["first_dims"] =
+      first_dims_contiguous.has_value() ? py::cast(*first_dims_contiguous) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
   kwargs["with_gemm_swizzled_scales"] = py::cast(false);

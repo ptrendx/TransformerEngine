@@ -43,22 +43,65 @@ struct RowwiseElemsPerThread {
           : 1;
 };
 
-static __global__ void initialize_current_scaling_metadata_kernel(float *amax, float *scale,
-                                                                  float *scale_inv,
-                                                                  const size_t num_tensors,
-                                                                  const float *noop) {
-  if (noop != nullptr && noop[0] == 1.0f) {
+static __global__ void initialize_current_scaling_metadata_kernel(
+    float *amax, float *scale, float *scale_inv, int64_t *offsets,
+    const int64_t *first_dims, const size_t num_tensors, const int64_t logical_last_dim,
+    const float *noop) {
+  const bool noop_enabled = noop != nullptr && noop[0] == 1.0f;
+  __shared__ int64_t block_scan[METADATA_THREADS_PER_BLOCK];
+  __shared__ int64_t chunk_prefix;
+
+  if (offsets != nullptr && first_dims != nullptr && blockIdx.x == 0) {
+    const size_t tid = threadIdx.x;
+    if (tid == 0) {
+      offsets[0] = 0;
+      chunk_prefix = 0;
+    }
+    __syncthreads();
+
+    for (size_t chunk_start = 0; chunk_start < num_tensors;
+         chunk_start += METADATA_THREADS_PER_BLOCK) {
+      const size_t idx = chunk_start + tid;
+      int64_t value = 0;
+      if (idx < num_tensors) {
+        value = first_dims[idx] * logical_last_dim;
+      }
+      block_scan[tid] = value;
+      __syncthreads();
+
+#pragma unroll
+      for (int offset = 1; offset < METADATA_THREADS_PER_BLOCK; offset <<= 1) {
+        const int64_t addend =
+            (tid >= static_cast<size_t>(offset))
+                ? block_scan[tid - static_cast<size_t>(offset)]
+                : 0;
+        __syncthreads();
+        block_scan[tid] += addend;
+        __syncthreads();
+      }
+
+      if (idx < num_tensors) {
+        offsets[idx + 1] = chunk_prefix + block_scan[tid];
+      }
+      __syncthreads();
+
+      if (tid == METADATA_THREADS_PER_BLOCK - 1) {
+        chunk_prefix += block_scan[tid];
+      }
+      __syncthreads();
+    }
+  }
+
+  if (noop_enabled) {
     return;
   }
 
   const size_t tensor_id = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tensor_id >= num_tensors) {
-    return;
+  if (tensor_id < num_tensors) {
+    amax[tensor_id] = 0.0f;
+    scale[tensor_id] = 1.0f;
+    scale_inv[tensor_id] = 1.0f;
   }
-
-  amax[tensor_id] = 0.0f;
-  scale[tensor_id] = 1.0f;
-  scale_inv[tensor_id] = 1.0f;
 }
 
 template <bool VARYING_FIRST_DIM>
@@ -528,12 +571,18 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool varying_first_dim = output->first_dims.has_data();
   NVTE_CHECK(!varying_first_dim || output->tensor_offsets.has_data(),
              "Grouped FP8 current scaling requires tensor_offsets when first_dims is set.");
+  NVTE_CHECK(!varying_first_dim ||
+                 (output->first_dims.dtype == DType::kInt64 &&
+                  output->first_dims.numel() == num_tensors),
+             "Grouped FP8 current scaling requires one INT64 first_dim per tensor.");
   NVTE_CHECK(varying_first_dim || first_logical_dim % num_tensors == 0,
              "Uniform grouped FP8 current scaling requires first dimension divisible by "
              "num_tensors.");
 
-  const int64_t *const offsets_ptr =
-      varying_first_dim ? reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr) : nullptr;
+  int64_t *const offsets_ptr =
+      varying_first_dim ? reinterpret_cast<int64_t *>(output->tensor_offsets.dptr) : nullptr;
+  const int64_t *const first_dims_ptr =
+      varying_first_dim ? reinterpret_cast<const int64_t *>(output->first_dims.dptr) : nullptr;
   const float *const noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
   float *const amax_ptr = reinterpret_cast<float *>(output->amax.dptr);
   float *const scale_ptr = reinterpret_cast<float *>(output->scale.dptr);
@@ -546,7 +595,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       DIVUP(num_tensors, static_cast<size_t>(METADATA_THREADS_PER_BLOCK)));
   initialize_current_scaling_metadata_kernel<<<metadata_grid, METADATA_THREADS_PER_BLOCK, 0,
                                                stream>>>(amax_ptr, scale_ptr, scale_inv_ptr,
-                                                         num_tensors, noop_ptr);
+                                                         offsets_ptr, first_dims_ptr, num_tensors,
+                                                         static_cast<int64_t>(last_logical_dim),
+                                                         noop_ptr);
   NVTE_CHECK_CUDA(cudaGetLastError());
 
   if (total_elements == 0) {
