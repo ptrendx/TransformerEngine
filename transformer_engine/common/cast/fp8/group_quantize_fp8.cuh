@@ -33,7 +33,7 @@ namespace group_quantize_kernel {
 constexpr int METADATA_THREADS_PER_BLOCK = 32;
 constexpr int ROWWISE_THREADS_PER_BLOCK = 512;
 constexpr int ROWWISE_TARGET_INPUT_BYTES_PER_THREAD = 32;
-constexpr int ROWWISE_ROWS_PER_BLOCK = 64;
+constexpr int ROWWISE_ROWS_PER_BLOCK = 32;
 
 template <typename IType>
 struct RowwiseElemsPerThread {
@@ -117,6 +117,25 @@ template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), ty
           int ELEMS_PER_THREAD>
 __device__ __forceinline__ float compute_vector_amax(
     const Vec<IType, ELEMS_PER_THREAD> &input_vec, const size_t count) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+  if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
+                ELEMS_PER_THREAD % 2 == 0) {
+    if (count == static_cast<size_t>(ELEMS_PER_THREAD)) {
+      using IType2 = typename ptx::FPx2<IType>;
+      IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+
+#pragma unroll
+      for (int i = 0; i < ELEMS_PER_THREAD; i += 2) {
+        const auto in_2x = *reinterpret_cast<const IType2 *>(&input_vec.data.elt[i]);
+        ptx::abs_max_2x(thread_amax_2x, thread_amax_2x, in_2x);
+      }
+
+      return static_cast<float>(__hmax(__habs(thread_amax_2x.x),
+                                       __habs(thread_amax_2x.y)));
+    }
+  }
+#endif
+
   float thread_amax = 0.0f;
 
 #pragma unroll
