@@ -31,8 +31,8 @@ namespace fp8 {
 namespace group_quantize_kernel {
 
 constexpr int METADATA_THREADS_PER_BLOCK = 32;
-constexpr int ROWWISE_THREADS_PER_BLOCK = 512;
-constexpr int ROWWISE_TARGET_INPUT_BYTES_PER_THREAD = 32;
+constexpr int ROWWISE_THREADS_PER_BLOCK = 256;
+constexpr int ROWWISE_TARGET_INPUT_BYTES_PER_THREAD = 64;
 constexpr int ROWWISE_ROWS_PER_BLOCK = 32;
 
 template <typename IType>
@@ -153,6 +153,22 @@ __device__ __forceinline__ float compute_vector_amax(
   return thread_amax;
 }
 
+template <typename IType, int ELEMS_PER_THREAD>
+__device__ __forceinline__ void accumulate_vector_amax_2x(
+    const Vec<IType, ELEMS_PER_THREAD> &input_vec, typename ptx::FPx2<IType> *thread_amax_2x) {
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; i += 2) {
+    const auto in_2x = *reinterpret_cast<const typename ptx::FPx2<IType> *>(
+        &input_vec.data.elt[i]);
+    ptx::abs_max_2x(*thread_amax_2x, *thread_amax_2x, in_2x);
+  }
+}
+
+template <typename IType>
+__device__ __forceinline__ float packed_amax_to_float(const typename ptx::FPx2<IType> amax_2x) {
+  return static_cast<float>(__hmax(__habs(amax_2x.x), __habs(amax_2x.y)));
+}
+
 template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
           typename OType, int ELEMS_PER_THREAD>
 __device__ __forceinline__ void cast_scaled_vector(
@@ -200,7 +216,7 @@ __device__ __forceinline__ void cast_scaled_vector(
 
 template <bool VARYING_FIRST_DIM, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &), typename IType, int ELEMS_PER_THREAD>
-static __global__ void grouped_rowblock_amax_kernel(
+static __global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK) grouped_rowblock_amax_kernel(
     const IType *const __restrict__ input, float *const __restrict__ amax,
     const size_t num_tensors, const size_t first_logical_dim, const size_t last_dim,
     const size_t column_tiles, const int64_t *const __restrict__ offsets, const float *noop) {
@@ -264,16 +280,55 @@ static __global__ void grouped_rowblock_amax_kernel(
   if (shared_single_tensor) {
     float thread_amax = 0.0f;
     if (valid_column) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+      if constexpr (!IS_ACT && (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16>) &&
+                    ELEMS_PER_THREAD % 2 == 0) {
+        if (count == static_cast<size_t>(ELEMS_PER_THREAD)) {
+          using IType2 = typename ptx::FPx2<IType>;
+          IType2 thread_amax_2x = {static_cast<IType>(0.0f), static_cast<IType>(0.0f)};
+
 #pragma unroll 4
-      for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
-        if (row_start + static_cast<size_t>(row_idx) < row_end) {
-          Vec<IType, ELEMS_PER_THREAD> input_vec;
-          input_vec.load_from_elts(input + shared_start_tensor_start +
-                                       (shared_start_row_in_tensor + row_idx) * last_dim,
-                                   column, count);
-          thread_amax = fmaxf(
-              thread_amax,
-              compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec, count));
+          for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+            if (row_start + static_cast<size_t>(row_idx) < row_end) {
+              Vec<IType, ELEMS_PER_THREAD> input_vec;
+              input_vec.load_from_elts(input + shared_start_tensor_start +
+                                           (shared_start_row_in_tensor + row_idx) * last_dim,
+                                       column, count);
+              accumulate_vector_amax_2x<IType, ELEMS_PER_THREAD>(input_vec, &thread_amax_2x);
+            }
+          }
+
+          thread_amax = packed_amax_to_float<IType>(thread_amax_2x);
+        } else {
+#pragma unroll 4
+          for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+            if (row_start + static_cast<size_t>(row_idx) < row_end) {
+              Vec<IType, ELEMS_PER_THREAD> input_vec;
+              input_vec.load_from_elts(input + shared_start_tensor_start +
+                                           (shared_start_row_in_tensor + row_idx) * last_dim,
+                                       column, count);
+              thread_amax = fmaxf(
+                  thread_amax,
+                  compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec,
+                                                                                    count));
+            }
+          }
+        }
+      } else
+#endif
+      {
+#pragma unroll 4
+        for (int row_idx = 0; row_idx < ROWWISE_ROWS_PER_BLOCK; ++row_idx) {
+          if (row_start + static_cast<size_t>(row_idx) < row_end) {
+            Vec<IType, ELEMS_PER_THREAD> input_vec;
+            input_vec.load_from_elts(input + shared_start_tensor_start +
+                                         (shared_start_row_in_tensor + row_idx) * last_dim,
+                                     column, count);
+            thread_amax = fmaxf(
+                thread_amax,
+                compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec,
+                                                                                  count));
+          }
         }
       }
     }
@@ -307,7 +362,8 @@ static __global__ void grouped_rowblock_amax_kernel(
 template <bool VARYING_FIRST_DIM, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &), typename IType, typename OType,
           int ELEMS_PER_THREAD>
-static __global__ void grouped_rowblock_cast_fp8_kernel(
+static __global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK)
+    grouped_rowblock_cast_fp8_kernel(
     const IType *const __restrict__ input, OType *const __restrict__ output,
     const float *const __restrict__ amax, float *const __restrict__ scale,
     float *const __restrict__ scale_inv, const size_t num_tensors,
