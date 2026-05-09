@@ -30,10 +30,10 @@ namespace dispatch {
 namespace fp8 {
 namespace group_quantize_kernel {
 
-constexpr int THREADS_PER_BLOCK = 256;
+constexpr int METADATA_THREADS_PER_BLOCK = 32;
 constexpr int ROWWISE_THREADS_PER_BLOCK = 512;
 constexpr int ROWWISE_TARGET_INPUT_BYTES_PER_THREAD = 32;
-constexpr int ROWWISE_ROWS_PER_BLOCK = 32;
+constexpr int ROWWISE_ROWS_PER_BLOCK = 64;
 
 template <typename IType>
 struct RowwiseElemsPerThread {
@@ -467,9 +467,11 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool force_pow_2_scales = quant_config != nullptr && quant_config->force_pow_2_scales;
   const float amax_epsilon = quant_config != nullptr ? quant_config->amax_epsilon : 0.0f;
 
-  const dim3 metadata_grid(DIVUP(num_tensors, static_cast<size_t>(THREADS_PER_BLOCK)));
-  initialize_current_scaling_metadata_kernel<<<metadata_grid, THREADS_PER_BLOCK, 0, stream>>>(
-      amax_ptr, scale_ptr, scale_inv_ptr, num_tensors, noop_ptr);
+  const dim3 metadata_grid(
+      DIVUP(num_tensors, static_cast<size_t>(METADATA_THREADS_PER_BLOCK)));
+  initialize_current_scaling_metadata_kernel<<<metadata_grid, METADATA_THREADS_PER_BLOCK, 0,
+                                               stream>>>(amax_ptr, scale_ptr, scale_inv_ptr,
+                                                         num_tensors, noop_ptr);
   NVTE_CHECK_CUDA(cudaGetLastError());
 
   if (total_elements == 0) {

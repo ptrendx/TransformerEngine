@@ -129,6 +129,18 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+__global__ void __launch_bounds__(1)
+    splits_to_offsets_small_kernel(const int64_t *__restrict__ first_dims,
+                                   int64_t *__restrict__ output, size_t num_tensors,
+                                   int64_t logical_last_dim) {
+  int64_t running_offset = 0;
+  output[0] = 0;
+  for (size_t i = 0; i < num_tensors; ++i) {
+    running_offset += first_dims[i] * logical_last_dim;
+    output[i + 1] = running_offset;
+  }
+}
+
 }  // namespace
 
 #define MEMSET_VECTORIZED_KERNEL_DISPATCH(ptr, size_in_bytes, value, vectorizedType, stream) \
@@ -167,8 +179,13 @@ void nvte_splits_to_offsets(const int64_t *first_dims, int64_t *output, size_t n
   NVTE_CHECK(first_dims != nullptr, "first_dims pointer must be allocated.");
   NVTE_CHECK(logical_last_dim > 0, "logical_last_dim must be greater than 0.");
 
-  splits_to_offsets_kernel<<<1, kThreadsPerBlock, 0, stream>>>(first_dims, output, num_tensors,
-                                                               logical_last_dim);
+  if (num_tensors <= 32) {
+    splits_to_offsets_small_kernel<<<1, 1, 0, stream>>>(first_dims, output, num_tensors,
+                                                        logical_last_dim);
+  } else {
+    splits_to_offsets_kernel<<<1, kThreadsPerBlock, 0, stream>>>(first_dims, output, num_tensors,
+                                                                 logical_last_dim);
+  }
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 }  // extern "C"
