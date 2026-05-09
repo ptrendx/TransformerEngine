@@ -39,10 +39,10 @@ struct ElemsPerThread {
           : 1;
 };
 
-__global__ void initialize_current_scaling_metadata_kernel(float *amax, float *scale,
-                                                           float *scale_inv,
-                                                           const size_t num_tensors,
-                                                           const float *noop) {
+static __global__ void initialize_current_scaling_metadata_kernel(float *amax, float *scale,
+                                                                  float *scale_inv,
+                                                                  const size_t num_tensors,
+                                                                  const float *noop) {
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
   }
