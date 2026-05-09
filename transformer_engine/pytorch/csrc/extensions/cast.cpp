@@ -163,7 +163,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   // Create input GroupedTensor.
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()),
+      std::vector<size_t>{logical_first_dim * logical_last_dim});
 
   // Create output GroupedTensor.
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
@@ -264,7 +265,8 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
 
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()),
+      std::vector<size_t>{logical_first_dim * logical_last_dim});
 
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
       num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
