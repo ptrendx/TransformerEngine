@@ -17,10 +17,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "../../common.h"
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/math.h"
+#include "../../util/ptx.cuh"
 #include "../../utils.cuh"
 
 namespace transformer_engine {
@@ -29,13 +31,14 @@ namespace fp8 {
 namespace group_quantize_kernel {
 
 constexpr int THREADS_PER_BLOCK = 256;
-constexpr int TARGET_BYTES_PER_THREAD = 16;
+constexpr int ROWWISE_THREADS_PER_BLOCK = 512;
+constexpr int ROWWISE_TARGET_INPUT_BYTES_PER_THREAD = 32;
 
 template <typename IType>
-struct ElemsPerThread {
+struct RowwiseElemsPerThread {
   static constexpr int value =
-      (TARGET_BYTES_PER_THREAD / static_cast<int>(sizeof(IType)) > 0)
-          ? TARGET_BYTES_PER_THREAD / static_cast<int>(sizeof(IType))
+      (ROWWISE_TARGET_INPUT_BYTES_PER_THREAD / static_cast<int>(sizeof(IType)) > 0)
+          ? ROWWISE_TARGET_INPUT_BYTES_PER_THREAD / static_cast<int>(sizeof(IType))
           : 1;
 };
 
@@ -57,51 +60,57 @@ static __global__ void initialize_current_scaling_metadata_kernel(float *amax, f
   scale_inv[tensor_id] = 1.0f;
 }
 
-__device__ __forceinline__ size_t tensor_start_offset(
-    const size_t tensor_id, const int64_t *const __restrict__ offsets,
-    const size_t uniform_tensor_elements) {
-  return (offsets != nullptr) ? static_cast<size_t>(offsets[tensor_id])
-                              : tensor_id * uniform_tensor_elements;
-}
+template <bool VARYING_FIRST_DIM>
+__device__ __forceinline__ bool row_to_tensor(
+    const size_t row_id, const size_t num_tensors, const size_t first_logical_dim,
+    const size_t last_dim, const int64_t *const __restrict__ offsets,
+    size_t *const __restrict__ tensor_id, size_t *const __restrict__ tensor_start,
+    size_t *const __restrict__ row_in_tensor) {
+  if constexpr (VARYING_FIRST_DIM) {
+    const size_t actual_rows = static_cast<size_t>(offsets[num_tensors]) / last_dim;
+    if (row_id >= actual_rows) {
+      return false;
+    }
 
-__device__ __forceinline__ size_t tensor_payload_elements(
-    const size_t tensor_id, const int64_t *const __restrict__ first_dims, const size_t uniform_rows,
-    const size_t last_dim) {
-  const size_t rows =
-      (first_dims != nullptr) ? static_cast<size_t>(first_dims[tensor_id]) : uniform_rows;
-  return rows * last_dim;
+    size_t low = 1;
+    size_t high = num_tensors;
+    while (low < high) {
+      const size_t mid = low + (high - low) / 2;
+      const size_t mid_row = static_cast<size_t>(offsets[mid]) / last_dim;
+      if (mid_row <= row_id) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+
+    *tensor_id = low - 1;
+    *tensor_start = static_cast<size_t>(offsets[*tensor_id]);
+    const size_t tensor_start_row = *tensor_start / last_dim;
+    *row_in_tensor = row_id - tensor_start_row;
+    return true;
+  } else {
+    const size_t rows_per_tensor = first_logical_dim / num_tensors;
+    if (row_id >= rows_per_tensor * num_tensors) {
+      return false;
+    }
+    *tensor_id = row_id / rows_per_tensor;
+    *row_in_tensor = row_id - *tensor_id * rows_per_tensor;
+    *tensor_start = *tensor_id * rows_per_tensor * last_dim;
+    return true;
+  }
 }
 
 template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
           int ELEMS_PER_THREAD>
-__global__ void grouped_amax_kernel(const IType *const __restrict__ input,
-                                    float *const __restrict__ amax,
-                                    const size_t uniform_tensor_elements,
-                                    const size_t uniform_rows, const size_t last_dim,
-                                    const int64_t *const __restrict__ offsets,
-                                    const int64_t *const __restrict__ first_dims,
-                                    const float *noop) {
-  if (noop != nullptr && noop[0] == 1.0f) {
-    return;
-  }
-
-  const size_t tensor_id = blockIdx.y;
-  const size_t local_base =
-      (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<size_t>(ELEMS_PER_THREAD);
-  const size_t tensor_elements =
-      tensor_payload_elements(tensor_id, first_dims, uniform_rows, last_dim);
-  if (local_base >= tensor_elements) {
-    return;
-  }
-
-  const size_t tensor_start = tensor_start_offset(tensor_id, offsets, uniform_tensor_elements);
+__device__ __forceinline__ float compute_vector_amax(
+    const Vec<IType, ELEMS_PER_THREAD> &input_vec, const size_t count) {
   float thread_amax = 0.0f;
 
 #pragma unroll
   for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-    const size_t local_idx = local_base + static_cast<size_t>(i);
-    if (local_idx < tensor_elements) {
-      float elt = static_cast<float>(input[tensor_start + local_idx]);
+    if (static_cast<size_t>(i) < count) {
+      float elt = static_cast<float>(input_vec.data.elt[i]);
       if constexpr (IS_ACT) {
         elt = OP(elt, {});
       }
@@ -110,11 +119,165 @@ __global__ void grouped_amax_kernel(const IType *const __restrict__ input,
     }
   }
 
-  const int warp_id = threadIdx.x / THREADS_PER_WARP;
-  thread_amax = reduce_max<THREADS_PER_BLOCK / THREADS_PER_WARP>(thread_amax, warp_id);
-  if (threadIdx.x == 0) {
-    atomicMaxFloat(amax + tensor_id, thread_amax);
+  return thread_amax;
+}
+
+template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
+          typename OType, int ELEMS_PER_THREAD>
+__device__ __forceinline__ void cast_scaled_vector(
+    const Vec<IType, ELEMS_PER_THREAD> &input_vec, Vec<OType, ELEMS_PER_THREAD> *output_vec,
+    const size_t count, const float scale) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr (!IS_ACT && ELEMS_PER_THREAD % 4 == 0 &&
+                (std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16> ||
+                 std::is_same_v<IType, float>) &&
+                (std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>)) {
+    const ptx::floatx2 scale_2x{scale, scale};
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_THREAD; i += 4) {
+      if (static_cast<size_t>(i + 4) <= count) {
+        const auto in_4x =
+            *reinterpret_cast<const ptx::FPx4<IType> *>(&input_vec.data.elt[i]);
+        ptx::FPx4<OType> out_4x;
+        ptx::mul_cvt_4x(out_4x, in_4x, scale_2x);
+        *reinterpret_cast<ptx::FPx4<OType> *>(&output_vec->data.elt[i]) = out_4x;
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int elem = i + j;
+          if (static_cast<size_t>(elem) < count) {
+            output_vec->data.elt[elem] =
+                static_cast<OType>(static_cast<float>(input_vec.data.elt[elem]) * scale);
+          }
+        }
+      }
+    }
+    return;
   }
+#endif
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+    if (static_cast<size_t>(i) < count) {
+      float elt = static_cast<float>(input_vec.data.elt[i]);
+      if constexpr (IS_ACT) {
+        elt = OP(elt, {});
+      }
+      output_vec->data.elt[i] = static_cast<OType>(elt * scale);
+    }
+  }
+}
+
+template <bool VARYING_FIRST_DIM, bool IS_ACT, typename ParamOP,
+          float (*OP)(float, const ParamOP &), typename IType, int ELEMS_PER_THREAD>
+static __global__ void grouped_rowwise_amax_kernel(
+    const IType *const __restrict__ input, float *const __restrict__ amax,
+    const size_t num_tensors, const size_t first_logical_dim, const size_t last_dim,
+    const size_t column_tiles, const int64_t *const __restrict__ offsets, const float *noop) {
+  if (noop != nullptr && noop[0] == 1.0f) {
+    return;
+  }
+
+  const size_t tile_id = blockIdx.x;
+  const size_t row_id = tile_id / column_tiles;
+  const size_t column_tile = tile_id - row_id * column_tiles;
+
+  __shared__ size_t shared_tensor_id;
+  __shared__ size_t shared_tensor_start;
+  __shared__ size_t shared_row_in_tensor;
+  __shared__ int shared_is_valid_row;
+  if (threadIdx.x == 0) {
+    size_t tensor_id = 0;
+    size_t tensor_start = 0;
+    size_t row_in_tensor = 0;
+    shared_is_valid_row = row_to_tensor<VARYING_FIRST_DIM>(
+        row_id, num_tensors, first_logical_dim, last_dim, offsets, &tensor_id, &tensor_start,
+        &row_in_tensor);
+    shared_tensor_id = tensor_id;
+    shared_tensor_start = tensor_start;
+    shared_row_in_tensor = row_in_tensor;
+  }
+  __syncthreads();
+
+  if (!shared_is_valid_row) {
+    return;
+  }
+
+  const size_t column =
+      (column_tile * blockDim.x + threadIdx.x) * static_cast<size_t>(ELEMS_PER_THREAD);
+  float thread_amax = 0.0f;
+  if (column < last_dim) {
+    const size_t remaining_columns = last_dim - column;
+    const size_t count = remaining_columns < static_cast<size_t>(ELEMS_PER_THREAD)
+                             ? remaining_columns
+                             : static_cast<size_t>(ELEMS_PER_THREAD);
+    Vec<IType, ELEMS_PER_THREAD> input_vec;
+    input_vec.load_from_elts(input + shared_tensor_start + shared_row_in_tensor * last_dim, column,
+                             count);
+    thread_amax =
+        compute_vector_amax<IS_ACT, ParamOP, OP, IType, ELEMS_PER_THREAD>(input_vec, count);
+  }
+
+  const int warp_id = threadIdx.x / THREADS_PER_WARP;
+  thread_amax = reduce_max<ROWWISE_THREADS_PER_BLOCK / THREADS_PER_WARP>(thread_amax, warp_id);
+  if (threadIdx.x == 0) {
+    atomicMaxFloat(amax + shared_tensor_id, thread_amax);
+  }
+}
+
+template <bool VARYING_FIRST_DIM, bool IS_ACT, typename ParamOP,
+          float (*OP)(float, const ParamOP &), typename IType, typename OType,
+          int ELEMS_PER_THREAD>
+static __global__ void grouped_rowwise_cast_fp8_kernel(
+    const IType *const __restrict__ input, OType *const __restrict__ output,
+    const float *const __restrict__ scale, const size_t num_tensors,
+    const size_t first_logical_dim, const size_t last_dim, const size_t column_tiles,
+    const int64_t *const __restrict__ offsets, const float *noop) {
+  if (noop != nullptr && noop[0] == 1.0f) {
+    return;
+  }
+
+  const size_t tile_id = blockIdx.x;
+  const size_t row_id = tile_id / column_tiles;
+  const size_t column_tile = tile_id - row_id * column_tiles;
+
+  __shared__ size_t shared_tensor_id;
+  __shared__ size_t shared_tensor_start;
+  __shared__ size_t shared_row_in_tensor;
+  __shared__ int shared_is_valid_row;
+  if (threadIdx.x == 0) {
+    size_t tensor_id = 0;
+    size_t tensor_start = 0;
+    size_t row_in_tensor = 0;
+    shared_is_valid_row = row_to_tensor<VARYING_FIRST_DIM>(
+        row_id, num_tensors, first_logical_dim, last_dim, offsets, &tensor_id, &tensor_start,
+        &row_in_tensor);
+    shared_tensor_id = tensor_id;
+    shared_tensor_start = tensor_start;
+    shared_row_in_tensor = row_in_tensor;
+  }
+  __syncthreads();
+
+  if (!shared_is_valid_row) {
+    return;
+  }
+
+  const size_t column =
+      (column_tile * blockDim.x + threadIdx.x) * static_cast<size_t>(ELEMS_PER_THREAD);
+  if (column >= last_dim) {
+    return;
+  }
+
+  const size_t remaining_columns = last_dim - column;
+  const size_t count = remaining_columns < static_cast<size_t>(ELEMS_PER_THREAD)
+                           ? remaining_columns
+                           : static_cast<size_t>(ELEMS_PER_THREAD);
+  const size_t row_offset = shared_tensor_start + shared_row_in_tensor * last_dim;
+  Vec<IType, ELEMS_PER_THREAD> input_vec;
+  Vec<OType, ELEMS_PER_THREAD> output_vec;
+  input_vec.load_from_elts(input + row_offset, column, count);
+  cast_scaled_vector<IS_ACT, ParamOP, OP, IType, OType, ELEMS_PER_THREAD>(
+      input_vec, &output_vec, count, scale[shared_tensor_id]);
+  output_vec.store_to_elts(output + row_offset, column, count);
 }
 
 template <typename OType>
@@ -138,45 +301,6 @@ __global__ void compute_grouped_scale_kernel(const float *const __restrict__ ama
       std::numeric_limits<float>::max());
   scale[tensor_id] = scale_val;
   reciprocal<float>(scale_inv + tensor_id, scale_val);
-}
-
-template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
-          typename OType, int ELEMS_PER_THREAD>
-__global__ void grouped_cast_fp8_kernel(const IType *const __restrict__ input,
-                                        OType *const __restrict__ output,
-                                        const float *const __restrict__ scale,
-                                        const size_t uniform_tensor_elements,
-                                        const size_t uniform_rows, const size_t last_dim,
-                                        const int64_t *const __restrict__ offsets,
-                                        const int64_t *const __restrict__ first_dims,
-                                        const float *noop) {
-  if (noop != nullptr && noop[0] == 1.0f) {
-    return;
-  }
-
-  const size_t tensor_id = blockIdx.y;
-  const size_t local_base =
-      (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<size_t>(ELEMS_PER_THREAD);
-  const size_t tensor_elements =
-      tensor_payload_elements(tensor_id, first_dims, uniform_rows, last_dim);
-  if (local_base >= tensor_elements) {
-    return;
-  }
-
-  const size_t tensor_start = tensor_start_offset(tensor_id, offsets, uniform_tensor_elements);
-  const float scale_val = scale[tensor_id];
-
-#pragma unroll
-  for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-    const size_t local_idx = local_base + static_cast<size_t>(i);
-    if (local_idx < tensor_elements) {
-      float elt = static_cast<float>(input[tensor_start + local_idx]);
-      if constexpr (IS_ACT) {
-        elt = OP(elt, {});
-      }
-      output[tensor_start + local_idx] = static_cast<OType>(elt * scale_val);
-    }
-  }
 }
 
 }  // namespace group_quantize_kernel
@@ -233,14 +357,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
              "Uniform grouped FP8 current scaling requires first dimension divisible by "
              "num_tensors.");
 
-  const size_t uniform_rows = varying_first_dim ? 0 : first_logical_dim / num_tensors;
-  const size_t uniform_tensor_elements = uniform_rows * last_logical_dim;
-  const size_t max_tensor_elements =
-      varying_first_dim ? total_elements : uniform_tensor_elements;
   const int64_t *const offsets_ptr =
       varying_first_dim ? reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr) : nullptr;
-  const int64_t *const first_dims_ptr =
-      varying_first_dim ? reinterpret_cast<const int64_t *>(output->first_dims.dptr) : nullptr;
   const float *const noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
   float *const amax_ptr = reinterpret_cast<float *>(output->amax.dptr);
   float *const scale_ptr = reinterpret_cast<float *>(output->scale.dptr);
@@ -254,20 +372,34 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       amax_ptr, scale_ptr, scale_inv_ptr, num_tensors, noop_ptr);
   NVTE_CHECK_CUDA(cudaGetLastError());
 
+  if (total_elements == 0) {
+    return;
+  }
+
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
       input->dtype(), IType,
       TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
           output->dtype(), OType,
-          constexpr int elems_per_thread = ElemsPerThread<IType>::value;
-          const dim3 grid(
-              DIVUP(max_tensor_elements,
-                    static_cast<size_t>(THREADS_PER_BLOCK * elems_per_thread)),
-              num_tensors);
-          grouped_amax_kernel<IS_ACT, ParamOP, OP, IType, elems_per_thread>
-          <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-              reinterpret_cast<const IType *>(input->data.dptr), amax_ptr,
-              uniform_tensor_elements, uniform_rows, last_logical_dim, offsets_ptr, first_dims_ptr,
-              noop_ptr);
+          constexpr int elems_per_thread = RowwiseElemsPerThread<IType>::value;
+          const size_t column_tiles =
+              DIVUP(last_logical_dim,
+                    static_cast<size_t>(ROWWISE_THREADS_PER_BLOCK * elems_per_thread));
+          const size_t rowwise_blocks = first_logical_dim * column_tiles;
+          NVTE_CHECK(rowwise_blocks <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                     "Grouped FP8 current scaling rowwise grid is too large.");
+          const dim3 rowwise_grid(static_cast<unsigned int>(rowwise_blocks));
+
+          if (varying_first_dim) {
+            grouped_rowwise_amax_kernel<true, IS_ACT, ParamOP, OP, IType, elems_per_thread>
+            <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                reinterpret_cast<const IType *>(input->data.dptr), amax_ptr, num_tensors,
+                first_logical_dim, last_logical_dim, column_tiles, offsets_ptr, noop_ptr);
+          } else {
+            grouped_rowwise_amax_kernel<false, IS_ACT, ParamOP, OP, IType, elems_per_thread>
+            <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                reinterpret_cast<const IType *>(input->data.dptr), amax_ptr, num_tensors,
+                first_logical_dim, last_logical_dim, column_tiles, offsets_ptr, noop_ptr);
+          }
           NVTE_CHECK_CUDA(cudaGetLastError());
 
           compute_grouped_scale_kernel<OType>
@@ -276,11 +408,21 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
               noop_ptr);
           NVTE_CHECK_CUDA(cudaGetLastError());
 
-          grouped_cast_fp8_kernel<IS_ACT, ParamOP, OP, IType, OType, elems_per_thread>
-          <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-              reinterpret_cast<const IType *>(input->data.dptr),
-              reinterpret_cast<OType *>(output->data.dptr), scale_ptr, uniform_tensor_elements,
-              uniform_rows, last_logical_dim, offsets_ptr, first_dims_ptr, noop_ptr);
+          if (varying_first_dim) {
+            grouped_rowwise_cast_fp8_kernel<true, IS_ACT, ParamOP, OP, IType, OType,
+                                            elems_per_thread>
+            <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                reinterpret_cast<const IType *>(input->data.dptr),
+                reinterpret_cast<OType *>(output->data.dptr), scale_ptr, num_tensors,
+                first_logical_dim, last_logical_dim, column_tiles, offsets_ptr, noop_ptr);
+          } else {
+            grouped_rowwise_cast_fp8_kernel<false, IS_ACT, ParamOP, OP, IType, OType,
+                                            elems_per_thread>
+            <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                reinterpret_cast<const IType *>(input->data.dptr),
+                reinterpret_cast<OType *>(output->data.dptr), scale_ptr, num_tensors,
+                first_logical_dim, last_logical_dim, column_tiles, offsets_ptr, noop_ptr);
+          }
           NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
   );                                             // NOLINT(*)
 }
