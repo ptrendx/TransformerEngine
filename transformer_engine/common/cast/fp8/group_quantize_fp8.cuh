@@ -15,7 +15,9 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "../../common.h"
 #include "../../recipe/recipe_common.cuh"
@@ -31,6 +33,9 @@ namespace group_quantize_current_scaling_kernel {
 constexpr size_t THREADS_PER_BLOCK = 256;
 constexpr size_t ELEMS_PER_THREAD = 8;
 constexpr size_t ELEMS_PER_BLOCK = THREADS_PER_BLOCK * ELEMS_PER_THREAD;
+constexpr size_t ROWWISE_THREADS_PER_BLOCK = 512;
+constexpr size_t ROWWISE_VECTOR_BYTES = 32;
+constexpr size_t MAX_BLOCKS_PER_TENSOR = 2048;
 
 __device__ __forceinline__ bool noop_enabled(const float *noop_ptr) {
   return noop_ptr != nullptr && noop_ptr[0] == 1.0f;
@@ -69,6 +74,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
        tensor_id += gridDim.x * blockDim.x) {
     amax_ptr[tensor_id] = 0.0f;
   }
+}
+
+inline bool is_aligned_to(const void *ptr, const size_t alignment) {
+  return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
+
+inline size_t limited_blocks_per_tensor(const size_t work_items,
+                                        const size_t work_items_per_block) {
+  return std::max<size_t>(
+      1, std::min<size_t>(DIVUP(work_items, work_items_per_block), MAX_BLOCKS_PER_TENSOR));
 }
 
 template <bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &), typename IType,
@@ -122,6 +137,87 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) compute_amax_kernel(
   }
 }
 
+template <int NVec, bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &),
+          typename IType, ShapeRepresentation SHAPE_REP>
+__global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK) compute_amax_rowwise_vectorized_kernel(
+    const IType *const __restrict__ input_ptr, float *const __restrict__ amax_ptr,
+    const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *const __restrict__ offsets_ptr, const int64_t *const __restrict__ first_dims_ptr,
+    const float *noop_ptr) {
+  if (noop_enabled(noop_ptr)) {
+    return;
+  }
+
+  const size_t tensor_id = blockIdx.y;
+  if (tensor_id >= num_tensors) {
+    return;
+  }
+
+  const size_t rows =
+      get_tensor_rows<SHAPE_REP>(tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+  const size_t cols = last_logical_dim;
+  const size_t numel = rows * cols;
+  const size_t num_vecs = numel / NVec;
+  if (num_vecs == 0) {
+    return;
+  }
+
+  const size_t tensor_offset = get_tensor_offset<SHAPE_REP>(tensor_id, rows, cols, offsets_ptr);
+  const IType *const tensor_input = input_ptr + tensor_offset;
+
+  float thread_amax = 0.0f;
+  if constexpr (!IS_ACT && std::is_same_v<IType, __nv_bfloat16>) {
+    IType typed_amax = IType{0.0f};
+    for (size_t vec_id = blockIdx.x * blockDim.x + threadIdx.x; vec_id < num_vecs;
+         vec_id += gridDim.x * blockDim.x) {
+      Vec<IType, NVec> input_vec;
+      input_vec.load_from(tensor_input, vec_id);
+#pragma unroll
+      for (int i = 0; i < NVec; ++i) {
+#if __CUDA_ARCH__ >= 800
+        typed_amax = __hmax(__habs(input_vec.data.elt[i]), typed_amax);
+#else
+        typed_amax = static_cast<IType>(fmaxf(fabsf(static_cast<float>(input_vec.data.elt[i])),
+                                              static_cast<float>(typed_amax)));
+#endif
+      }
+    }
+    thread_amax = static_cast<float>(typed_amax);
+  } else if constexpr (!IS_ACT && std::is_same_v<IType, __half>) {
+    IType typed_amax = IType{0.0f};
+    for (size_t vec_id = blockIdx.x * blockDim.x + threadIdx.x; vec_id < num_vecs;
+         vec_id += gridDim.x * blockDim.x) {
+      Vec<IType, NVec> input_vec;
+      input_vec.load_from(tensor_input, vec_id);
+#pragma unroll
+      for (int i = 0; i < NVec; ++i) {
+        typed_amax = __hmax(__habs(input_vec.data.elt[i]), typed_amax);
+      }
+    }
+    thread_amax = static_cast<float>(typed_amax);
+  } else {
+    for (size_t vec_id = blockIdx.x * blockDim.x + threadIdx.x; vec_id < num_vecs;
+         vec_id += gridDim.x * blockDim.x) {
+      Vec<IType, NVec> input_vec;
+      input_vec.load_from(tensor_input, vec_id);
+#pragma unroll
+      for (int i = 0; i < NVec; ++i) {
+        float value = static_cast<float>(input_vec.data.elt[i]);
+        if constexpr (IS_ACT) {
+          value = OP(value, {});
+        }
+        thread_amax = fmaxf(thread_amax, fabsf(value));
+      }
+    }
+  }
+
+  const int warp_id = threadIdx.x / THREADS_PER_WARP;
+  thread_amax = reduce_max<ROWWISE_THREADS_PER_BLOCK / THREADS_PER_WARP>(thread_amax, warp_id);
+  if (threadIdx.x == 0) {
+    atomicMaxFloat(amax_ptr + tensor_id, thread_amax);
+  }
+}
+
 template <typename OType>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) compute_scale_kernel(
     const float *const __restrict__ amax_ptr, float *const __restrict__ scale_ptr,
@@ -144,6 +240,61 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) compute_scale_kernel(
     if (columnwise_scale_inv_ptr != nullptr) {
       reciprocal<float>(columnwise_scale_inv_ptr + tensor_id, scale);
     }
+  }
+}
+
+template <int NVec, bool IS_ACT, typename ParamOP, float (*OP)(float, const ParamOP &),
+          typename IType, typename OType, ShapeRepresentation SHAPE_REP>
+__global__ void __launch_bounds__(ROWWISE_THREADS_PER_BLOCK) cast_fp8_rowwise_vectorized_kernel(
+    const IType *const __restrict__ input_ptr, OType *const __restrict__ output_ptr,
+    const float *const __restrict__ amax_ptr, float *const __restrict__ scale_ptr,
+    float *const __restrict__ scale_inv_ptr, const size_t num_tensors,
+    const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *const __restrict__ offsets_ptr, const int64_t *const __restrict__ first_dims_ptr,
+    const bool force_pow_2_scales, const float epsilon, const float *noop_ptr) {
+  if (noop_enabled(noop_ptr)) {
+    return;
+  }
+
+  const size_t tensor_id = blockIdx.y;
+  if (tensor_id >= num_tensors) {
+    return;
+  }
+
+  const size_t rows =
+      get_tensor_rows<SHAPE_REP>(tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+  const size_t cols = last_logical_dim;
+  const size_t numel = rows * cols;
+  const size_t num_vecs = numel / NVec;
+  constexpr float max_fp8 = TypeInfo<OType>::max_finite_value;
+  const float scale = compute_scale_from_amax(amax_ptr[tensor_id], max_fp8, force_pow_2_scales,
+                                              epsilon, std::numeric_limits<float>::max());
+
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    scale_ptr[tensor_id] = scale;
+    if (scale_inv_ptr != nullptr) {
+      reciprocal<float>(scale_inv_ptr + tensor_id, scale);
+    }
+  }
+
+  const size_t tensor_offset = get_tensor_offset<SHAPE_REP>(tensor_id, rows, cols, offsets_ptr);
+  const IType *const tensor_input = input_ptr + tensor_offset;
+  OType *const tensor_output = output_ptr + tensor_offset;
+
+  for (size_t vec_id = blockIdx.x * blockDim.x + threadIdx.x; vec_id < num_vecs;
+       vec_id += gridDim.x * blockDim.x) {
+    Vec<IType, NVec> input_vec;
+    Vec<OType, NVec> output_vec;
+    input_vec.load_from(tensor_input, vec_id);
+#pragma unroll
+    for (int i = 0; i < NVec; ++i) {
+      float value = static_cast<float>(input_vec.data.elt[i]);
+      if constexpr (IS_ACT) {
+        value = OP(value, {});
+      }
+      output_vec.data.elt[i] = static_cast<OType>(value * scale);
+    }
+    output_vec.store_to(tensor_output, vec_id);
   }
 }
 
@@ -292,7 +443,7 @@ void group_quantize_current_scaling(const GroupedTensor *input, const Tensor *no
 
   const size_t average_tensor_elements = DIVUP(total_elements, num_tensors);
   const size_t blocks_per_tensor =
-      std::max<size_t>(1, std::min<size_t>(DIVUP(average_tensor_elements, ELEMS_PER_BLOCK), 65535));
+      limited_blocks_per_tensor(average_tensor_elements, ELEMS_PER_BLOCK);
   const dim3 grouped_grid(blocks_per_tensor, num_tensors);
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
@@ -301,31 +452,63 @@ void group_quantize_current_scaling(const GroupedTensor *input, const Tensor *no
           output->dtype(), OType,
           TRANSFORMER_ENGINE_GROUP_TENSOR_SHAPE_REPRESENTATION_SWITCH(
               shape_rep, SHAPE_REP,
-              compute_amax_kernel<IS_ACT, ParamOP, OP, IType, SHAPE_REP>
-              <<<grouped_grid, THREADS_PER_BLOCK, 0, stream>>>(
-                  reinterpret_cast<const IType *>(input->data.dptr), amax_ptr, num_tensors,
-                  first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, noop_ptr);
-              NVTE_CHECK_CUDA(cudaGetLastError());
-
-              const size_t scale_blocks =
-                  std::max<size_t>(1, DIVUP(num_tensors, THREADS_PER_BLOCK));
-              compute_scale_kernel<OType><<<scale_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-                  amax_ptr, scale_ptr, scale_inv_ptr, columnwise_scale_inv_ptr, num_tensors,
-                  force_pow_2_scales, epsilon, noop_ptr);
-              NVTE_CHECK_CUDA(cudaGetLastError());
-
               OType *const output_ptr =
                   output->has_data() ? reinterpret_cast<OType *>(output->data.dptr) : nullptr;
               OType *const columnwise_output_ptr = output->has_columnwise_data()
                                                        ? reinterpret_cast<OType *>(
                                                              output->columnwise_data.dptr)
                                                        : nullptr;
-              cast_fp8_kernel<IS_ACT, ParamOP, OP, IType, OType, SHAPE_REP>
-              <<<grouped_grid, THREADS_PER_BLOCK, 0, stream>>>(
-                  reinterpret_cast<const IType *>(input->data.dptr), output_ptr,
-                  columnwise_output_ptr, scale_ptr, num_tensors, first_logical_dim,
-                  last_logical_dim, offsets_ptr, first_dims_ptr, noop_ptr);
-              NVTE_CHECK_CUDA(cudaGetLastError()););););  // NOLINT(*)
+              constexpr int rowwise_nvec = ROWWISE_VECTOR_BYTES / sizeof(IType);
+              const bool use_vectorized_rowwise =
+                  output_ptr != nullptr && columnwise_output_ptr == nullptr &&
+                  last_logical_dim % rowwise_nvec == 0 &&
+                  is_aligned_to(input->data.dptr, ROWWISE_VECTOR_BYTES) &&
+                  is_aligned_to(output->data.dptr, sizeof(OType) * rowwise_nvec);
+
+              if (use_vectorized_rowwise) {
+                const size_t average_tensor_vecs = DIVUP(average_tensor_elements, rowwise_nvec);
+                const size_t rowwise_blocks_per_tensor = limited_blocks_per_tensor(
+                    average_tensor_vecs, ROWWISE_THREADS_PER_BLOCK);
+                const dim3 rowwise_grid(rowwise_blocks_per_tensor, num_tensors);
+
+                compute_amax_rowwise_vectorized_kernel<rowwise_nvec, IS_ACT, ParamOP, OP, IType,
+                                                       SHAPE_REP>
+                    <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), amax_ptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr,
+                        noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+
+                cast_fp8_rowwise_vectorized_kernel<rowwise_nvec, IS_ACT, ParamOP, OP, IType,
+                                                   OType, SHAPE_REP>
+                    <<<rowwise_grid, ROWWISE_THREADS_PER_BLOCK, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), output_ptr, amax_ptr,
+                        scale_ptr, scale_inv_ptr, num_tensors, first_logical_dim,
+                        last_logical_dim, offsets_ptr, first_dims_ptr, force_pow_2_scales, epsilon,
+                        noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+              } else {
+                compute_amax_kernel<IS_ACT, ParamOP, OP, IType, SHAPE_REP>
+                    <<<grouped_grid, THREADS_PER_BLOCK, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), amax_ptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr,
+                        noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+
+                const size_t scale_blocks =
+                    std::max<size_t>(1, DIVUP(num_tensors, THREADS_PER_BLOCK));
+                compute_scale_kernel<OType><<<scale_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    amax_ptr, scale_ptr, scale_inv_ptr, columnwise_scale_inv_ptr, num_tensors,
+                    force_pow_2_scales, epsilon, noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+
+                cast_fp8_kernel<IS_ACT, ParamOP, OP, IType, OType, SHAPE_REP>
+                    <<<grouped_grid, THREADS_PER_BLOCK, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), output_ptr,
+                        columnwise_output_ptr, scale_ptr, num_tensors, first_logical_dim,
+                        last_logical_dim, offsets_ptr, first_dims_ptr, noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+              });););  // NOLINT(*)
 }
 
 }  // namespace fp8
