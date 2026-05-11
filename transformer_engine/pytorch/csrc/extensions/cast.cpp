@@ -162,14 +162,24 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
 
   // Create input GroupedTensor.
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
-  grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+  const std::vector<size_t> flat_data_shape = {static_cast<size_t>(tensor.numel())};
+  grouped_input_tensor.set_rowwise_data(tensor.data_ptr(),
+                                        GetTransformerEngineDType(tensor.scalar_type()),
+                                        flat_data_shape);
 
   // Create output GroupedTensor.
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
       num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
       py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
       logical_last_dim);
+  if (first_dims.has_value()) {
+    grouped_input_tensor.set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                        getTensorShape(*first_dims));
+    const auto tensor_offsets = grouped_output_tensor_cpp.get_tensor_offsets();
+    grouped_input_tensor.set_tensor_offsets(tensor_offsets.data_ptr,
+                                            static_cast<DType>(tensor_offsets.dtype),
+                                            tensor_offsets.shape);
+  }
 
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {
