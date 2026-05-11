@@ -466,7 +466,8 @@ void group_quantize_current_scaling(const GroupedTensor *input, const Tensor *no
                   is_aligned_to(output->data.dptr, sizeof(OType) * rowwise_nvec);
 
               if (use_vectorized_rowwise) {
-                const size_t average_tensor_vecs = DIVUP(average_tensor_elements, rowwise_nvec);
+                const size_t average_tensor_vecs =
+                    DIVUP(average_tensor_elements, static_cast<size_t>(rowwise_nvec));
                 const size_t rowwise_blocks_per_tensor = limited_blocks_per_tensor(
                     average_tensor_vecs, ROWWISE_THREADS_PER_BLOCK);
                 const dim3 rowwise_grid(rowwise_blocks_per_tensor, num_tensors);
