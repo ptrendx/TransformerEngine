@@ -474,6 +474,59 @@ class TestGroupedTensor:
         torch.testing.assert_close(grouped_output.amax, expected_amax, rtol=0, atol=0)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_current_scaling_default_columnwise(self) -> None:
+        """Default current scaling should produce matching grouped columnwise FP8 output."""
+        first_dims_h = [4, 9, 6]
+        hidden_size = 16
+        shape = [(rows, hidden_size) for rows in first_dims_h]
+        num_tensors = len(shape)
+        input_tensors = [
+            torch.randn(s, dtype=torch.bfloat16, device="cuda") * 0.25 for s in shape
+        ]
+        grouped_input = torch.cat(input_tensors, dim=0)
+        first_dims = torch.tensor(first_dims_h, dtype=torch.int64, device="cuda")
+
+        quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+        )
+        assert quantizer.rowwise_usage
+        assert quantizer.columnwise_usage
+
+        grouped_output = tex.group_quantize(grouped_input, quantizer, num_tensors, first_dims)
+
+        expected_rowwise_data = []
+        expected_columnwise_data = []
+        expected_scale_inv = []
+        expected_amax = []
+        for tensor in input_tensors:
+            qtensor = quantizer(tensor)
+            expected_rowwise_data.append(qtensor._data.reshape(-1))
+            if qtensor._transpose is not None:
+                expected_columnwise_data.append(qtensor._transpose.reshape(-1))
+            else:
+                expected_columnwise_data.append(
+                    qtensor._data.view(tensor.shape).T.contiguous().reshape(-1)
+                )
+            expected_scale_inv.append(qtensor._scale_inv.reshape(-1))
+            expected_amax.append(tensor.float().abs().max())
+
+        expected_rowwise_data = torch.cat(expected_rowwise_data)
+        expected_columnwise_data = torch.cat(expected_columnwise_data)
+        expected_scale_inv = torch.cat(expected_scale_inv)
+        expected_amax = torch.stack(expected_amax)
+
+        assert grouped_output.columnwise_data is not None
+        assert grouped_output.columnwise_scale_inv is not None
+        assert torch.equal(grouped_output.rowwise_data, expected_rowwise_data)
+        assert torch.equal(grouped_output.columnwise_data, expected_columnwise_data)
+        torch.testing.assert_close(grouped_output.scale_inv, expected_scale_inv, rtol=0, atol=0)
+        torch.testing.assert_close(
+            grouped_output.columnwise_scale_inv, expected_scale_inv, rtol=0, atol=0
+        )
+        torch.testing.assert_close(grouped_output.amax, expected_amax, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     def test_group_quantize_fp8_current_scaling_overallocated_tail(self) -> None:
         """Sentinel tail capacity must not affect grouped FP8 current scaling."""
         first_dims_h = [5, 2, 9]

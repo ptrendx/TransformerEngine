@@ -43,6 +43,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allocated-first-dim", type=int, default=114688)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--inner-iters",
+        type=int,
+        default=20,
+        help=(
+            "Number of tex.group_quantize invocations per CUDA-event measurement window. "
+            "Increasing this amortizes event, launch, and synchronization overhead."
+        ),
+    )
     parser.add_argument("--require-min-tbps", type=float, default=6.0)
     parser.add_argument("--peak-bandwidth-tbps", type=float, default=8.0)
     parser.add_argument("--tail-sentinel", type=float, default=4096.0)
@@ -65,6 +74,8 @@ def main() -> None:
         raise ValueError("--hidden-size must be positive")
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
+    if args.inner_iters <= 0:
+        raise ValueError("--inner-iters must be positive")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
 
@@ -98,32 +109,46 @@ def main() -> None:
         tex.group_quantize(x, quantizer, args.num_tensors, first_dims)
     torch.cuda.synchronize()
 
-    times_sec = []
+    window_times_sec = []
+    output = None
     for _ in range(args.iters):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        output = tex.group_quantize(x, quantizer, args.num_tensors, first_dims)
+        for _ in range(args.inner_iters):
+            output = tex.group_quantize(x, quantizer, args.num_tensors, first_dims)
         end.record()
         end.synchronize()
-        times_sec.append(start.elapsed_time(end) / 1000.0)
+        window_times_sec.append(start.elapsed_time(end) / 1000.0)
 
     torch.cuda.synchronize()
+    assert output is not None
 
     actual_numel = actual_first_dim * args.hidden_size
     allocated_numel = args.allocated_first_dim * args.hidden_size
     tail_numel = allocated_numel - actual_numel
-    logical_payload_bytes = actual_numel * (
+    logical_payload_bytes_per_invocation = actual_numel * (
         input_element_size + output_count * output_element_size
     )
-    estimated_relevant_traffic_bytes = actual_numel * (
+    estimated_relevant_traffic_bytes_per_invocation = actual_numel * (
         2 * input_element_size + output_count * output_element_size
     )
+    estimated_relevant_traffic_bytes_per_window = (
+        estimated_relevant_traffic_bytes_per_invocation * args.inner_iters
+    )
 
-    median_sec = statistics.median(times_sec)
-    mean_sec = statistics.fmean(times_sec)
-    min_sec = min(times_sec)
-    bandwidth_tbps = estimated_relevant_traffic_bytes / median_sec / 1.0e12
+    per_invocation_times_sec = [elapsed / args.inner_iters for elapsed in window_times_sec]
+    window_bandwidths_tbps = [
+        estimated_relevant_traffic_bytes_per_window / elapsed / 1.0e12
+        for elapsed in window_times_sec
+    ]
+    median_window_sec = statistics.median(window_times_sec)
+    mean_window_sec = statistics.fmean(window_times_sec)
+    min_window_sec = min(window_times_sec)
+    median_invocation_sec = statistics.median(per_invocation_times_sec)
+    mean_invocation_sec = statistics.fmean(per_invocation_times_sec)
+    min_invocation_sec = min(per_invocation_times_sec)
+    bandwidth_tbps = statistics.median(window_bandwidths_tbps)
     peak_fraction = bandwidth_tbps / args.peak_bandwidth_tbps
 
     result = {
@@ -145,12 +170,46 @@ def main() -> None:
         "fp8_dtype": "kFloat8E4M3",
         "input_element_size": input_element_size,
         "output_element_size_per_present_output": output_element_size,
-        "logical_payload_bytes": logical_payload_bytes,
-        "estimated_relevant_traffic_bytes": estimated_relevant_traffic_bytes,
-        "elapsed_sec_median": median_sec,
-        "elapsed_sec_mean": mean_sec,
-        "elapsed_sec_min": min_sec,
+        "logical_payload_bytes": logical_payload_bytes_per_invocation,
+        "logical_payload_bytes_per_invocation": logical_payload_bytes_per_invocation,
+        "estimated_relevant_traffic_bytes": estimated_relevant_traffic_bytes_per_invocation,
+        "estimated_relevant_traffic_bytes_per_invocation": (
+            estimated_relevant_traffic_bytes_per_invocation
+        ),
+        "estimated_relevant_traffic_bytes_per_window": (
+            estimated_relevant_traffic_bytes_per_window
+        ),
+        "cuda_event_windows": args.iters,
+        "inner_iters_per_window": args.inner_iters,
+        "total_measured_invocations": args.iters * args.inner_iters,
+        "warmup_invocations": args.warmup,
+        "synchronization_method": (
+            "one CUDA event synchronization per measured window after the inner loop; "
+            "no per-invocation synchronization inside the measured loop"
+        ),
+        "timed_region": (
+            "CUDA events around inner_iters consecutive tex.group_quantize calls on pre-created "
+            "input, first_dims, and quantizer"
+        ),
+        "input_setup_allocation_excluded": True,
+        "first_dims_and_quantizer_setup_excluded": True,
+        "output_allocation_included": True,
+        "output_allocation_note": (
+            "tex.group_quantize creates a new grouped output object; that wrapper/output "
+            "allocation is included in each timed invocation because the public API has no "
+            "out parameter to pre-bind reusable output storage"
+        ),
+        "elapsed_sec_median": median_invocation_sec,
+        "elapsed_sec_mean": mean_invocation_sec,
+        "elapsed_sec_min": min_invocation_sec,
+        "elapsed_sec_per_invocation_median": median_invocation_sec,
+        "elapsed_sec_per_invocation_mean": mean_invocation_sec,
+        "elapsed_sec_per_invocation_min": min_invocation_sec,
+        "elapsed_sec_per_window_median": median_window_sec,
+        "elapsed_sec_per_window_mean": mean_window_sec,
+        "elapsed_sec_per_window_min": min_window_sec,
         "bandwidth_TBps_actual_bytes": bandwidth_tbps,
+        "bandwidth_TBps_actual_bytes_per_window_median": bandwidth_tbps,
         "gb200_peak_bandwidth_TBps_expectation": args.peak_bandwidth_tbps,
         "fraction_of_gb200_peak_bandwidth": peak_fraction,
         "required_min_TBps": args.require_min_tbps,
