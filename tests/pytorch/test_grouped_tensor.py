@@ -431,6 +431,94 @@ class TestGroupedTensor:
         assert dbias.shape == (num_tensors, last_dim)
         assert torch.all(dbias == 0)
 
+    @pytest.mark.parametrize("force_pow_2_scales,amax_epsilon", [(False, 0.0), (True, 1.0e-3)])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_current_scaling(
+        self, force_pow_2_scales: bool, amax_epsilon: float
+    ) -> None:
+        """Test grouped FP8 current scaling against per-tensor quantization."""
+        shape = [(7, 16), (3, 16), (11, 16)]
+        num_tensors = len(shape)
+        input_tensors = [
+            torch.randn(s, dtype=torch.bfloat16, device="cuda") * 0.25 for s in shape
+        ]
+        grouped_input = torch.cat(input_tensors, dim=0)
+        first_dims = torch.tensor([s[0] for s in shape], dtype=torch.int64, device="cuda")
+
+        quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+            rowwise=True,
+            columnwise=False,
+            force_pow_2_scales=force_pow_2_scales,
+            amax_epsilon=amax_epsilon,
+        )
+
+        grouped_output = tex.group_quantize(grouped_input, quantizer, num_tensors, first_dims)
+
+        expected_data = []
+        expected_scale_inv = []
+        expected_amax = []
+        for tensor in input_tensors:
+            qtensor = quantizer(tensor)
+            expected_data.append(qtensor._data.reshape(-1))
+            expected_scale_inv.append(qtensor._scale_inv.reshape(-1))
+            expected_amax.append(tensor.float().abs().max())
+
+        expected_data = torch.cat(expected_data)
+        expected_scale_inv = torch.cat(expected_scale_inv)
+        expected_amax = torch.stack(expected_amax)
+
+        assert torch.equal(grouped_output.rowwise_data, expected_data)
+        torch.testing.assert_close(grouped_output.scale_inv, expected_scale_inv, rtol=0, atol=0)
+        torch.testing.assert_close(grouped_output.amax, expected_amax, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_current_scaling_overallocated_tail(self) -> None:
+        """Sentinel tail capacity must not affect grouped FP8 current scaling."""
+        first_dims_h = [5, 2, 9]
+        hidden_size = 16
+        tail_rows = 6
+        num_tensors = len(first_dims_h)
+        shape = [(rows, hidden_size) for rows in first_dims_h]
+        input_tensors = [
+            torch.randn(s, dtype=torch.bfloat16, device="cuda") * 0.125 for s in shape
+        ]
+        compact_input = torch.cat(input_tensors, dim=0)
+        overallocated_input = torch.empty(
+            compact_input.shape[0] + tail_rows,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        overallocated_input[: compact_input.shape[0]].copy_(compact_input)
+        overallocated_input[compact_input.shape[0] :].fill_(4096.0)
+        first_dims = torch.tensor(first_dims_h, dtype=torch.int64, device="cuda")
+
+        quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+            rowwise=True,
+            columnwise=False,
+        )
+
+        compact_output = tex.group_quantize(compact_input, quantizer, num_tensors, first_dims)
+        overallocated_output = tex.group_quantize(
+            overallocated_input, quantizer, num_tensors, first_dims
+        )
+
+        actual_numel = compact_input.numel()
+        assert overallocated_output.rowwise_data.numel() > actual_numel
+        assert overallocated_output.tensor_offsets[-1].item() == actual_numel
+        assert torch.equal(
+            overallocated_output.rowwise_data[:actual_numel], compact_output.rowwise_data
+        )
+        torch.testing.assert_close(overallocated_output.amax, compact_output.amax, rtol=0, atol=0)
+        torch.testing.assert_close(
+            overallocated_output.scale_inv, compact_output.scale_inv, rtol=0, atol=0
+        )
+        torch.testing.assert_close(overallocated_output.scale, compact_output.scale, rtol=0, atol=0)
+
     @pytest.mark.parametrize("output_dbias", [False, True])
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     def test_group_quantize_cudagraph_capturable(self, output_dbias: bool) -> None:
