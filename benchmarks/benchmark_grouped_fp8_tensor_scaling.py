@@ -203,7 +203,7 @@ def main():
         dest="cuda_graph",
         help="Measure eager public API calls instead of CUDA graph replay.",
     )
-    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--output", type=str, nargs="?", default=None)
     parser.set_defaults(cuda_graph=True)
     benchmark(parser.parse_args())
 
