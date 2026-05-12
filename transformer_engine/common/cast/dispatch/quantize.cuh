@@ -17,6 +17,7 @@
 #include "../../transpose/cast_transpose.h"
 #include "../../util/vectorized_pointwise.h"
 #include "../core/common.cuh"
+#include "../fp8/group_quantize_fp8.cuh"
 #include "../fp8/quantize_fp8.cuh"
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
@@ -418,6 +419,17 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
 
   // Dispatch to quantization kernel depending on data format
   switch (scaling_mode) {
+    case NVTE_DELAYED_TENSOR_SCALING: {
+      NVTE_CHECK(!IS_ACT,
+                 "Grouped FP8 current scaling does not support fused activation quantization.");
+      NVTE_CHECK(fp8::group_quantize_current_scaling::is_current_scaling_grouped_output(
+                     output_tensor),
+                 "Grouped FP8 delayed scaling is not supported by nvte_group_quantize; "
+                 "use Float8CurrentScalingQuantizer so grouped scale buffers are allocated.");
+      fp8::group_quantize_current_scaling::group_quantize(
+          input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+      break;
+    }
     case NVTE_MXFP8_1D_SCALING: {
       mxfp8::group_quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
           input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
