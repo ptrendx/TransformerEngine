@@ -535,8 +535,6 @@ inline void check_grouped_fp8_current_scaling_tensors(const GroupedTensor *input
   NVTE_CHECK(!is_fp8_dtype(input->dtype()), "Input must be in higher precision.");
   NVTE_CHECK(output->has_data() || output->has_columnwise_data(),
              "Either rowwise or columnwise output data need to be allocated.");
-  NVTE_CHECK(output->has_data(),
-             "Grouped FP8 current scaling does not support columnwise-only output.");
   NVTE_CHECK(is_fp8_dtype(output->dtype()), "Output must have FP8 type.");
   NVTE_CHECK(output->amax.dptr != nullptr && output->amax.dtype == DType::kFloat32 &&
                  output->amax.numel() == output->num_tensors,

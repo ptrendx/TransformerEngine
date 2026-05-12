@@ -118,6 +118,86 @@ class TestGroupedTensor:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
 
+    @staticmethod
+    def _assert_fp8_current_scaling_grouped_matches_independent(
+        grouped_output: GroupedTensor,
+        input_tensors: List[torch.Tensor],
+        *,
+        rowwise: bool,
+        columnwise: bool,
+        force_pow_2_scales: bool,
+        amax_epsilon: float = 0.0,
+    ) -> None:
+        """Check grouped FP8 current-scaling output against per-tensor quantization."""
+        assert (grouped_output.rowwise_data is not None) == rowwise
+        assert (grouped_output.columnwise_data is not None) == columnwise
+        assert (grouped_output.scale_inv is not None) == rowwise
+        assert (grouped_output.columnwise_scale_inv is not None) == columnwise
+
+        device = input_tensors[0].device
+        ref_quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+            rowwise=True,
+            columnwise=True,
+            force_pow_2_scales=force_pow_2_scales,
+            amax_epsilon=amax_epsilon,
+        )
+
+        expected_amax = []
+        expected_scale_inv = []
+        offset = 0
+        for tensor in input_tensors:
+            numel = tensor.numel()
+            if numel == 0:
+                expected_amax.append(torch.zeros((), dtype=torch.float32, device=device))
+                expected_scale_inv.append(torch.ones((), dtype=torch.float32, device=device))
+                continue
+
+            ref = ref_quantizer(tensor)
+            expected_amax.append(tensor.abs().float().max())
+            expected_scale_inv.append(ref._scale_inv.reshape(()))
+
+            if rowwise:
+                torch.testing.assert_close(
+                    grouped_output.rowwise_data[offset : offset + numel],
+                    ref._data.reshape(-1),
+                    rtol=0,
+                    atol=0,
+                )
+            if columnwise:
+                if ref._transpose is not None:
+                    expected_columnwise = ref._transpose.reshape(-1)
+                else:
+                    expected_columnwise = (
+                        ref._data.reshape(tensor.shape).t().contiguous().reshape(-1)
+                    )
+                torch.testing.assert_close(
+                    grouped_output.columnwise_data[offset : offset + numel],
+                    expected_columnwise,
+                    rtol=0,
+                    atol=0,
+                )
+            offset += numel
+
+        expected_amax = torch.stack(expected_amax)
+        expected_scale_inv = torch.stack(expected_scale_inv)
+        torch.testing.assert_close(grouped_output.amax, expected_amax, rtol=0, atol=0)
+        if rowwise:
+            torch.testing.assert_close(
+                grouped_output.scale_inv,
+                expected_scale_inv,
+                rtol=0,
+                atol=0,
+            )
+        if columnwise:
+            torch.testing.assert_close(
+                grouped_output.columnwise_scale_inv,
+                expected_scale_inv,
+                rtol=0,
+                atol=0,
+            )
+
     def test_basic_construction_all_same_shape(self) -> None:
         """Test GroupedTensor construction with all tensors having same shape"""
         num_tensors = 4
@@ -483,14 +563,128 @@ class TestGroupedTensor:
             atol=0,
         )
 
+    @pytest.mark.parametrize(
+        "rowwise,columnwise",
+        [(False, True), (True, True)],
+        ids=["columnwise_only", "rowwise_and_columnwise"],
+    )
+    @pytest.mark.parametrize(
+        "first_dims_list,tail_rows,pass_first_dims",
+        [([4, 4, 4], 0, False), ([3, 0, 5, 2], 4, True)],
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_current_scaling_columnwise_payload(
+        self,
+        rowwise: bool,
+        columnwise: bool,
+        first_dims_list: List[int],
+        tail_rows: int,
+        pass_first_dims: bool,
+    ) -> None:
+        """Test grouped FP8 current scaling writes correct columnwise payloads."""
+        num_tensors = len(first_dims_list)
+        hidden_dim = 32
+        actual_rows = sum(first_dims_list)
+        allocated_rows = actual_rows + tail_rows
+
+        torch.manual_seed(321)
+        input_tensors = [
+            torch.randn(rows, hidden_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+            for rows in first_dims_list
+        ]
+        grouped_input = torch.empty(
+            allocated_rows, hidden_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        if actual_rows > 0:
+            grouped_input[:actual_rows].copy_(torch.cat(input_tensors, dim=0))
+        grouped_input[actual_rows:].fill_(1000)
+
+        first_dims = torch.tensor(first_dims_list, dtype=torch.int64, device="cuda")
+        first_dims_arg = first_dims if pass_first_dims else None
+        quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+            rowwise=rowwise,
+            columnwise=columnwise,
+            force_pow_2_scales=True,
+        )
+
+        grouped_output = tex.group_quantize(grouped_input, quantizer, num_tensors, first_dims_arg)
+        self._assert_fp8_current_scaling_grouped_matches_independent(
+            grouped_output,
+            input_tensors,
+            rowwise=rowwise,
+            columnwise=columnwise,
+            force_pow_2_scales=True,
+        )
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_group_quantize_fp8_current_scaling_grouped_linear_backward_usage(self) -> None:
+        """Test the GroupedLinear backward grad-output usage flags are reachable."""
+        first_dims_list = [16, 0, 16]
+        num_tensors = len(first_dims_list)
+        hidden_dim = 16
+        tail_rows = 3
+        actual_rows = sum(first_dims_list)
+        allocated_rows = actual_rows + tail_rows
+
+        torch.manual_seed(456)
+        input_tensors = [
+            torch.randn(rows, hidden_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+            for rows in first_dims_list
+        ]
+        grouped_input = torch.empty(
+            allocated_rows, hidden_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        grouped_input[:actual_rows].copy_(torch.cat(input_tensors, dim=0))
+        grouped_input[actual_rows:].fill_(1000)
+        first_dims = torch.tensor(first_dims_list, dtype=torch.int64, device="cuda")
+
+        input_requires_grad = False
+        weight_requires_grad = True
+        grad_output_quantizer = Float8CurrentScalingQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            device="cuda",
+            force_pow_2_scales=True,
+        )
+        grad_output_quantizer.set_usage(
+            rowwise=input_requires_grad,
+            columnwise=weight_requires_grad,
+        )
+
+        grouped_output = tex.group_quantize(
+            grouped_input,
+            grad_output_quantizer,
+            num_tensors,
+            first_dims,
+        )
+        self._assert_fp8_current_scaling_grouped_matches_independent(
+            grouped_output,
+            input_tensors,
+            rowwise=False,
+            columnwise=True,
+            force_pow_2_scales=True,
+        )
+
+        split_outputs = grouped_output.split_into_quantized_tensors()
+        for tensor_id, split_output in enumerate(split_outputs):
+            assert split_output._data is None
+            assert split_output._transpose is not None
+            assert split_output._transpose.shape == (hidden_dim, first_dims_list[tensor_id])
+            torch.testing.assert_close(
+                split_output._scale_inv,
+                grouped_output.columnwise_scale_inv[tensor_id : tensor_id + 1],
+                rtol=0,
+                atol=0,
+            )
+
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     def test_group_quantize_fp8_current_scaling_default_quantizer(self) -> None:
         """Test grouped FP8 current scaling works with the quantizer's default usages."""
         num_tensors = 2
         shape = [(4, 16), (4, 16)]
-        grouped_input = torch.cat(
-            [torch.randn(s, dtype=torch.bfloat16, device="cuda") for s in shape], dim=0
-        )
+        input_tensors = [torch.randn(s, dtype=torch.bfloat16, device="cuda") for s in shape]
+        grouped_input = torch.cat(input_tensors, dim=0)
         first_dims = torch.tensor([s[0] for s in shape], dtype=torch.int64, device="cuda")
         quantizer = Float8CurrentScalingQuantizer(
             fp8_dtype=tex.DType.kFloat8E4M3,
@@ -502,6 +696,13 @@ class TestGroupedTensor:
         assert grouped_output.rowwise_data is not None
         assert grouped_output.columnwise_data is not None
         torch.testing.assert_close(grouped_output.scale_inv, grouped_output.columnwise_scale_inv)
+        self._assert_fp8_current_scaling_grouped_matches_independent(
+            grouped_output,
+            input_tensors,
+            rowwise=True,
+            columnwise=True,
+            force_pow_2_scales=False,
+        )
 
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     def test_bgrad_group_quantize_zero_size_tensor(self) -> None:
