@@ -132,8 +132,8 @@ def benchmark(args):
     metadata_bytes = args.num_tensors * 3 * 4
     processed_bytes = actual_elements * (2 * input_element_size + fp8_element_size) + metadata_bytes
     median_us = statistics.median(times_us)
-    bandwidth_tbps = processed_bytes / (median_us * 1.0e-6) / 1.0e12
-    peak_fraction = bandwidth_tbps / GB200_PEAK_BANDWIDTH_TBPS
+    bandwidth_tbps_actual_bytes = processed_bytes / (median_us * 1.0e-6) / 1.0e12
+    peak_fraction = bandwidth_tbps_actual_bytes / GB200_PEAK_BANDWIDTH_TBPS
 
     output_path = args.output or os.environ.get(
         "ORCHESTRA_BENCHMARK_RAW_REPORT", "grouped_fp8_tensor_scaling_report.json"
@@ -160,7 +160,7 @@ def benchmark(args):
         ),
         "median_us": median_us,
         "times_us": times_us,
-        "bandwidth_TBps_actual_bytes": bandwidth_tbps,
+        "bandwidth_TBps_actual_bytes": bandwidth_tbps_actual_bytes,
         "gb200_peak_bandwidth_TBps": GB200_PEAK_BANDWIDTH_TBPS,
         "peak_fraction": peak_fraction,
         "scale_inv_sample": output.scale_inv[: min(args.num_tensors, 8)].float().tolist(),
@@ -172,7 +172,8 @@ def benchmark(args):
     print(
         "actual_elements={actual_elements} allocated_elements={allocated_elements} "
         "tail_elements={tail_elements} processed_bytes={processed_bytes} "
-        "median_us={median_us:.3f} bandwidth_TBps={bandwidth_tbps:.3f} "
+        "median_us={median_us:.3f} "
+        "bandwidth_TBps_actual_bytes={bandwidth_TBps_actual_bytes:.3f} "
         "peak_fraction={peak_fraction:.3f}".format(**report)
     )
 
