@@ -17,10 +17,12 @@
 
 #include <cfloat>
 #include <cstddef>
+#include <type_traits>
 
 #include "../../common.h"
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/math.h"
+#include "../../util/ptx.cuh"
 #include "../../utils.cuh"
 #include "../core/common.cuh"
 
@@ -32,8 +34,9 @@ namespace group_quantize_current_scaling {
 namespace kernel {
 
 constexpr size_t THREADS_PER_BLOCK = 256;
-constexpr size_t ELEMENTS_PER_THREAD = 4;
+constexpr size_t ELEMENTS_PER_THREAD = 256;
 constexpr size_t ELEMENTS_PER_BLOCK = THREADS_PER_BLOCK * ELEMENTS_PER_THREAD;
+constexpr size_t VECTOR_LOAD_BYTES = 32;
 
 template <ShapeRepresentation SHAPE_REP>
 __device__ __forceinline__ size_t get_actual_elements(
@@ -117,6 +120,77 @@ __device__ __forceinline__ void update_amax(float *amax_ptr, const size_t tensor
   }
 }
 
+template <typename IType, typename OType>
+__device__ __forceinline__ void cast_4_scaled(const IType *input, OType *output,
+                                              const float scale, const size_t count) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if (count == 4) {
+    const ptx::floatx4 scale4 = {scale, scale, scale, scale};
+    if constexpr (std::is_same_v<IType, bf16> && std::is_same_v<OType, fp8e4m3>) {
+      const ptx::bf16x4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e4m3x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    } else if constexpr (std::is_same_v<IType, bf16> && std::is_same_v<OType, fp8e5m2>) {
+      const ptx::bf16x4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e5m2x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    } else if constexpr (std::is_same_v<IType, fp16> && std::is_same_v<OType, fp8e4m3>) {
+      const ptx::fp16x4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e4m3x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    } else if constexpr (std::is_same_v<IType, fp16> && std::is_same_v<OType, fp8e5m2>) {
+      const ptx::fp16x4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e5m2x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    } else if constexpr (std::is_same_v<IType, float> && std::is_same_v<OType, fp8e4m3>) {
+      const ptx::floatx4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e4m3x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    } else if constexpr (std::is_same_v<IType, float> && std::is_same_v<OType, fp8e5m2>) {
+      const ptx::floatx4 input4 = {input[0], input[1], input[2], input[3]};
+      ptx::fp8e5m2x4 output4;
+      ptx::mul_cvt_4x(output4, input4, scale4);
+      output[0] = output4.x1;
+      output[1] = output4.x2;
+      output[2] = output4.x3;
+      output[3] = output4.x4;
+      return;
+    }
+  }
+#endif
+#pragma unroll
+  for (size_t elem = 0; elem < 4; ++elem) {
+    if (elem < count) {
+      output[elem] = static_cast<OType>(static_cast<float>(input[elem]) * scale);
+    }
+  }
+}
+
 template <ShapeRepresentation SHAPE_REP>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     zero_grouped_amax_kernel(float *const __restrict__ amax_ptr,
@@ -158,15 +232,42 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
   if (block_is_inside_one_tensor<SHAPE_REP>(block_start, block_end, tensor_id, first_logical_dim,
                                             last_logical_dim, offsets_ptr, first_dims_ptr,
                                             num_tensors)) {
-    float thread_amax = 0.0f;
-    for (size_t idx = block_start + threadIdx.x; idx < block_end; idx += blockDim.x) {
-      const float value = fabsf(static_cast<float>(input_ptr[idx]));
-      thread_amax = fmaxf(thread_amax, value);
+    constexpr size_t VEC_SIZE = VECTOR_LOAD_BYTES / sizeof(IType);
+    static_assert(VECTOR_LOAD_BYTES % sizeof(IType) == 0);
+    IType thread_amax = 0.0f;
+    for (size_t vector_offset = threadIdx.x * VEC_SIZE; vector_offset < ELEMENTS_PER_BLOCK;
+         vector_offset += blockDim.x * VEC_SIZE) {
+      const size_t idx = block_start + vector_offset;
+      if (idx >= block_end) {
+        break;
+      }
+      const size_t remaining = block_end - idx;
+      const size_t count = (remaining < VEC_SIZE) ? remaining : VEC_SIZE;
+      Vec<IType, VEC_SIZE> input_vec;
+      input_vec.load_from_elts(input_ptr, idx, count);
+#pragma unroll
+      for (size_t elem = 0; elem < VEC_SIZE; ++elem) {
+        const IType value = input_vec.data.elt[elem];
+        __builtin_assume(thread_amax >= IType{0.0f});
+        if constexpr (std::is_same_v<IType, __nv_bfloat16>) {
+#if __CUDA_ARCH__ >= 800
+          thread_amax = __hmax(__habs(value), thread_amax);
+#else
+          thread_amax = static_cast<__nv_bfloat16>(
+              fmaxf(fabsf(static_cast<float>(value)), static_cast<float>(thread_amax)));
+#endif
+        } else if constexpr (std::is_same_v<IType, __half>) {
+          thread_amax = __hmax(__habs(value), thread_amax);
+        } else {
+          thread_amax = fmaxf(fabsf(value), thread_amax);
+        }
+      }
     }
     const int warp_id = threadIdx.x / THREADS_PER_WARP;
-    thread_amax = reduce_max<THREADS_PER_BLOCK / THREADS_PER_WARP>(thread_amax, warp_id);
+    const float block_amax =
+        reduce_max<THREADS_PER_BLOCK / THREADS_PER_WARP>(thread_amax, warp_id);
     if (threadIdx.x == 0) {
-      update_amax(amax_ptr, tensor_id, thread_amax);
+      update_amax(amax_ptr, tensor_id, block_amax);
     }
   } else {
     for (size_t idx = block_start + threadIdx.x; idx < block_end; idx += blockDim.x) {
@@ -284,6 +385,71 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
   }
 }
 
+template <typename IType, typename OType, ShapeRepresentation SHAPE_REP>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+    grouped_rowwise_cast_kernel(const IType *const __restrict__ input_ptr,
+                                OType *const __restrict__ output_ptr,
+                                const float *const __restrict__ scale_ptr,
+                                const float *const __restrict__ noop_ptr,
+                                const size_t num_tensors, const size_t first_logical_dim,
+                                const size_t last_logical_dim,
+                                const int64_t *const __restrict__ offsets_ptr,
+                                const int64_t *const __restrict__ first_dims_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  const size_t actual_elements =
+      get_actual_elements<SHAPE_REP>(first_logical_dim, last_logical_dim, offsets_ptr, num_tensors);
+  const size_t block_start = blockIdx.x * ELEMENTS_PER_BLOCK;
+  if (block_start >= actual_elements) {
+    return;
+  }
+  const size_t block_limit = block_start + ELEMENTS_PER_BLOCK;
+  const size_t block_end = (block_limit < actual_elements) ? block_limit : actual_elements;
+  const size_t tensor_id =
+      get_tensor_id<SHAPE_REP>(block_start, first_logical_dim, last_logical_dim, offsets_ptr,
+                               num_tensors);
+
+  if (block_is_inside_one_tensor<SHAPE_REP>(block_start, block_end, tensor_id, first_logical_dim,
+                                            last_logical_dim, offsets_ptr, first_dims_ptr,
+                                            num_tensors)) {
+    constexpr size_t VEC_SIZE = VECTOR_LOAD_BYTES / sizeof(IType);
+    static_assert(VECTOR_LOAD_BYTES % sizeof(IType) == 0);
+    const float scale = scale_ptr[tensor_id];
+    for (size_t vector_offset = threadIdx.x * VEC_SIZE; vector_offset < ELEMENTS_PER_BLOCK;
+         vector_offset += blockDim.x * VEC_SIZE) {
+      const size_t idx = block_start + vector_offset;
+      if (idx >= block_end) {
+        break;
+      }
+      const size_t remaining = block_end - idx;
+      const size_t count = (remaining < VEC_SIZE) ? remaining : VEC_SIZE;
+      Vec<IType, VEC_SIZE> input_vec;
+      Vec<OType, VEC_SIZE> output_vec;
+      input_vec.load_from_elts(input_ptr, idx, count);
+#pragma unroll
+      for (size_t elem = 0; elem < VEC_SIZE; elem += 4) {
+        const size_t remaining_vec = (count > elem) ? count - elem : 0;
+        const size_t cast_count = (remaining_vec < 4) ? remaining_vec : 4;
+        if (cast_count > 0) {
+          cast_4_scaled<IType, OType>(&input_vec.data.elt[elem], &output_vec.data.elt[elem],
+                                      scale, cast_count);
+        }
+      }
+      output_vec.store_to_elts(output_ptr, idx, count);
+    }
+  } else {
+    for (size_t idx = block_start + threadIdx.x; idx < block_end; idx += blockDim.x) {
+      const size_t current_tensor_id =
+          get_tensor_id<SHAPE_REP>(idx, first_logical_dim, last_logical_dim, offsets_ptr,
+                                   num_tensors);
+      const float scaled_value = static_cast<float>(input_ptr[idx]) * scale_ptr[current_tensor_id];
+      output_ptr[idx] = static_cast<OType>(scaled_value);
+    }
+  }
+}
+
 }  // namespace kernel
 
 template <ShapeRepresentation SHAPE_REP, typename IType, typename OType>
@@ -330,9 +496,15 @@ void launch_group_quantize(const GroupedTensor *input, const Tensor *noop, Group
         force_pow_2_scales, epsilon);
     NVTE_CHECK_CUDA(cudaGetLastError());
 
-    grouped_cast_kernel<IType, OType, SHAPE_REP><<<data_grid, block, 0, stream>>>(
-        input_ptr, output_ptr, columnwise_output_ptr, scale_ptr, noop_ptr, num_tensors,
-        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr);
+    if (columnwise_output_ptr == nullptr) {
+      grouped_rowwise_cast_kernel<IType, OType, SHAPE_REP><<<data_grid, block, 0, stream>>>(
+          input_ptr, output_ptr, scale_ptr, noop_ptr, num_tensors, first_logical_dim,
+          last_logical_dim, offsets_ptr, first_dims_ptr);
+    } else {
+      grouped_cast_kernel<IType, OType, SHAPE_REP><<<data_grid, block, 0, stream>>>(
+          input_ptr, output_ptr, columnwise_output_ptr, scale_ptr, noop_ptr, num_tensors,
+          first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr);
+    }
     NVTE_CHECK_CUDA(cudaGetLastError());
   }
 }
