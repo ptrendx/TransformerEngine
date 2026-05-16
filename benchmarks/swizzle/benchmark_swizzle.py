@@ -41,6 +41,7 @@ K_NVTE_GROUPED_COLUMNWISE_DATA = 1
 K_NVTE_GROUPED_ROWWISE_SCALE_INV = 4
 K_NVTE_GROUPED_COLUMNWISE_SCALE_INV = 5
 K_NVTE_GROUPED_FIRST_DIMS = 7
+K_NVTE_GROUPED_TENSOR_OFFSETS = 9
 K_NVTE_GROUPED_WITH_GEMM_SWIZZLED_SCALES = 10
 
 MXFP8_BLOCK_SIZE = 32
@@ -285,9 +286,15 @@ def make_grouped_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> B
     tensors = [dummy_data, input_scale, output_scale]
 
     first_dims_tensor = None
+    tensor_offsets = None
     if spec.variable_first_dims:
         first_dims_tensor = torch.tensor(first_dims, dtype=torch.int64, device=device)
+        offsets = [0]
+        for m, k in spec.data_shapes:
+            offsets.append(offsets[-1] + m * k)
+        tensor_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
         tensors.append(first_dims_tensor)
+        tensors.append(tensor_offsets)
 
     input_handle = api.create_grouped_tensor(num_tensors, logical_shape)
     output_handle = api.create_grouped_tensor(num_tensors, logical_shape)
@@ -316,6 +323,7 @@ def make_grouped_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> B
         output_handle, scale_param, output_scale.data_ptr(), K_NVTE_FLOAT8_E8M0, (output_elems,)
     )
     if first_dims_tensor is not None:
+        assert tensor_offsets is not None
         api.set_grouped_basic(
             input_handle,
             K_NVTE_GROUPED_FIRST_DIMS,
@@ -329,6 +337,20 @@ def make_grouped_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> B
             first_dims_tensor.data_ptr(),
             K_NVTE_INT64,
             (num_tensors,),
+        )
+        api.set_grouped_basic(
+            input_handle,
+            K_NVTE_GROUPED_TENSOR_OFFSETS,
+            tensor_offsets.data_ptr(),
+            K_NVTE_INT64,
+            (num_tensors + 1,),
+        )
+        api.set_grouped_basic(
+            output_handle,
+            K_NVTE_GROUPED_TENSOR_OFFSETS,
+            tensor_offsets.data_ptr(),
+            K_NVTE_INT64,
+            (num_tensors + 1,),
         )
     api.set_grouped_bool(input_handle, K_NVTE_GROUPED_WITH_GEMM_SWIZZLED_SCALES, False)
     api.set_grouped_bool(output_handle, K_NVTE_GROUPED_WITH_GEMM_SWIZZLED_SCALES, True)
@@ -457,27 +479,31 @@ def run_case(
         launch(api, spec, buffers[i % count])
     torch.cuda.synchronize()
 
+    launches_per_sample = args.launches_per_sample
+    timed_launches = args.measurement_iterations * launches_per_sample
     samples_us: list[float] = []
     if args.profile:
         check_cuda_status(torch.cuda.cudart().cudaProfilerStart(), "cudaProfilerStart")
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i in range(args.measurement_iterations):
+        for i in range(timed_launches):
             launch(api, spec, buffers[i % count])
         end.record()
         end.synchronize()
         check_cuda_status(torch.cuda.cudart().cudaProfilerStop(), "cudaProfilerStop")
-        samples_us.append(start.elapsed_time(end) * 1000.0 / args.measurement_iterations)
+        samples_us.append(start.elapsed_time(end) * 1000.0 / timed_launches)
     else:
         for i in range(args.measurement_iterations):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            launch(api, spec, buffers[i % count])
+            launch_base = i * launches_per_sample
+            for j in range(launches_per_sample):
+                launch(api, spec, buffers[(launch_base + j) % count])
             end.record()
             end.synchronize()
-            samples_us.append(start.elapsed_time(end) * 1000.0)
+            samples_us.append(start.elapsed_time(end) * 1000.0 / launches_per_sample)
 
     median_us = statistics.median(samples_us)
     bandwidth_tbps = processed_bytes / (median_us * 1.0e-6) / 1.0e12
@@ -495,6 +521,8 @@ def run_case(
         "classification": "large" if output_bytes > 10 * 1024 * 1024 else "small",
         "warmup_iterations": args.warmup_iterations,
         "measurement_iterations": args.measurement_iterations,
+        "launches_per_sample": launches_per_sample,
+        "timed_launches": timed_launches,
         "median_us": median_us,
         "bandwidth_TBps": bandwidth_tbps,
         "device_name": props.name,
@@ -517,6 +545,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup-iterations", type=int, default=20)
     parser.add_argument("--measurement-iterations", type=int, default=100)
+    parser.add_argument(
+        "--launches-per-sample",
+        type=int,
+        default=20,
+        help="Swizzle launches timed inside each CUDA-event measurement window.",
+    )
     parser.add_argument("--min-buffers", type=int, default=8)
     parser.add_argument("--max-buffers", type=int, default=128)
     parser.add_argument("--buffer-footprint-mib", type=int, default=512)
@@ -525,8 +559,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.profile and not args.profile_case:
         parser.error("--profile requires --profile-case so profiler output maps to one case")
-    if args.warmup_iterations <= 0 or args.measurement_iterations <= 0:
-        parser.error("Warmup and measurement iterations must be positive")
+    if (
+        args.warmup_iterations <= 0
+        or args.measurement_iterations <= 0
+        or args.launches_per_sample <= 0
+    ):
+        parser.error(
+            "Warmup iterations, measurement iterations, and launches per sample must be positive"
+        )
     return args
 
 
