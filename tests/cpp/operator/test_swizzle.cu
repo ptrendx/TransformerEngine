@@ -615,6 +615,26 @@ TEST_P(SwizzleGroupedVariableTestSuite, TestGroupedSwizzleMXFP8Variable) {
   performTestGroupedSwizzleMXFP8Variable(shapes);
 }
 
+TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReuse) {
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int sm_count = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  ASSERT_GT(sm_count, 0);
+
+  constexpr size_t rows_per_swizzle_tile = 128;
+  constexpr size_t k_dim = 512;
+  const size_t row_coalesced_grid_tiles = static_cast<size_t>(sm_count) * 4;
+  const size_t first_tensor_tiles =
+      row_coalesced_grid_tiles > 1 ? row_coalesced_grid_tiles - 1 : 1;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {first_tensor_tiles * rows_per_swizzle_tile, k_dim},
+      {9 * rows_per_swizzle_tile, k_dim},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
 INSTANTIATE_TEST_SUITE_P(
   OperatorTest,
   SwizzleGroupedVariableTestSuite,

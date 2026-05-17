@@ -2434,6 +2434,10 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
             grid_dim_x, grid_dim_y, padding_k, padding_m);
       }
     }
+
+    // Persistent CTAs reuse the same dynamic shared memory on the next loop
+    // iteration. Wait for all shared-memory reads from this tile to finish.
+    __syncthreads();
   }
 }
 
@@ -2495,6 +2499,10 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
     swizzle_row_scaling_narrow_k_kernel_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
         input_base, output_base, padded_m, padded_k, original_M, original_K, local_block_id,
         tensor_blocks);
+
+    // Keep the next persistent iteration from overwriting shared staging data
+    // while slower threads are still reading it to write this tile out.
+    __syncthreads();
   }
 }
 
@@ -2560,6 +2568,10 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
     swizzle_col_scaling_narrow_m_kernel_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
         input_base, output_base, padded_m, padded_k, original_M, original_K, local_block_id,
         tensor_blocks);
+
+    // Keep the next persistent iteration from overwriting shared staging data
+    // while slower threads are still reading it to write this tile out.
+    __syncthreads();
   }
 }
 
@@ -2616,6 +2628,10 @@ __global__ void __launch_bounds__(ROW_COALESCED_THREADS)
     uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current_scale_base;
     swizzle_row_scaling_coalesced_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
         input_base, output_base, padded_m, padded_k, original_M, local_m_tile, slm_v4i);
+
+    // Keep the next persistent iteration from overwriting shared staging data
+    // while slower threads are still reading this tile out.
+    __syncthreads();
   }
 }
 
