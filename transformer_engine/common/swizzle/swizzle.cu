@@ -39,9 +39,9 @@ int get_max_dynamic_smem() {
 constexpr __device__ __host__ int TB_DIM = 32;
 constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
-constexpr int ROW_COALESCED_THREADS = 512;
-constexpr int ROW_COALESCED_MIN_K = 64;
-constexpr int COL_WARP_TILE_WARPS = 4;
+constexpr int ROW_COALESCED_THREADS = 256;
+constexpr int ROW_COALESCED_MIN_K = 32;
+constexpr int COL_WARP_TILE_WARPS = 8;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 constexpr int VARIABLE_SWIZZLE_METADATA_BYTES = 16;
 
@@ -681,22 +681,39 @@ __global__ void __launch_bounds__(ROW_COALESCED_THREADS)
       input, output, M, K, original_M, blockIdx.x, slm_v4i);
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
-__device__ __forceinline__ uint32_t load_col_swizzle_word(const uint8_t* input, const int M,
+__device__ __forceinline__ uint4 load_col_swizzle_segment(const uint8_t* input, const int M,
                                                           const int original_M,
-                                                          const int original_K, const int m,
-                                                          const int k_base) {
-  if (m >= original_M) {
-    return 0;
+                                                          const int original_K, const int m_base,
+                                                          const int k, const int segment) {
+  const int m = m_base + segment * static_cast<int>(sizeof(uint4));
+  if (k >= original_K || m >= original_M) {
+    return make_uint4(0, 0, 0, 0);
   }
-  uint32_t word = 0;
+  if (m + static_cast<int>(sizeof(uint4)) <= original_M) {
+    return __ldg(reinterpret_cast<const uint4*>(input + static_cast<size_t>(k) * M + m));
+  }
+
+  uint4 value = make_uint4(0, 0, 0, 0);
+  uint8_t* value_bytes = reinterpret_cast<uint8_t*>(&value);
 #pragma unroll
-  for (int i = 0; i < SF_TILE_DIM_K; ++i) {
-    const int k = k_base + i;
-    const uint32_t value = (k < original_K) ? __ldg(input + static_cast<size_t>(k) * M + m) : 0;
-    word |= value << (8 * i);
+  for (int i = 0; i < static_cast<int>(sizeof(uint4)); ++i) {
+    if (m + i < original_M) {
+      value_bytes[i] = __ldg(input + static_cast<size_t>(k) * M + m + i);
+    }
   }
-  return word;
+  return value;
+}
+
+__device__ __forceinline__ uint32_t shuffle_uint4_byte(const uint4 value, const int src_lane,
+                                                       const int byte_idx) {
+  const int component = byte_idx / static_cast<int>(sizeof(uint32_t));
+  const uint32_t src_x = __shfl_sync(0xffffffff, value.x, src_lane);
+  const uint32_t src_y = __shfl_sync(0xffffffff, value.y, src_lane);
+  const uint32_t src_z = __shfl_sync(0xffffffff, value.z, src_lane);
+  const uint32_t src_w = __shfl_sync(0xffffffff, value.w, src_lane);
+  const uint32_t src_component =
+      component == 0 ? src_x : component == 1 ? src_y : component == 2 ? src_z : src_w;
+  return (src_component >> (8 * (byte_idx % static_cast<int>(sizeof(uint32_t))))) & 0xff;
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
@@ -711,20 +728,32 @@ __device__ void swizzle_col_scaling_warp_tile_impl(const void* input, void* outp
   const int m_base = m_tile * SF_TILE_DIM_M;
   const int k_base = k_tile * SF_TILE_DIM_K;
   const uint8_t* input_u8 = reinterpret_cast<const uint8_t*>(input);
-  int4* output_v4 = reinterpret_cast<int4*>(
+  uint4* output_v4 = reinterpret_cast<uint4*>(
       reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(m_tile) * SF_TILE_DIM_M * K +
       k_tile * SF_TILE_SIZE);
 
-  output_v4[lane] = make_int4(
-      static_cast<int>(
-          load_col_swizzle_word<SF_TILE_DIM_M, SF_TILE_DIM_K>(input_u8, M, original_M, original_K,
-                                                              m_base + lane, k_base)),
-      static_cast<int>(load_col_swizzle_word<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-          input_u8, M, original_M, original_K, m_base + 32 + lane, k_base)),
-      static_cast<int>(load_col_swizzle_word<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-          input_u8, M, original_M, original_K, m_base + 64 + lane, k_base)),
-      static_cast<int>(load_col_swizzle_word<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-          input_u8, M, original_M, original_K, m_base + 96 + lane, k_base)));
+  const int input_row = lane / 8;
+  const int input_segment = lane % 8;
+  const uint4 input_segment_data = load_col_swizzle_segment(
+      input_u8, M, original_M, original_K, m_base, k_base + input_row, input_segment);
+
+  uint32_t output_words[4];
+  const int lane_byte = lane % static_cast<int>(sizeof(uint4));
+  const int lane_segment_base = lane / static_cast<int>(sizeof(uint4));
+#pragma unroll
+  for (int m_group = 0; m_group < 4; ++m_group) {
+    uint32_t word = 0;
+    const int src_segment = lane_segment_base + m_group * 2;
+#pragma unroll
+    for (int k_group = 0; k_group < SF_TILE_DIM_K; ++k_group) {
+      const int src_lane = k_group * 8 + src_segment;
+      word |= shuffle_uint4_byte(input_segment_data, src_lane, lane_byte) << (8 * k_group);
+    }
+    output_words[m_group] = word;
+  }
+
+  output_v4[lane] =
+      make_uint4(output_words[0], output_words[1], output_words[2], output_words[3]);
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
@@ -932,12 +961,7 @@ bool use_blackwell_row_coalesced_swizzle(const int padded_k, const int original_
 }
 
 bool use_blackwell_col_warp_tile_swizzle(const size_t scale_elem_size) {
-  // The warp-tile path does only one 128x4 scale tile (512 B) per warp. On
-  // Blackwell this leaves the large columnwise cases instruction/CTA overhead
-  // bound; the coarser narrow-M and generic kernels move many tiles per CTA and
-  // sustain higher memory throughput.
-  (void)scale_elem_size;
-  return false;
+  return cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t);
 }
 
 template <typename LType, int SF_TILE_DIM_M, int SF_TILE_DIM_K>
