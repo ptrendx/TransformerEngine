@@ -47,6 +47,7 @@ K_NVTE_GROUPED_WITH_GEMM_SWIZZLED_SCALES = 10
 MXFP8_BLOCK_SIZE = 32
 SWIZZLE_TILE_M = 128
 SWIZZLE_TILE_K = 4
+DEFAULT_CUDA_DEVICE = "cuda:0"
 
 
 class NVTEShape(ctypes.Structure):
@@ -571,8 +572,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-footprint-mib", type=int, default=512)
     parser.add_argument(
         "--device",
-        default="cuda",
-        help="CUDA device to use, e.g. 'cuda', 'cuda:0', or '0'.",
+        default=DEFAULT_CUDA_DEVICE,
+        help="CUDA device to use, e.g. 'cuda:0' or '0'. Bare 'cuda' resolves to the current device.",
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-case", default=None)

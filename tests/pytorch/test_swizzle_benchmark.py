@@ -2,6 +2,8 @@
 #
 # See LICENSE for license information.
 
+import sys
+
 import pytest
 
 import benchmarks.swizzle.benchmark_swizzle as benchmark_swizzle
@@ -41,6 +43,14 @@ class _FakeTorch:
             device_type, device_index = device_arg.split(":", 1)
             return _FakeDevice(device_type, int(device_index))
         return _FakeDevice(device_arg)
+
+
+def test_parse_args_defaults_to_indexed_cuda_device(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["benchmark_swizzle.py"])
+
+    args = benchmark_swizzle.parse_args()
+
+    assert args.device == "cuda:0"
 
 
 @pytest.mark.parametrize(
