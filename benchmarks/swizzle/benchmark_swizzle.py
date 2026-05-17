@@ -463,6 +463,21 @@ def check_cuda_status(status: Any, name: str) -> None:
         raise RuntimeError(f"{name} failed with CUDA status {code}")
 
 
+def resolve_cuda_device(device_arg: str) -> torch.device:
+    if device_arg.isdigit():
+        device = torch.device("cuda", int(device_arg))
+    else:
+        device = torch.device(device_arg)
+    if device.type != "cuda":
+        raise ValueError(f"CUDA device is required, got {device}")
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    torch.cuda.set_device(device_index)
+    return torch.device("cuda", device_index)
+
+
 def run_case(
     api: NvteAPI,
     spec: CaseSpec,
@@ -554,6 +569,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-buffers", type=int, default=8)
     parser.add_argument("--max-buffers", type=int, default=128)
     parser.add_argument("--buffer-footprint-mib", type=int, default=512)
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="CUDA device to use, e.g. 'cuda', 'cuda:0', or '0'.",
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-case", default=None)
     args = parser.parse_args()
@@ -577,8 +597,7 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for swizzle benchmarking")
-    device = torch.device("cuda")
-    torch.cuda.set_device(device)
+    device = resolve_cuda_device(args.device)
     api = NvteAPI()
     selected = select_cases(build_cases(), args.case, args.profile_case)
     results = [run_case(api, case, args, device) for case in selected]
