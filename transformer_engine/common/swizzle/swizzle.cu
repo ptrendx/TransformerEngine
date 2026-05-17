@@ -39,7 +39,8 @@ int get_max_dynamic_smem() {
 constexpr __device__ __host__ int TB_DIM = 32;
 constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
-constexpr int ROW_COALESCED_THREADS = 256;
+constexpr int ROW_COALESCED_THREADS = 512;
+constexpr int ROW_COALESCED_MIN_K = 64;
 constexpr int COL_WARP_TILE_WARPS = 4;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 constexpr int VARIABLE_SWIZZLE_METADATA_BYTES = 16;
@@ -926,11 +927,17 @@ bool use_blackwell_row_coalesced_swizzle(const int padded_k, const int original_
   const int slm_size =
       row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(padded_k, scale_elem_size);
   return cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t) && original_k == padded_k &&
-         padded_k % static_cast<int>(sizeof(int4)) == 0 && slm_size <= get_max_dynamic_smem();
+         padded_k >= ROW_COALESCED_MIN_K && padded_k % static_cast<int>(sizeof(int4)) == 0 &&
+         slm_size <= get_max_dynamic_smem();
 }
 
 bool use_blackwell_col_warp_tile_swizzle(const size_t scale_elem_size) {
-  return cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t);
+  // The warp-tile path does only one 128x4 scale tile (512 B) per warp. On
+  // Blackwell this leaves the large columnwise cases instruction/CTA overhead
+  // bound; the coarser narrow-M and generic kernels move many tiles per CTA and
+  // sustain higher memory throughput.
+  (void)scale_elem_size;
+  return false;
 }
 
 template <typename LType, int SF_TILE_DIM_M, int SF_TILE_DIM_K>
