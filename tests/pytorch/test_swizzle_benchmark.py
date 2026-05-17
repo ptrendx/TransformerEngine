@@ -55,7 +55,7 @@ def test_resolve_cuda_device_returns_indexed_device(
     monkeypatch, device_arg, current_device, expected_index
 ):
     fake_torch = _FakeTorch(current_device)
-    monkeypatch.setattr(benchmark_swizzle, "torch", fake_torch)
+    monkeypatch.setattr(benchmark_swizzle, "torch", fake_torch, raising=False)
 
     device = benchmark_swizzle.resolve_cuda_device(device_arg)
 
@@ -66,7 +66,7 @@ def test_resolve_cuda_device_returns_indexed_device(
 
 def test_resolve_cuda_device_rejects_non_cuda_device(monkeypatch):
     fake_torch = _FakeTorch()
-    monkeypatch.setattr(benchmark_swizzle, "torch", fake_torch)
+    monkeypatch.setattr(benchmark_swizzle, "torch", fake_torch, raising=False)
 
     with pytest.raises(ValueError, match="CUDA device is required"):
         benchmark_swizzle.resolve_cuda_device("cpu")
