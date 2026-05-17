@@ -48,6 +48,10 @@ MXFP8_BLOCK_SIZE = 32
 SWIZZLE_TILE_M = 128
 SWIZZLE_TILE_K = 4
 DEFAULT_CUDA_DEVICE = "cuda:0"
+ROWWISE_DIRECTION = "rowwise"
+COLUMNWISE_DIRECTION = "columnwise"
+COMBINED_DIRECTION = "rowwise+columnwise"
+SCALE_DIRECTIONS = (ROWWISE_DIRECTION, COLUMNWISE_DIRECTION)
 
 
 class NVTEShape(ctypes.Structure):
@@ -200,16 +204,28 @@ class BenchBuffer:
     tensors: list[torch.Tensor]
 
 
+def scale_directions(direction: str) -> tuple[str, ...]:
+    if direction == COMBINED_DIRECTION:
+        return SCALE_DIRECTIONS
+    if direction in SCALE_DIRECTIONS:
+        return (direction,)
+    raise ValueError(f"Unsupported scale direction: {direction}")
+
+
 def regular_scale_shape(shape: tuple[int, int], direction: str) -> tuple[int, int]:
     m, k = shape
-    if direction == "rowwise":
+    if direction == ROWWISE_DIRECTION:
         return round_up(m, SWIZZLE_TILE_M), round_up(
             math.ceil(k / MXFP8_BLOCK_SIZE), SWIZZLE_TILE_K
         )
+    if direction != COLUMNWISE_DIRECTION:
+        raise ValueError(f"Regular swizzle supports one scale direction, got {direction}")
     return round_up(math.ceil(m / MXFP8_BLOCK_SIZE), SWIZZLE_TILE_K), round_up(k, SWIZZLE_TILE_M)
 
 
-def grouped_output_scale_elems(shapes: tuple[tuple[int, int], ...], direction: str) -> int:
+def grouped_output_scale_elems_for_direction(
+    shapes: tuple[tuple[int, int], ...], direction: str
+) -> int:
     elems = 0
     for shape in shapes:
         scale_shape = regular_scale_shape(shape, direction)
@@ -217,44 +233,80 @@ def grouped_output_scale_elems(shapes: tuple[tuple[int, int], ...], direction: s
     return elems
 
 
-def grouped_uniform_input_scale_elems(
+def grouped_output_scale_elems(shapes: tuple[tuple[int, int], ...], direction: str) -> int:
+    return sum(
+        grouped_output_scale_elems_for_direction(shapes, scale_direction)
+        for scale_direction in scale_directions(direction)
+    )
+
+
+def grouped_uniform_input_scale_elems_for_direction(
     num_tensors: int, shape: tuple[int, int], direction: str
 ) -> int:
     m, k = shape
-    if direction == "rowwise":
+    if direction == ROWWISE_DIRECTION:
         padded_k = round_up(math.ceil(k / MXFP8_BLOCK_SIZE), SWIZZLE_TILE_K)
         return round_up(num_tensors * m, SWIZZLE_TILE_M) * padded_k
+    if direction != COLUMNWISE_DIRECTION:
+        raise ValueError(f"Grouped uniform swizzle supports one scale direction, got {direction}")
     padded_m = round_up(k, SWIZZLE_TILE_M)
     k_scales = math.ceil(m / MXFP8_BLOCK_SIZE)
     return round_up(num_tensors * k_scales, SWIZZLE_TILE_K) * padded_m
 
 
-def case_scale_bytes(spec: CaseSpec) -> tuple[int, int, int]:
-    output_elems = grouped_output_scale_elems(spec.data_shapes, spec.direction)
+def grouped_uniform_input_scale_elems(
+    num_tensors: int, shape: tuple[int, int], direction: str
+) -> int:
+    return sum(
+        grouped_uniform_input_scale_elems_for_direction(num_tensors, shape, scale_direction)
+        for scale_direction in scale_directions(direction)
+    )
+
+
+def case_direction_scale_bytes(spec: CaseSpec, direction: str) -> tuple[int, int, int]:
+    output_elems = grouped_output_scale_elems_for_direction(spec.data_shapes, direction)
     if spec.api == "regular":
         input_elems = output_elems
     elif spec.api == "grouped_uniform":
-        input_elems = grouped_uniform_input_scale_elems(
-            spec.num_tensors, spec.data_shapes[0], spec.direction
+        input_elems = grouped_uniform_input_scale_elems_for_direction(
+            spec.num_tensors, spec.data_shapes[0], direction
         )
     else:
         input_elems = output_elems
     return input_elems, output_elems, input_elems + output_elems
 
 
+def case_scale_bytes(spec: CaseSpec) -> tuple[int, int, int]:
+    input_elems = 0
+    output_elems = 0
+    processed_elems = 0
+    for direction in scale_directions(spec.direction):
+        direction_input, direction_output, direction_processed = case_direction_scale_bytes(
+            spec, direction
+        )
+        input_elems += direction_input
+        output_elems += direction_output
+        processed_elems += direction_processed
+    return input_elems, output_elems, processed_elems
+
+
 def make_regular_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> BenchBuffer:
+    directions = scale_directions(spec.direction)
+    if len(directions) != 1:
+        raise ValueError("Regular swizzle benchmark cases must use exactly one scale direction")
+    direction = directions[0]
     shape = spec.data_shapes[0]
-    scale_shape = regular_scale_shape(shape, spec.direction)
+    scale_shape = regular_scale_shape(shape, direction)
     dummy_data = torch.empty(1, dtype=torch.uint8, device=device)
     input_scale = torch.empty(scale_shape, dtype=torch.uint8, device=device)
     output_scale = torch.empty(scale_shape, dtype=torch.uint8, device=device)
 
     input_handle = api.create_tensor()
     output_handle = api.create_tensor()
-    data_param = K_NVTE_ROWWISE_DATA if spec.direction == "rowwise" else K_NVTE_COLUMNWISE_DATA
+    data_param = K_NVTE_ROWWISE_DATA if direction == ROWWISE_DIRECTION else K_NVTE_COLUMNWISE_DATA
     scale_param = (
         K_NVTE_ROWWISE_SCALE_INV
-        if spec.direction == "rowwise"
+        if direction == ROWWISE_DIRECTION
         else K_NVTE_COLUMNWISE_SCALE_INV
     )
     api.set_tensor_basic(input_handle, data_param, dummy_data.data_ptr(), K_NVTE_FLOAT8_E4M3, shape)
@@ -279,12 +331,8 @@ def make_grouped_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> B
     if len(set(last_dims)) != 1:
         raise ValueError("This benchmark driver expects grouped cases with a common last dim")
     logical_shape = (sum(first_dims), last_dims[0])
-    input_elems, output_elems, _ = case_scale_bytes(spec)
-
     dummy_data = torch.empty(1, dtype=torch.uint8, device=device)
-    input_scale = torch.empty(input_elems, dtype=torch.uint8, device=device)
-    output_scale = torch.empty(output_elems, dtype=torch.uint8, device=device)
-    tensors = [dummy_data, input_scale, output_scale]
+    tensors = [dummy_data]
 
     first_dims_tensor = None
     tensor_offsets = None
@@ -300,29 +348,39 @@ def make_grouped_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> B
     input_handle = api.create_grouped_tensor(num_tensors, logical_shape)
     output_handle = api.create_grouped_tensor(num_tensors, logical_shape)
 
-    data_param = (
-        K_NVTE_GROUPED_ROWWISE_DATA
-        if spec.direction == "rowwise"
-        else K_NVTE_GROUPED_COLUMNWISE_DATA
-    )
-    scale_param = (
-        K_NVTE_GROUPED_ROWWISE_SCALE_INV
-        if spec.direction == "rowwise"
-        else K_NVTE_GROUPED_COLUMNWISE_SCALE_INV
-    )
     flat_data_shape = (sum(m * k for m, k in spec.data_shapes),)
-    api.set_grouped_basic(
-        input_handle, data_param, dummy_data.data_ptr(), K_NVTE_FLOAT8_E4M3, flat_data_shape
-    )
-    api.set_grouped_basic(
-        output_handle, data_param, dummy_data.data_ptr(), K_NVTE_FLOAT8_E4M3, flat_data_shape
-    )
-    api.set_grouped_basic(
-        input_handle, scale_param, input_scale.data_ptr(), K_NVTE_FLOAT8_E8M0, (input_elems,)
-    )
-    api.set_grouped_basic(
-        output_handle, scale_param, output_scale.data_ptr(), K_NVTE_FLOAT8_E8M0, (output_elems,)
-    )
+    for direction in scale_directions(spec.direction):
+        input_elems, output_elems, _ = case_direction_scale_bytes(spec, direction)
+        input_scale = torch.empty(input_elems, dtype=torch.uint8, device=device)
+        output_scale = torch.empty(output_elems, dtype=torch.uint8, device=device)
+        tensors.extend([input_scale, output_scale])
+
+        data_param = (
+            K_NVTE_GROUPED_ROWWISE_DATA
+            if direction == ROWWISE_DIRECTION
+            else K_NVTE_GROUPED_COLUMNWISE_DATA
+        )
+        scale_param = (
+            K_NVTE_GROUPED_ROWWISE_SCALE_INV
+            if direction == ROWWISE_DIRECTION
+            else K_NVTE_GROUPED_COLUMNWISE_SCALE_INV
+        )
+        api.set_grouped_basic(
+            input_handle, data_param, dummy_data.data_ptr(), K_NVTE_FLOAT8_E4M3, flat_data_shape
+        )
+        api.set_grouped_basic(
+            output_handle, data_param, dummy_data.data_ptr(), K_NVTE_FLOAT8_E4M3, flat_data_shape
+        )
+        api.set_grouped_basic(
+            input_handle, scale_param, input_scale.data_ptr(), K_NVTE_FLOAT8_E8M0, (input_elems,)
+        )
+        api.set_grouped_basic(
+            output_handle,
+            scale_param,
+            output_scale.data_ptr(),
+            K_NVTE_FLOAT8_E8M0,
+            (output_elems,),
+        )
     if first_dims_tensor is not None:
         assert tensor_offsets is not None
         api.set_grouped_basic(
@@ -365,6 +423,8 @@ def make_case_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> Benc
 
 
 def build_cases() -> list[CaseSpec]:
+    uniform_combined_small = ((16384, 1024),) * 8
+    uniform_combined_large = ((65536, 4096),) * 8
     variable_small = (
         (16384, 1024),
         (24576, 1024),
@@ -375,6 +435,7 @@ def build_cases() -> list[CaseSpec]:
         (16384, 1024),
         (24576, 1024),
     )
+    variable_combined_small = tuple((m // 2, k) for m, k in variable_small)
     variable_large = tuple((m * 8, k) for m, k in variable_small)
     return [
         CaseSpec("regular_rowwise_small", "regular", "rowwise", ((262144, 1024),)),
@@ -398,6 +459,18 @@ def build_cases() -> list[CaseSpec]:
             "grouped_uniform",
             "columnwise",
             ((4096, 65536),) * 8,
+        ),
+        CaseSpec(
+            "grouped_uniform_rowwise_columnwise_small",
+            "grouped_uniform",
+            COMBINED_DIRECTION,
+            uniform_combined_small,
+        ),
+        CaseSpec(
+            "grouped_uniform_rowwise_columnwise_large",
+            "grouped_uniform",
+            COMBINED_DIRECTION,
+            uniform_combined_large,
         ),
         CaseSpec(
             "grouped_variable_rowwise_small",
@@ -424,6 +497,20 @@ def build_cases() -> list[CaseSpec]:
             "grouped_variable_columnwise_large",
             "grouped_variable",
             "columnwise",
+            variable_large,
+            variable_first_dims=True,
+        ),
+        CaseSpec(
+            "grouped_variable_rowwise_columnwise_small",
+            "grouped_variable",
+            COMBINED_DIRECTION,
+            variable_combined_small,
+            variable_first_dims=True,
+        ),
+        CaseSpec(
+            "grouped_variable_rowwise_columnwise_large",
+            "grouped_variable",
+            COMBINED_DIRECTION,
             variable_large,
             variable_first_dims=True,
         ),
@@ -531,10 +618,22 @@ def run_case(
         "case_name": spec.name,
         "api": spec.api,
         "direction": spec.direction,
+        "scale_directions": list(scale_directions(spec.direction)),
         "num_tensors": spec.num_tensors,
         "input_scale_bytes": input_bytes,
         "output_scale_bytes": output_bytes,
         "processed_bytes": processed_bytes,
+        "per_direction_scale_bytes": {
+            direction: {
+                "input_scale_bytes": direction_input,
+                "output_scale_bytes": direction_output,
+                "processed_bytes": direction_processed,
+            }
+            for direction in scale_directions(spec.direction)
+            for direction_input, direction_output, direction_processed in [
+                case_direction_scale_bytes(spec, direction)
+            ]
+        },
         "buffer_count": count,
         "classification": "large" if output_bytes > 10 * 1024 * 1024 else "small",
         "warmup_iterations": args.warmup_iterations,
@@ -575,7 +674,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default=DEFAULT_CUDA_DEVICE,
-        help="CUDA device to use, e.g. 'cuda:0' or '0'. Bare 'cuda' resolves to the current device.",
+        help=(
+            "CUDA device to use, e.g. 'cuda:0' or '0'. Bare 'cuda' resolves to the "
+            "current device."
+        ),
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-case", default=None)

@@ -97,3 +97,47 @@ def test_resolve_cuda_device_rejects_non_cuda_device(monkeypatch):
         benchmark_swizzle.resolve_cuda_device("cpu")
 
     assert fake_torch.cuda.set_device_calls == []
+
+
+def test_build_cases_includes_grouped_combined_modes():
+    cases = {case.name: case for case in benchmark_swizzle.build_cases()}
+
+    assert cases["grouped_uniform_rowwise_columnwise_small"].direction == (
+        benchmark_swizzle.COMBINED_DIRECTION
+    )
+    assert cases["grouped_uniform_rowwise_columnwise_large"].direction == (
+        benchmark_swizzle.COMBINED_DIRECTION
+    )
+    assert cases["grouped_variable_rowwise_columnwise_small"].direction == (
+        benchmark_swizzle.COMBINED_DIRECTION
+    )
+    assert cases["grouped_variable_rowwise_columnwise_large"].direction == (
+        benchmark_swizzle.COMBINED_DIRECTION
+    )
+    assert benchmark_swizzle.scale_directions(benchmark_swizzle.COMBINED_DIRECTION) == (
+        "rowwise",
+        "columnwise",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected_classification"),
+    [
+        ("grouped_uniform_rowwise_columnwise_small", "small"),
+        ("grouped_uniform_rowwise_columnwise_large", "large"),
+        ("grouped_variable_rowwise_columnwise_small", "small"),
+        ("grouped_variable_rowwise_columnwise_large", "large"),
+    ],
+)
+def test_combined_grouped_case_byte_accounting(case_name, expected_classification):
+    cases = {case.name: case for case in benchmark_swizzle.build_cases()}
+    spec = cases[case_name]
+
+    input_bytes, output_bytes, processed_bytes = benchmark_swizzle.case_scale_bytes(spec)
+    row_bytes = benchmark_swizzle.case_direction_scale_bytes(spec, "rowwise")
+    column_bytes = benchmark_swizzle.case_direction_scale_bytes(spec, "columnwise")
+
+    assert input_bytes == row_bytes[0] + column_bytes[0]
+    assert output_bytes == row_bytes[1] + column_bytes[1]
+    assert processed_bytes == row_bytes[2] + column_bytes[2]
+    assert (output_bytes > 10 * 1024 * 1024) == (expected_classification == "large")
