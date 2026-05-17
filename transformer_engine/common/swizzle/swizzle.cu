@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <transformer_engine/swizzle.h>
 
+#include <algorithm>
 #include <cassert>
 #include <mutex>
 #include <numeric>
@@ -43,6 +44,29 @@ constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr __device__ __host__ int NEW_SF_TILE_DIM_K_I32 = NEW_SF_TILE_DIM_K / 4;
 constexpr __device__ __host__ int NEW_SF_TILE_DIM_M_I32 = 32;
 
+template <typename Kernel>
+void set_dynamic_smem_if_needed(Kernel kernel_fn, int slm_size, int& cached_smem_size) {
+  if (cached_smem_size < slm_size) {
+    NVTE_CHECK_CUDA(
+        cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+    cached_smem_size = slm_size;
+  }
+}
+
+__device__ __forceinline__ void transpose_4x4_bytes(const int32_t a, const int32_t b,
+                                                    const int32_t c, const int32_t d,
+                                                    int32_t* out0, int32_t* out1,
+                                                    int32_t* out2, int32_t* out3) {
+  const int32_t ab01 = __byte_perm(a, b, 0x5140);
+  const int32_t cd01 = __byte_perm(c, d, 0x5140);
+  const int32_t ab23 = __byte_perm(a, b, 0x7362);
+  const int32_t cd23 = __byte_perm(c, d, 0x7362);
+  *out0 = __byte_perm(ab01, cd01, 0x5410);
+  *out1 = __byte_perm(ab01, cd01, 0x7632);
+  *out2 = __byte_perm(ab23, cd23, 0x5410);
+  *out3 = __byte_perm(ab23, cd23, 0x7632);
+}
+
 template <typename LType>
 __device__ inline void regs_shuffle_with_bit_shifts(LType* regs_vec) {
   // inp, 4-byte chunks [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
@@ -53,15 +77,27 @@ __device__ inline void regs_shuffle_with_bit_shifts(LType* regs_vec) {
   int32_t new_regs[kVectorSize];
   int32_t* regs = reinterpret_cast<int32_t*>(regs_vec);
 
+  if constexpr (N_TILE_PER_TD == 4) {
 #pragma unroll
-  for (int i = 0; i < N_TILE_PER_TD; i++) {
+    for (int i = 0; i < N_TILE_PER_TD; i++) {
+      transpose_4x4_bytes(regs[i], regs[i + N_TILE_PER_TD], regs[i + 2 * N_TILE_PER_TD],
+                          regs[i + 3 * N_TILE_PER_TD],
+                          &new_regs[i * N_SF_PER_TD_PER_TILE + 0],
+                          &new_regs[i * N_SF_PER_TD_PER_TILE + 1],
+                          &new_regs[i * N_SF_PER_TD_PER_TILE + 2],
+                          &new_regs[i * N_SF_PER_TD_PER_TILE + 3]);
+    }
+  } else {
 #pragma unroll
-    for (int j = 0; j < N_SF_PER_TD_PER_TILE; j++) {
-      new_regs[i * N_SF_PER_TD_PER_TILE + j] =
-          (((regs[i + 0 * N_TILE_PER_TD] >> 8 * j) & 0xFF)) |
-          (((regs[i + 1 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 8) |
-          (((regs[i + 2 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 16) |
-          (((regs[i + 3 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 24);
+    for (int i = 0; i < N_TILE_PER_TD; i++) {
+#pragma unroll
+      for (int j = 0; j < N_SF_PER_TD_PER_TILE; j++) {
+        new_regs[i * N_SF_PER_TD_PER_TILE + j] =
+            (((regs[i + 0 * N_TILE_PER_TD] >> 8 * j) & 0xFF)) |
+            (((regs[i + 1 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 8) |
+            (((regs[i + 2 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 16) |
+            (((regs[i + 3 * N_TILE_PER_TD] >> 8 * j) & 0xFF) << 24);
+      }
     }
   }
 #pragma unroll
@@ -79,15 +115,27 @@ __device__ inline void regs_unshuffle_with_bit_shifts(LType* regs_vec) {
   int32_t new_regs[kVectorSize];
   int32_t* regs = reinterpret_cast<int32_t*>(regs_vec);
 
+  if constexpr (N_TILE_PER_TD == 4) {
 #pragma unroll
-  for (int i = 0; i < N_TILE_PER_TD; i++) {
+    for (int i = 0; i < N_TILE_PER_TD; i++) {
+      transpose_4x4_bytes(regs[i * N_SF_PER_TD_PER_TILE + 0],
+                          regs[i * N_SF_PER_TD_PER_TILE + 1],
+                          regs[i * N_SF_PER_TD_PER_TILE + 2],
+                          regs[i * N_SF_PER_TD_PER_TILE + 3], &new_regs[i],
+                          &new_regs[i + N_TILE_PER_TD], &new_regs[i + 2 * N_TILE_PER_TD],
+                          &new_regs[i + 3 * N_TILE_PER_TD]);
+    }
+  } else {
 #pragma unroll
-    for (int j = 0; j < N_SF_PER_TD_PER_TILE; j++) {
-      new_regs[i + j * N_TILE_PER_TD] =
-          ((regs[i * N_SF_PER_TD_PER_TILE + 0] >> 8 * j) & 0xFF) |
-          (((regs[i * N_SF_PER_TD_PER_TILE + 1] >> 8 * j) & 0xFF) << 8) |
-          (((regs[i * N_SF_PER_TD_PER_TILE + 2] >> 8 * j) & 0xFF) << 16) |
-          (((regs[i * N_SF_PER_TD_PER_TILE + 3] >> 8 * j) & 0xFF) << 24);
+    for (int i = 0; i < N_TILE_PER_TD; i++) {
+#pragma unroll
+      for (int j = 0; j < N_SF_PER_TD_PER_TILE; j++) {
+        new_regs[i + j * N_TILE_PER_TD] =
+            ((regs[i * N_SF_PER_TD_PER_TILE + 0] >> 8 * j) & 0xFF) |
+            (((regs[i * N_SF_PER_TD_PER_TILE + 1] >> 8 * j) & 0xFF) << 8) |
+            (((regs[i * N_SF_PER_TD_PER_TILE + 2] >> 8 * j) & 0xFF) << 16) |
+            (((regs[i * N_SF_PER_TD_PER_TILE + 3] >> 8 * j) & 0xFF) << 24);
+      }
     }
   }
 #pragma unroll
@@ -735,6 +783,16 @@ constexpr size_t round_up_to_multiple(size_t value, size_t multiple) {
   return DIVUP(value, multiple) * multiple;
 }
 
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+int row_swizzle_m_tiles_per_block(const int num_tiles_k) {
+  if (num_tiles_k <= 0) return 0;
+  const int per_m_tile_slm_size =
+      num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
+  const int max_smem = get_max_dynamic_smem();
+  if (per_m_tile_slm_size > max_smem) return 0;
+  return std::min(TB_DIM, max_smem / per_m_tile_slm_size);
+}
+
 template <typename LType, int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 __global__ void __launch_bounds__(TB_DIM* TB_DIM)
     grouped_swizzle_row_scaling_uniform_shape_kernel(const void* input, void* output, const int M,
@@ -1134,16 +1192,21 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
         NVTE_ERROR("Invalid scaling mode");
     }
 
-    const int narrow_k_slm_size =
-        TB_DIM * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
-    if (num_tiles_k < TB_DIM && narrow_k_slm_size <= get_max_dynamic_smem()) {
-      // Narrow-K: batch TB_DIM M-tiles per block, fully utilizing all threads.
-      dim3 num_blocks_narrow(DIVUP(num_tiles_m, TB_DIM));
-      NVTE_CHECK_CUDA(
-          cudaFuncSetAttribute(swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize, narrow_k_slm_size));
+    const int m_tiles_per_block =
+        row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k);
+    if (m_tiles_per_block > 1) {
+      // Batch as many M-tiles per block as dynamic shared memory allows. This
+      // keeps the rowwise path efficient for K-scale counts at and below the
+      // 32-tile boundary where the generic kernel leaves most x lanes idle.
+      const int slm_size = m_tiles_per_block * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K *
+                           static_cast<int>(sizeof(int8_t));
+      dim3 block_size_batched(TB_DIM, m_tiles_per_block);
+      dim3 num_blocks_narrow(DIVUP(num_tiles_m, m_tiles_per_block));
+      static int cached_regular_row_batched = -1;
+      set_dynamic_smem_if_needed(swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                 slm_size, cached_regular_row_batched);
       swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-          <<<num_blocks_narrow, block_size, narrow_k_slm_size, stream>>>(
+          <<<num_blocks_narrow, block_size_batched, slm_size, stream>>>(
               input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, original_K);
     } else {
       int vec_load_size = (num_tiles_k - 1) % 4 + 1;
@@ -1154,30 +1217,33 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
       int slm_size = n_tiles_in_tb * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
 
       switch (vec_load_size) {
-        case 4:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_row_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        case 4: {
+          static int cached_regular_row_int4 = -1;
+          set_dynamic_smem_if_needed(swizzle_row_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_row_int4);
           swizzle_row_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(
                   input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, original_K);
           break;
-        case 2:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_row_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        }
+        case 2: {
+          static int cached_regular_row_int2 = -1;
+          set_dynamic_smem_if_needed(swizzle_row_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_row_int2);
           swizzle_row_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(
                   input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, original_K);
           break;
-        case 1:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_row_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        }
+        case 1: {
+          static int cached_regular_row_int1 = -1;
+          set_dynamic_smem_if_needed(swizzle_row_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_row_int1);
           swizzle_row_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(
                   input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, original_K);
           break;
+        }
         default:
           NVTE_ERROR("Not valid vec_load_size.");
           break;
@@ -1196,9 +1262,9 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
     if (num_tiles_m < TB_DIM && narrow_m_slm_size <= get_max_dynamic_smem()) {
       // Narrow-M: batch TB_DIM K-tiles per block, fully utilizing all threads.
       dim3 num_blocks_narrow(DIVUP(num_tiles_k, TB_DIM));
-      NVTE_CHECK_CUDA(
-          cudaFuncSetAttribute(swizzle_col_scaling_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize, narrow_m_slm_size));
+      static int cached_regular_col_narrow_m = -1;
+      set_dynamic_smem_if_needed(swizzle_col_scaling_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                 narrow_m_slm_size, cached_regular_col_narrow_m);
       swizzle_col_scaling_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
           <<<num_blocks_narrow, block_size, narrow_m_slm_size, stream>>>(
               input->columnwise_scale_inv.dptr, output->columnwise_scale_inv.dptr, m, k, original_M,
@@ -1211,33 +1277,36 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
       int slm_size = n_tiles_in_tb * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
 
       switch (vec_load_size) {
-        case 4:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_col_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        case 4: {
+          static int cached_regular_col_int4 = -1;
+          set_dynamic_smem_if_needed(swizzle_col_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_col_int4);
           swizzle_col_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(input->columnwise_scale_inv.dptr,
                                                              output->columnwise_scale_inv.dptr, m,
                                                              k, original_M, original_K);
           break;
-        case 2:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_col_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        }
+        case 2: {
+          static int cached_regular_col_int2 = -1;
+          set_dynamic_smem_if_needed(swizzle_col_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_col_int2);
           swizzle_col_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(input->columnwise_scale_inv.dptr,
                                                              output->columnwise_scale_inv.dptr, m,
                                                              k, original_M, original_K);
           break;
-        case 1:
-          NVTE_CHECK_CUDA(
-              cudaFuncSetAttribute(swizzle_col_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+        }
+        case 1: {
+          static int cached_regular_col_int1 = -1;
+          set_dynamic_smem_if_needed(swizzle_col_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                                     slm_size, cached_regular_col_int1);
           swizzle_col_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(input->columnwise_scale_inv.dptr,
                                                              output->columnwise_scale_inv.dptr, m,
                                                              k, original_M, original_K);
           break;
+        }
         default:
           NVTE_ERROR("Not valid vec_load_size.");
           break;
@@ -1252,40 +1321,43 @@ void launch_multi_tensor_swizzle_scaling_factors(MultiSwizzleArgs& kernel_args,
                                                  const int vec_load_size, const bool is_rowwise,
                                                  const bool use_narrow_k, const bool use_narrow_m,
                                                  cudaStream_t stream) {
-  // cudaFuncSetAttribute is a host-synchronous driver call; cache the max shared memory
-  // setting per kernel variant so we only pay the cost when slm_size actually increases.
-  auto set_smem_if_needed = [](auto kernel_fn, int slm, int& cached) {
-    if (cached < slm) {
-      NVTE_CHECK_CUDA(
-          cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, slm));
-      cached = slm;
-    }
-  };
-
   dim3 block_size(TB_DIM, TB_DIM);
+  bool launched = false;
 
   if (is_rowwise && use_narrow_k) {
-    // Narrow-K path: each block handles TB_DIM M-tiles with full thread utilization.
-    // slm_size depends on num_tiles_k, which can vary per tensor — use the max.
+    // Batched rowwise path: each block handles as many M-tiles as fit in dynamic smem.
+    // slm_size depends on num_tiles_k, which can vary per tensor; use the max.
     int max_num_tiles_k = 0;
     for (size_t j = 0; j < kernel_args.num_tensors; j++) {
-      const int num_tiles_m = kernel_args.m_list[j] / SF_TILE_DIM_M;
       const int num_tiles_k = kernel_args.k_list[j] / SF_TILE_DIM_K;
       max_num_tiles_k = std::max(max_num_tiles_k, num_tiles_k);
-      kernel_args.block_range[j + 1] = kernel_args.block_range[j] + DIVUP(num_tiles_m, TB_DIM);
     }
-    int slm_size = TB_DIM * max_num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
-    const int num_blocks = kernel_args.block_range[kernel_args.num_tensors];
+    const int m_tiles_per_block =
+        row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(max_num_tiles_k);
+    if (m_tiles_per_block > 1) {
+      for (size_t j = 0; j < kernel_args.num_tensors; j++) {
+        const int num_tiles_m = kernel_args.m_list[j] / SF_TILE_DIM_M;
+        kernel_args.block_range[j + 1] =
+            kernel_args.block_range[j] + DIVUP(num_tiles_m, m_tiles_per_block);
+      }
+      const int slm_size = m_tiles_per_block * max_num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K *
+                           static_cast<int>(sizeof(int8_t));
+      const int num_blocks = kernel_args.block_range[kernel_args.num_tensors];
+      dim3 block_size_batched(TB_DIM, m_tiles_per_block);
 
-    static int cached_narrow_k = -1;
-    set_smem_if_needed(
-        multi_tensor_swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
-        cached_narrow_k);
-    multi_tensor_swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-        <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
-  } else if (!is_rowwise && use_narrow_m) {
+      static int cached_narrow_k = -1;
+      set_dynamic_smem_if_needed(
+          multi_tensor_swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
+          cached_narrow_k);
+      multi_tensor_swizzle_row_scaling_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+          <<<num_blocks, block_size_batched, slm_size, stream>>>(kernel_args);
+      launched = true;
+    }
+  }
+
+  if (!launched && !is_rowwise && use_narrow_m) {
     // Narrow-M path: each block handles TB_DIM K-tiles with full thread utilization.
-    // slm_size depends on num_tiles_m, which can vary per tensor — use the max.
+    // slm_size depends on num_tiles_m, which can vary per tensor; use the max.
     int max_num_tiles_m = 0;
     for (size_t j = 0; j < kernel_args.num_tensors; j++) {
       const int num_tiles_m = kernel_args.m_list[j] / SF_TILE_DIM_M;
@@ -1297,12 +1369,15 @@ void launch_multi_tensor_swizzle_scaling_factors(MultiSwizzleArgs& kernel_args,
     const int num_blocks = kernel_args.block_range[kernel_args.num_tensors];
 
     static int cached_narrow_m = -1;
-    set_smem_if_needed(
+    set_dynamic_smem_if_needed(
         multi_tensor_swizzle_col_scaling_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
         cached_narrow_m);
     multi_tensor_swizzle_col_scaling_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
         <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
-  } else {
+    launched = true;
+  }
+
+  if (!launched) {
     int n_tiles_in_tb = TB_DIM * vec_load_size;
     int slm_size = n_tiles_in_tb * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
     /* Calculate number of CUDA blocks needed for each tensor.
@@ -1331,21 +1406,21 @@ void launch_multi_tensor_swizzle_scaling_factors(MultiSwizzleArgs& kernel_args,
     if (is_rowwise) {
       switch (vec_load_size) {
         case 4:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_row_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_row_int4);
           multi_tensor_swizzle_row_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
           break;
         case 2:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_row_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_row_int2);
           multi_tensor_swizzle_row_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
           break;
         case 1:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_row_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_row_int1);
           multi_tensor_swizzle_row_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>
@@ -1358,21 +1433,21 @@ void launch_multi_tensor_swizzle_scaling_factors(MultiSwizzleArgs& kernel_args,
     } else {
       switch (vec_load_size) {
         case 4:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_col_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_col_int4);
           multi_tensor_swizzle_col_scaling_kernel<int4, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
           break;
         case 2:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_col_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_col_int2);
           multi_tensor_swizzle_col_scaling_kernel<int2, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(kernel_args);
           break;
         case 1:
-          set_smem_if_needed(
+          set_dynamic_smem_if_needed(
               multi_tensor_swizzle_col_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
               cached_col_int1);
           multi_tensor_swizzle_col_scaling_kernel<int, SF_TILE_DIM_M, SF_TILE_DIM_K>
@@ -1560,10 +1635,9 @@ void multi_tensor_swizzle_scaling_factors(const std::vector<Tensor*>& input,
       }
 
       int num_tiles_k = k / SF_TILE_DIM_K;
-      const int narrow_k_slm =
-          TB_DIM * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
       all_narrow_k =
-          all_narrow_k && (num_tiles_k < TB_DIM) && (narrow_k_slm <= get_max_dynamic_smem());
+          all_narrow_k &&
+          (row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k) > 1);
       int vec_load_size_i = (num_tiles_k - 1) % 4 + 1;
       // We use the minimum vec_load_size across all tensors.
       // TODO(zhongbo): fix vec_load_size for NVFP4
@@ -2166,6 +2240,132 @@ __global__ void __launch_bounds__(TB_DIM* TB_DIM)
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+__global__ void __launch_bounds__(TB_DIM* TB_DIM)
+    grouped_swizzle_row_scaling_variable_shape_batched_m_kernel(
+        const void* input, void* output, const int64_t* m_array, int num_tensors,
+        size_t scale_elem_size, size_t common_k) {
+  extern __shared__ int s_metadata[];
+  int* s_total_blocks = &s_metadata[0];
+
+  const int padded_k =
+      static_cast<int>(round_up_to_multiple(DIVUP(common_k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                                            static_cast<size_t>(SF_TILE_DIM_K)));
+  const int num_tiles_k = padded_k / SF_TILE_DIM_K;
+
+  if (threadIdx.x < 32 && threadIdx.y == 0) {
+    int local_blocks = 0;
+    for (int i = threadIdx.x; i < num_tensors; i += 32) {
+      const size_t m = static_cast<size_t>(m_array[i]);
+      const size_t padded_m = round_up_to_multiple(m, SF_TILE_DIM_M);
+      const int num_tiles_m = static_cast<int>(padded_m / SF_TILE_DIM_M);
+      local_blocks += DIVUP(num_tiles_m, static_cast<int>(blockDim.y));
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+      local_blocks += __shfl_down_sync(0xffffffff, local_blocks, offset);
+    }
+    if (threadIdx.x == 0) *s_total_blocks = local_blocks;
+  }
+  __syncthreads();
+
+  const int total_blocks = *s_total_blocks;
+  for (int linear_block_id = blockIdx.x; linear_block_id < total_blocks;
+       linear_block_id += gridDim.x) {
+    int current_block_base = 0;
+    size_t current_scale_base = 0;
+    size_t m = 0;
+    int tensor_blocks = 0;
+
+    for (int i = 0; i < num_tensors; ++i) {
+      m = static_cast<size_t>(m_array[i]);
+      const size_t padded_m = round_up_to_multiple(m, SF_TILE_DIM_M);
+      const int num_tiles_m = static_cast<int>(padded_m / SF_TILE_DIM_M);
+      tensor_blocks = DIVUP(num_tiles_m, static_cast<int>(blockDim.y));
+      if (linear_block_id < current_block_base + tensor_blocks) {
+        break;
+      }
+      current_block_base += tensor_blocks;
+      current_scale_base += padded_m * padded_k * scale_elem_size;
+    }
+
+    const int local_block_id = linear_block_id - current_block_base;
+    const int padded_m = static_cast<int>(round_up_to_multiple(m, SF_TILE_DIM_M));
+    const int original_M = static_cast<int>(m);
+    const int original_K = static_cast<int>(DIVUP(common_k, static_cast<size_t>(MXFP8_BLOCK_SIZE)));
+    const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current_scale_base;
+    uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current_scale_base;
+
+    swizzle_row_scaling_narrow_k_kernel_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+        input_base, output_base, padded_m, padded_k, original_M, original_K, local_block_id,
+        tensor_blocks);
+  }
+}
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+__global__ void __launch_bounds__(TB_DIM* TB_DIM)
+    grouped_swizzle_col_scaling_variable_shape_narrow_m_kernel(
+        const void* input, void* output, const int64_t* k_array, int num_tensors,
+        size_t scale_elem_size, size_t common_m) {
+  extern __shared__ int s_metadata[];
+  int* s_total_blocks = &s_metadata[0];
+
+  const int padded_m = static_cast<int>(round_up_to_multiple(common_m, SF_TILE_DIM_M));
+  const int num_tiles_m = padded_m / SF_TILE_DIM_M;
+
+  if (threadIdx.x < 32 && threadIdx.y == 0) {
+    int local_blocks = 0;
+    for (int i = threadIdx.x; i < num_tensors; i += 32) {
+      const size_t k = static_cast<size_t>(k_array[i]);
+      const size_t padded_k =
+          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                               static_cast<size_t>(SF_TILE_DIM_K));
+      const int num_tiles_k = static_cast<int>(padded_k / SF_TILE_DIM_K);
+      local_blocks += DIVUP(num_tiles_k, static_cast<int>(blockDim.y));
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+      local_blocks += __shfl_down_sync(0xffffffff, local_blocks, offset);
+    }
+    if (threadIdx.x == 0) *s_total_blocks = local_blocks;
+  }
+  __syncthreads();
+
+  const int total_blocks = *s_total_blocks;
+  for (int linear_block_id = blockIdx.x; linear_block_id < total_blocks;
+       linear_block_id += gridDim.x) {
+    int current_block_base = 0;
+    size_t current_scale_base = 0;
+    size_t k = 0;
+    int tensor_blocks = 0;
+
+    for (int i = 0; i < num_tensors; ++i) {
+      k = static_cast<size_t>(k_array[i]);
+      const size_t padded_k =
+          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                               static_cast<size_t>(SF_TILE_DIM_K));
+      const int num_tiles_k = static_cast<int>(padded_k / SF_TILE_DIM_K);
+      tensor_blocks = DIVUP(num_tiles_k, static_cast<int>(blockDim.y));
+      if (linear_block_id < current_block_base + tensor_blocks) {
+        break;
+      }
+      current_block_base += tensor_blocks;
+      current_scale_base += static_cast<size_t>(padded_m) * padded_k * scale_elem_size;
+    }
+
+    const int local_block_id = linear_block_id - current_block_base;
+    const int padded_k =
+        static_cast<int>(round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                                              static_cast<size_t>(SF_TILE_DIM_K)));
+    const int original_M = static_cast<int>(common_m);
+    const int original_K = static_cast<int>(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)));
+    const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current_scale_base;
+    uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current_scale_base;
+
+    swizzle_col_scaling_narrow_m_kernel_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+        input_base, output_base, padded_m, padded_k, original_M, original_K, local_block_id,
+        tensor_blocks);
+  }
+}
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 int grouped_swizzle_variable_max_active_blocks_per_sm(int device_id) {
   static std::vector<int> cache(cuda::num_devices(), -1);
   static std::vector<std::once_flag> flags(cuda::num_devices());
@@ -2286,18 +2486,17 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
       int vec_load_size = (rowwise ? ((num_tiles_k - 1) % 4 + 1) : ((num_tiles_m - 1) % 4 + 1));
       if (vec_load_size == 3) vec_load_size = 1;
       const int n_tiles_in_tb = TB_DIM * vec_load_size;
-      const int narrow_k_slm_size =
-          TB_DIM * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
+      const int m_tiles_per_block =
+          row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k);
       const int narrow_m_slm_size =
           TB_DIM * num_tiles_m * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
-      const bool use_narrow_k =
-          rowwise && num_tiles_k < TB_DIM && narrow_k_slm_size <= get_max_dynamic_smem();
+      const bool use_narrow_k = rowwise && m_tiles_per_block > 1;
       const bool use_narrow_m =
           !rowwise && num_tiles_m < TB_DIM && narrow_m_slm_size <= get_max_dynamic_smem();
 
       dim3 num_blocks;
       if (use_narrow_k) {
-        num_blocks = dim3(DIVUP(num_tiles_m, TB_DIM), 1, input->num_tensors);
+        num_blocks = dim3(DIVUP(num_tiles_m, m_tiles_per_block), 1, input->num_tensors);
       } else if (use_narrow_m) {
         num_blocks = dim3(DIVUP(num_tiles_k, TB_DIM), 1, input->num_tensors);
       } else if (rowwise) {
@@ -2306,7 +2505,9 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
         num_blocks =
             dim3(DIVUP(num_tiles_k, TB_DIM), DIVUP(num_tiles_m, vec_load_size), input->num_tensors);
       }
-      const int slm_size = use_narrow_k   ? narrow_k_slm_size
+      const int slm_size = use_narrow_k   ? m_tiles_per_block * num_tiles_k * SF_TILE_DIM_M *
+                                                SF_TILE_DIM_K *
+                                                static_cast<int>(sizeof(int8_t))
                            : use_narrow_m ? narrow_m_slm_size
                                           : n_tiles_in_tb * SF_TILE_DIM_M * SF_TILE_DIM_K *
                                                 static_cast<int>(sizeof(int8_t));
@@ -2317,28 +2518,32 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
       void* output_ptr = rowwise ? output->scale_inv.dptr : output->columnwise_scale_inv.dptr;
 
       if (use_narrow_k) {
-        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+        dim3 block_size_batched(TB_DIM, m_tiles_per_block);
+        static int cached_grouped_uniform_row_batched = -1;
+        set_dynamic_smem_if_needed(
             grouped_swizzle_row_scaling_uniform_shape_narrow_k_kernel<SF_TILE_DIM_M,
                                                                       SF_TILE_DIM_K>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+            slm_size, cached_grouped_uniform_row_batched);
         grouped_swizzle_row_scaling_uniform_shape_narrow_k_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-            <<<num_blocks, block_size, slm_size, stream>>>(
+            <<<num_blocks, block_size_batched, slm_size, stream>>>(
                 input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
                 input_stride_bytes, output_stride_bytes);
       } else if (use_narrow_m) {
-        NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+        static int cached_grouped_uniform_col_narrow_m = -1;
+        set_dynamic_smem_if_needed(
             grouped_swizzle_col_scaling_uniform_shape_narrow_m_kernel<SF_TILE_DIM_M,
                                                                       SF_TILE_DIM_K>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+            slm_size, cached_grouped_uniform_col_narrow_m);
         grouped_swizzle_col_scaling_uniform_shape_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
             <<<num_blocks, block_size, slm_size, stream>>>(
                 input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
                 input_stride_bytes, output_stride_bytes);
       } else if (rowwise) {
         TRANSFORMER_ENGINE_VECTORIZED_LOAD_INTEGER_TYPE_SWITCH(vec_load_size, LType, {
-          NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+          static int cached_grouped_uniform_row = -1;
+          set_dynamic_smem_if_needed(
               grouped_swizzle_row_scaling_uniform_shape_kernel<LType, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-              cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+              slm_size, cached_grouped_uniform_row);
           grouped_swizzle_row_scaling_uniform_shape_kernel<LType, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(
                   input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
@@ -2346,9 +2551,10 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
         });
       } else {
         TRANSFORMER_ENGINE_VECTORIZED_LOAD_INTEGER_TYPE_SWITCH(vec_load_size, LType, {
-          NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+          static int cached_grouped_uniform_col = -1;
+          set_dynamic_smem_if_needed(
               grouped_swizzle_col_scaling_uniform_shape_kernel<LType, SF_TILE_DIM_M, SF_TILE_DIM_K>,
-              cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
+              slm_size, cached_grouped_uniform_col);
           grouped_swizzle_col_scaling_uniform_shape_kernel<LType, SF_TILE_DIM_M, SF_TILE_DIM_K>
               <<<num_blocks, block_size, slm_size, stream>>>(
                   input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
@@ -2370,45 +2576,103 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
 
     constexpr int SF_TILE_DIM_M = 128;
     constexpr int SF_TILE_DIM_K = 4;
-    const dim3 block_size(TB_DIM, TB_DIM);
-    const int max_slm_size = TB_DIM * 4 * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
-    const int metadata_shmem = sizeof(int);  // s_total_blocks
-    const int dynamic_smem_size = max_slm_size + metadata_shmem;
-
-    size_t common_m = input->all_same_first_dim() ? input->get_common_first_dim() : 0;
-    size_t common_k = input->all_same_last_dim() ? input->get_common_last_dim() : 0;
-
-    NVTE_CHECK_CUDA(cudaFuncSetAttribute(
-        grouped_swizzle_scaling_variable_shape_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_size));
-
     const int device_id = cuda::current_device();
     const int num_SMs = cuda::sm_count(device_id);
-    const int max_active_blocks_per_sm =
-        grouped_swizzle_variable_max_active_blocks_per_sm<SF_TILE_DIM_M, SF_TILE_DIM_K>(device_id);
-    const int persistent_blocks = num_SMs * max_active_blocks_per_sm;
-    const dim3 num_blocks(persistent_blocks);
+    const int metadata_shmem = sizeof(int);  // s_total_blocks
+    size_t common_m = input->all_same_first_dim() ? input->get_common_first_dim() : 0;
+    size_t common_k = input->all_same_last_dim() ? input->get_common_last_dim() : 0;
+    bool rowwise_done = false;
+    bool columnwise_done = false;
 
-    auto launch_grouped_swizzle_variable = [&](bool rowwise) {
-      const size_t scale_elem_size = rowwise ? typeToSize(input->scale_inv.dtype)
-                                             : typeToSize(input->columnwise_scale_inv.dtype);
-
-      const void* input_ptr = rowwise ? input->scale_inv.dptr : input->columnwise_scale_inv.dptr;
-      void* output_ptr = rowwise ? output->scale_inv.dptr : output->columnwise_scale_inv.dptr;
-
-      grouped_swizzle_scaling_variable_shape_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-          <<<num_blocks, block_size, dynamic_smem_size, stream>>>(
-              input_ptr, output_ptr, m_array, k_array, num_tensors, rowwise, scale_elem_size,
-              common_m, common_k);
-
-      NVTE_CHECK_CUDA(cudaGetLastError());
-    };
-
-    if (has_rowwise_scale_inv) {
-      launch_grouped_swizzle_variable(true);
+    if (has_rowwise_scale_inv && input->all_same_last_dim() && input->first_dims.has_data()) {
+      const size_t k = input->get_common_last_dim();
+      const size_t padded_k =
+          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)), SF_TILE_DIM_K);
+      const int num_tiles_k = static_cast<int>(padded_k / SF_TILE_DIM_K);
+      const int m_tiles_per_block =
+          row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k);
+      if (m_tiles_per_block > 1) {
+        const int slm_size = m_tiles_per_block * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K *
+                             static_cast<int>(sizeof(int8_t));
+        const int dynamic_smem_size = slm_size + metadata_shmem;
+        const dim3 block_size_batched(TB_DIM, m_tiles_per_block);
+        static int cached_variable_row_batched = -1;
+        set_dynamic_smem_if_needed(
+            grouped_swizzle_row_scaling_variable_shape_batched_m_kernel<SF_TILE_DIM_M,
+                                                                        SF_TILE_DIM_K>,
+            dynamic_smem_size, cached_variable_row_batched);
+        grouped_swizzle_row_scaling_variable_shape_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+            <<<num_SMs, block_size_batched, dynamic_smem_size, stream>>>(
+                input->scale_inv.dptr, output->scale_inv.dptr, m_array,
+                static_cast<int>(num_tensors), typeToSize(input->scale_inv.dtype), k);
+        NVTE_CHECK_CUDA(cudaGetLastError());
+        rowwise_done = true;
+      }
     }
-    if (has_columnwise_scale_inv) {
-      launch_grouped_swizzle_variable(false);
+
+    if (has_columnwise_scale_inv && input->all_same_last_dim() && input->first_dims.has_data()) {
+      const size_t m = input->get_common_last_dim();
+      const size_t padded_m = round_up_to_multiple(m, SF_TILE_DIM_M);
+      const int num_tiles_m = static_cast<int>(padded_m / SF_TILE_DIM_M);
+      const int narrow_m_slm_size =
+          TB_DIM * num_tiles_m * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
+      if (num_tiles_m < TB_DIM && narrow_m_slm_size <= get_max_dynamic_smem()) {
+        const int dynamic_smem_size = narrow_m_slm_size + metadata_shmem;
+        const dim3 block_size(TB_DIM, TB_DIM);
+        static int cached_variable_col_narrow_m = -1;
+        set_dynamic_smem_if_needed(
+            grouped_swizzle_col_scaling_variable_shape_narrow_m_kernel<SF_TILE_DIM_M,
+                                                                       SF_TILE_DIM_K>,
+            dynamic_smem_size, cached_variable_col_narrow_m);
+        grouped_swizzle_col_scaling_variable_shape_narrow_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+            <<<num_SMs, block_size, dynamic_smem_size, stream>>>(
+                input->columnwise_scale_inv.dptr, output->columnwise_scale_inv.dptr, m_array,
+                static_cast<int>(num_tensors), typeToSize(input->columnwise_scale_inv.dtype), m);
+        NVTE_CHECK_CUDA(cudaGetLastError());
+        columnwise_done = true;
+      }
+    }
+
+    const bool needs_generic_variable =
+        (has_rowwise_scale_inv && !rowwise_done) || (has_columnwise_scale_inv && !columnwise_done);
+
+    if (needs_generic_variable) {
+      const dim3 block_size(TB_DIM, TB_DIM);
+      const int max_slm_size = TB_DIM * 4 * SF_TILE_DIM_M * SF_TILE_DIM_K * sizeof(int8_t);
+      const int dynamic_smem_size = max_slm_size + metadata_shmem;
+
+      static int cached_variable_generic = -1;
+      set_dynamic_smem_if_needed(
+          grouped_swizzle_scaling_variable_shape_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
+          dynamic_smem_size, cached_variable_generic);
+
+      const int max_active_blocks_per_sm =
+          grouped_swizzle_variable_max_active_blocks_per_sm<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+              device_id);
+      const int persistent_blocks = num_SMs * max_active_blocks_per_sm;
+      const dim3 num_blocks(persistent_blocks);
+
+      auto launch_grouped_swizzle_variable = [&](bool rowwise) {
+        const size_t scale_elem_size = rowwise ? typeToSize(input->scale_inv.dtype)
+                                               : typeToSize(input->columnwise_scale_inv.dtype);
+
+        const void* input_ptr = rowwise ? input->scale_inv.dptr : input->columnwise_scale_inv.dptr;
+        void* output_ptr = rowwise ? output->scale_inv.dptr : output->columnwise_scale_inv.dptr;
+
+        grouped_swizzle_scaling_variable_shape_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+            <<<num_blocks, block_size, dynamic_smem_size, stream>>>(
+                input_ptr, output_ptr, m_array, k_array, num_tensors, rowwise, scale_elem_size,
+                common_m, common_k);
+
+        NVTE_CHECK_CUDA(cudaGetLastError());
+      };
+
+      if (has_rowwise_scale_inv && !rowwise_done) {
+        launch_grouped_swizzle_variable(true);
+      }
+      if (has_columnwise_scale_inv && !columnwise_done) {
+        launch_grouped_swizzle_variable(false);
+      }
     }
   }
 }
