@@ -37,6 +37,8 @@ class _FakeTorch:
         self.cuda = _FakeCuda(current_device)
 
     def device(self, device_arg, index=None):
+        if isinstance(device_arg, _FakeDevice):
+            return device_arg
         if index is not None:
             return _FakeDevice(device_arg, index)
         if ":" in device_arg:
@@ -59,6 +61,7 @@ def test_parse_args_defaults_to_indexed_cuda_device(monkeypatch):
         ("cuda", 2, 2),
         ("cuda:1", 0, 1),
         ("0", 3, 0),
+        (0, 3, 0),
     ],
 )
 def test_resolve_cuda_device_returns_indexed_device(
@@ -72,6 +75,17 @@ def test_resolve_cuda_device_returns_indexed_device(
     assert device.type == "cuda"
     assert device.index == expected_index
     assert fake_torch.cuda.set_device_calls == [expected_index]
+
+
+def test_resolve_cuda_device_handles_bare_torch_device(monkeypatch):
+    fake_torch = _FakeTorch(current_device=1)
+    monkeypatch.setattr(benchmark_swizzle, "torch", fake_torch, raising=False)
+
+    device = benchmark_swizzle.resolve_cuda_device(_FakeDevice("cuda"))
+
+    assert device.type == "cuda"
+    assert device.index == 1
+    assert fake_torch.cuda.set_device_calls == [1]
 
 
 def test_resolve_cuda_device_rejects_non_cuda_device(monkeypatch):

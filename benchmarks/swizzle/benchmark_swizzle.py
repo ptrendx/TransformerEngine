@@ -464,8 +464,10 @@ def check_cuda_status(status: Any, name: str) -> None:
         raise RuntimeError(f"{name} failed with CUDA status {code}")
 
 
-def resolve_cuda_device(device_arg: str) -> torch.device:
-    if device_arg.isdigit():
+def resolve_cuda_device(device_arg: Any) -> torch.device:
+    if isinstance(device_arg, int):
+        device = torch.device("cuda", device_arg)
+    elif isinstance(device_arg, str) and device_arg.isdigit():
         device = torch.device("cuda", int(device_arg))
     else:
         device = torch.device(device_arg)
