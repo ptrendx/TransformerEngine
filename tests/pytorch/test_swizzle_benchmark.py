@@ -60,6 +60,7 @@ def test_parse_args_defaults_to_indexed_cuda_device(monkeypatch):
     [
         ("cuda", 2, 2),
         ("cuda:1", 0, 1),
+        (_FakeDevice("cuda", 4), 0, 4),
         ("0", 3, 0),
         (0, 3, 0),
     ],
