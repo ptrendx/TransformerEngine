@@ -26,6 +26,7 @@ using namespace transformer_engine;
 
 constexpr int MAT_TILE_DIM_M = 128;
 constexpr int MAT_TILE_DIM_K = 128;
+constexpr int MXFP8_BLOCK_SIZE = 32;
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool row_scaling>
 void compute_ref_swizzle(const uint8_t *h_input, uint8_t *h_output,
@@ -612,6 +613,192 @@ class SwizzleGroupedVariableTestSuite
 
 TEST_P(SwizzleGroupedVariableTestSuite, TestGroupedSwizzleMXFP8Variable) {
   const auto shapes = GetParam();
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
+TEST(SwizzleGroupedVariableTest, TestGroupedSwizzleMXFP8VariableRowwise32And64ScaleColumns) {
+  // Explicitly cover grouped-variable rowwise cases with 32 and 64 scale columns
+  // (K=1024 and K=2048 for MXFP8) because the Blackwell row-coalesced path has
+  // specialized shared-memory pitch handling for those common widths.
+  const std::vector<std::vector<std::pair<size_t, size_t>>> shape_sets{
+      {{128, 1024}, {512, 1024}, {64, 1024}},
+      {{128, 2048}, {512, 2048}, {64, 2048}},
+      {{200, 1024}, {33, 1024}, {1025, 1024}},
+  };
+
+  for (const auto& shapes : shape_sets) {
+    performTestGroupedSwizzleMXFP8Variable(shapes);
+  }
+}
+
+TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReuse) {
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int sm_count = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  ASSERT_GT(sm_count, 0);
+
+  constexpr size_t rows_per_swizzle_tile = 128;
+  constexpr size_t k_dim = 512;
+  const size_t row_coalesced_grid_tiles = static_cast<size_t>(sm_count) * 4;
+  const size_t first_tensor_tiles =
+      row_coalesced_grid_tiles > 1 ? row_coalesced_grid_tiles - 1 : 1;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {first_tensor_tiles * rows_per_swizzle_tile, k_dim},
+      {9 * rows_per_swizzle_tile, k_dim},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
+TEST(SwizzleGroupedVariableSharedMemoryTest,
+     TestGroupedSwizzleMXFP8VariableRowCoalescedMetadataBoundary) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Row-coalesced grouped variable swizzle requires Blackwell or newer.";
+  }
+
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int max_smem = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&max_smem,
+                                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                         device));
+
+  constexpr size_t scale_tile_m = 128;
+  constexpr size_t row_coalesced_min_k = 32;
+  constexpr size_t row_coalesced_k_alignment = sizeof(int4);
+  constexpr size_t variable_metadata_bytes = 16;
+  const size_t max_scale_elems = static_cast<size_t>(max_smem) / scale_tile_m;
+  if (max_scale_elems <= sizeof(int)) {
+    GTEST_SKIP() << "Opt-in shared memory is too small for row-coalesced boundary coverage.";
+  }
+
+  size_t padded_scale_k =
+      ((max_scale_elems - sizeof(int)) / row_coalesced_k_alignment) *
+      row_coalesced_k_alignment;
+  size_t boundary_padded_scale_k = 0;
+  while (padded_scale_k >= row_coalesced_min_k) {
+    const size_t slm_size = scale_tile_m * (padded_scale_k + sizeof(int));
+    if (slm_size <= static_cast<size_t>(max_smem) &&
+        slm_size + variable_metadata_bytes > static_cast<size_t>(max_smem)) {
+      boundary_padded_scale_k = padded_scale_k;
+      break;
+    }
+    if (padded_scale_k < row_coalesced_min_k + row_coalesced_k_alignment) {
+      break;
+    }
+    padded_scale_k -= row_coalesced_k_alignment;
+  }
+
+  if (boundary_padded_scale_k == 0) {
+    GTEST_SKIP() << "No aligned common K reaches the row-coalesced metadata boundary.";
+  }
+
+  const size_t k_dim = boundary_padded_scale_k * MXFP8_BLOCK_SIZE;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {MAT_TILE_DIM_M, k_dim},
+      {2 * MAT_TILE_DIM_M, k_dim},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
+TEST(SwizzleGroupedVariableSharedMemoryTest,
+     TestGroupedSwizzleMXFP8VariableRowBatchedFallbackMetadataBoundary) {
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int max_smem = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&max_smem,
+                                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                         device));
+  ASSERT_GT(max_smem, 0);
+
+  constexpr size_t scale_tile_m = 128;
+  constexpr size_t scale_tile_k = 4;
+  constexpr size_t threadblock_dim = 32;
+  constexpr size_t per_k_tile_slm_size = scale_tile_m * scale_tile_k * sizeof(uint8_t);
+  constexpr size_t row_coalesced_min_k = 32;
+  constexpr size_t row_coalesced_k_alignment = sizeof(int4);
+  constexpr size_t variable_scheduler_metadata_bytes = sizeof(int);
+
+  size_t boundary_num_tiles_k = 0;
+  const size_t max_num_tiles_k = static_cast<size_t>(max_smem) / per_k_tile_slm_size;
+  for (size_t num_tiles_k = max_num_tiles_k; num_tiles_k > 0; --num_tiles_k) {
+    const size_t per_m_tile_slm_size = num_tiles_k * per_k_tile_slm_size;
+    const size_t m_tiles_per_block =
+        std::min(threadblock_dim, static_cast<size_t>(max_smem) / per_m_tile_slm_size);
+    if (m_tiles_per_block > 1 &&
+        per_m_tile_slm_size * m_tiles_per_block <= static_cast<size_t>(max_smem) &&
+        per_m_tile_slm_size * m_tiles_per_block + variable_scheduler_metadata_bytes >
+            static_cast<size_t>(max_smem)) {
+      boundary_num_tiles_k = num_tiles_k;
+      break;
+    }
+  }
+
+  if (boundary_num_tiles_k == 0) {
+    GTEST_SKIP() << "No grouped variable rowwise batched fallback shared-memory boundary.";
+  }
+
+  const size_t padded_scale_k = boundary_num_tiles_k * scale_tile_k;
+  size_t original_scale_k = padded_scale_k;
+  if (test::getDeviceComputeCapability() >= test::blackwellComputeCapability &&
+      padded_scale_k >= row_coalesced_min_k &&
+      padded_scale_k % row_coalesced_k_alignment == 0) {
+    original_scale_k = padded_scale_k - 1;
+  }
+  ASSERT_GT(original_scale_k, 0);
+
+  const size_t k_dim = original_scale_k * MXFP8_BLOCK_SIZE;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {MAT_TILE_DIM_M, k_dim},
+      {2 * MAT_TILE_DIM_M, k_dim},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
+TEST(SwizzleGroupedVariableSharedMemoryTest,
+     TestGroupedSwizzleMXFP8VariableColumnNarrowMMetadataBoundary) {
+  if (test::getDeviceComputeCapability() >= test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell byte-scale columnwise swizzle uses the coalesced path.";
+  }
+
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int max_smem = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&max_smem,
+                                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                         device));
+  ASSERT_GT(max_smem, 0);
+
+  constexpr size_t scale_tile_m = 128;
+  constexpr size_t scale_tile_k = 4;
+  constexpr size_t threadblock_dim = 32;
+  constexpr size_t narrow_m_per_m_tile_slm_size =
+      threadblock_dim * scale_tile_m * scale_tile_k * sizeof(uint8_t);
+  constexpr size_t variable_scheduler_metadata_bytes = sizeof(int);
+
+  size_t boundary_num_tiles_m = 0;
+  for (size_t num_tiles_m = 1; num_tiles_m < threadblock_dim; ++num_tiles_m) {
+    const size_t narrow_m_slm_size = num_tiles_m * narrow_m_per_m_tile_slm_size;
+    if (narrow_m_slm_size <= static_cast<size_t>(max_smem) &&
+        narrow_m_slm_size + variable_scheduler_metadata_bytes > static_cast<size_t>(max_smem)) {
+      boundary_num_tiles_m = num_tiles_m;
+      break;
+    }
+  }
+
+  if (boundary_num_tiles_m == 0) {
+    GTEST_SKIP() << "No grouped variable columnwise narrow-M shared-memory boundary.";
+  }
+
+  const size_t common_last_dim = boundary_num_tiles_m * MAT_TILE_DIM_M;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {MAT_TILE_DIM_M, common_last_dim},
+      {2 * MAT_TILE_DIM_M, common_last_dim},
+  };
+
   performTestGroupedSwizzleMXFP8Variable(shapes);
 }
 
