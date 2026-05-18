@@ -879,6 +879,111 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
   }
 }
 
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int M_TILES_PER_BLOCK>
+__device__ void swizzle_row_scaling_coalesced_full_m_impl(
+    const void* input, void* output, const int K, const int first_m_tile, int4* slm_v4i) {
+  constexpr int SF_TILE_SIZE = SF_TILE_DIM_M * SF_TILE_DIM_K;
+  constexpr int TILE_OUTPUT_V4 = SF_TILE_SIZE / static_cast<int>(sizeof(int4));
+  const int row_v4 = K / static_cast<int>(sizeof(int4));
+  const int tile_v4 = SF_TILE_DIM_M * row_v4;
+  const int K_i32 = K / static_cast<int>(sizeof(int));
+  const int smem_stride_i32 = row_coalesced_smem_stride_i32(K_i32);
+  const int smem_tile_i32 = SF_TILE_DIM_M * smem_stride_i32;
+
+  const int4* input_v4 = reinterpret_cast<const int4*>(input);
+  int* slm_i32 = reinterpret_cast<int*>(slm_v4i);
+  const bool row_v4_is_pow2 = (row_v4 & (row_v4 - 1)) == 0;
+  const int row_v4_log2 = __ffs(row_v4) - 1;
+
+  for (int tile_idx_base = threadIdx.x; tile_idx_base < tile_v4;
+       tile_idx_base += blockDim.x * ROW_COALESCED_LOAD_PREFETCH) {
+    int rows[ROW_COALESCED_LOAD_PREFETCH];
+    int col_i32s[ROW_COALESCED_LOAD_PREFETCH];
+    bool valid[ROW_COALESCED_LOAD_PREFETCH];
+
+#pragma unroll
+    for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+      const int tile_idx = tile_idx_base + prefetch * blockDim.x;
+      valid[prefetch] = tile_idx < tile_v4;
+      if (valid[prefetch]) {
+        int col_v4;
+        divmod_tile_col_v4(tile_idx, row_v4, row_v4_is_pow2, row_v4_log2, &rows[prefetch],
+                           &col_v4);
+        col_i32s[prefetch] = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
+      }
+    }
+
+    if (tile_v4 <= blockDim.x && M_TILES_PER_BLOCK > 1) {
+      int4 values[M_TILES_PER_BLOCK];
+      const int row = rows[0];
+      const int col_i32 = col_i32s[0];
+      const int tile_idx = tile_idx_base;
+      const int smem_base = row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32;
+
+#pragma unroll
+      for (int local_m_tile = 0; local_m_tile < M_TILES_PER_BLOCK; ++local_m_tile) {
+        const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
+        const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
+        values[local_m_tile] = load_global_cs(input_v4 + input_tile_v4 + tile_idx);
+      }
+
+#pragma unroll
+      for (int local_m_tile = 0; local_m_tile < M_TILES_PER_BLOCK; ++local_m_tile) {
+        int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
+        store_row_coalesced_smem(smem_tile, smem_base, values[local_m_tile]);
+      }
+    } else {
+#pragma unroll
+      for (int local_m_tile = 0; local_m_tile < M_TILES_PER_BLOCK; ++local_m_tile) {
+        const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
+        const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
+        int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
+        int4 values[ROW_COALESCED_LOAD_PREFETCH];
+
+#pragma unroll
+        for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+          if (valid[prefetch]) {
+            const int tile_idx = tile_idx_base + prefetch * blockDim.x;
+            values[prefetch] = load_global_cs(input_v4 + input_tile_v4 + tile_idx);
+          }
+        }
+
+#pragma unroll
+        for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+          if (valid[prefetch]) {
+            const int row = rows[prefetch];
+            const int smem_base =
+                row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32s[prefetch];
+            store_row_coalesced_smem(smem_tile, smem_base, values[prefetch]);
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  const int* slm_read_i32 = reinterpret_cast<const int*>(slm_v4i);
+#pragma unroll
+  for (int local_m_tile = 0; local_m_tile < M_TILES_PER_BLOCK; ++local_m_tile) {
+    const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
+    int4* output_v4 = reinterpret_cast<int4*>(
+        reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(global_m) * K);
+
+    for (int tile_idx = threadIdx.x; tile_idx < tile_v4; tile_idx += blockDim.x) {
+      const int tile_k = tile_idx / TILE_OUTPUT_V4;
+      const int row_in_new_tile = tile_idx - tile_k * TILE_OUTPUT_V4;
+      const int smem_base =
+          local_m_tile * smem_tile_i32 +
+          row_coalesced_smem_physical_row(row_in_new_tile) * smem_stride_i32 + tile_k;
+      const int4 value =
+          make_int4(slm_read_i32[smem_base], slm_read_i32[smem_base + 32 * smem_stride_i32],
+                    slm_read_i32[smem_base + 64 * smem_stride_i32],
+                    slm_read_i32[smem_base + 96 * smem_stride_i32]);
+      store_global_cs(output_v4 + tile_idx, value);
+    }
+  }
+}
+
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 __global__ void __launch_bounds__(ROW_COALESCED_THREADS)
     swizzle_row_scaling_coalesced_batched_m_kernel(const void* input, void* output, const int M,
@@ -888,6 +993,15 @@ __global__ void __launch_bounds__(ROW_COALESCED_THREADS)
   const int first_m_tile = blockIdx.x * m_tiles_per_block;
   swizzle_row_scaling_coalesced_batched_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
       input, output, M, K, original_M, first_m_tile, m_tiles_per_block, slm_v4i);
+}
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int M_TILES_PER_BLOCK>
+__global__ void __launch_bounds__(ROW_COALESCED_THREADS)
+    swizzle_row_scaling_coalesced_full_m_kernel(const void* input, void* output, const int K) {
+  extern __shared__ int4 slm_v4i[];
+  const int first_m_tile = blockIdx.x * M_TILES_PER_BLOCK;
+  swizzle_row_scaling_coalesced_full_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, M_TILES_PER_BLOCK>(
+      input, output, K, first_m_tile, slm_v4i);
 }
 
 __device__ __forceinline__ uint4 load_col_swizzle_segment(const uint8_t* input, const int M,
@@ -913,6 +1027,13 @@ __device__ __forceinline__ uint4 load_col_swizzle_segment(const uint8_t* input, 
   return value;
 }
 
+__device__ __forceinline__ uint4 load_col_swizzle_segment_full_m(const uint8_t* input, const int M,
+                                                                 const int m_base, const int k,
+                                                                 const int segment) {
+  const int m = m_base + segment * static_cast<int>(sizeof(uint4));
+  return load_global_cs(reinterpret_cast<const uint4*>(input + static_cast<size_t>(k) * M + m));
+}
+
 __device__ __forceinline__ uint32_t shuffle_uint4_byte(const uint4 value, const int src_lane,
                                                        const int byte_idx) {
   const int component = byte_idx / static_cast<int>(sizeof(uint32_t));
@@ -925,7 +1046,7 @@ __device__ __forceinline__ uint32_t shuffle_uint4_byte(const uint4 value, const 
   return (src_component >> (8 * (byte_idx % static_cast<int>(sizeof(uint32_t))))) & 0xff;
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __device__ void swizzle_col_scaling_coalesced_tile_impl(
     const void* input, void* output, const int M, const int K, const int original_M,
     const int original_K, const int m_tile, const int k_tile_block,
@@ -951,9 +1072,13 @@ __device__ void swizzle_col_scaling_coalesced_tile_impl(
   for (int idx = threadIdx.x; idx < active_k * M_TILE_V4; idx += blockDim.x) {
     const int k_rel = idx / M_TILE_V4;
     const int segment = idx - k_rel * M_TILE_V4;
-    const uint4 value =
-        load_col_swizzle_segment(input_u8, M, original_M, original_K, m_base, k_base + k_rel,
-                                 segment);
+    uint4 value;
+    if constexpr (FULL_TILE) {
+      value = load_col_swizzle_segment_full_m(input_u8, M, m_base, k_base + k_rel, segment);
+    } else {
+      value = load_col_swizzle_segment(input_u8, M, original_M, original_K, m_base,
+                                       k_base + k_rel, segment);
+    }
     uint32_t* smem_row = slm_u32 + k_rel * SMEM_STRIDE_I32 + segment * 4;
     smem_row[0] = value.x;
     smem_row[1] = value.y;
@@ -990,7 +1115,7 @@ __device__ void swizzle_col_scaling_coalesced_tile_impl(
   }
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __device__ void swizzle_col_scaling_coalesced_batched_m_impl(
     const void* input, void* output, const int M, const int K, const int original_M,
     const int original_K, const int m_tile_block, const int k_tile_block,
@@ -1004,7 +1129,7 @@ __device__ void swizzle_col_scaling_coalesced_batched_m_impl(
                                                                        : m_tiles_per_block);
 
   for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
-    swizzle_col_scaling_coalesced_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+    swizzle_col_scaling_coalesced_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, FULL_TILE>(
         input, output, M, K, original_M, original_K, first_m_tile + local_m_tile, k_tile_block,
         k_tiles_per_block, slm_i32);
     if (local_m_tile + 1 < active_m_tiles) {
@@ -1013,7 +1138,7 @@ __device__ void swizzle_col_scaling_coalesced_batched_m_impl(
   }
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __global__ void __launch_bounds__(COL_COALESCED_THREADS)
     swizzle_col_scaling_coalesced_kernel(const void* input, void* output, const int M,
                                          const int K, const int original_M,
@@ -1021,7 +1146,7 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
                                          const int k_tiles_per_block,
                                          const int m_tiles_per_block) {
   extern __shared__ int slm_i32[];
-  swizzle_col_scaling_coalesced_batched_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+  swizzle_col_scaling_coalesced_batched_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, FULL_TILE>(
       input, output, M, K, original_M, original_K, blockIdx.y, blockIdx.x, k_tiles_per_block,
       m_tiles_per_block, slm_i32);
 }
@@ -1409,6 +1534,57 @@ __global__ void __launch_bounds__(ROW_COALESCED_THREADS)
       input_base, output_base, M, K, original_M, first_m_tile, m_tiles_per_block, slm_v4i);
 }
 
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int M_TILES_PER_BLOCK>
+__global__ void __launch_bounds__(ROW_COALESCED_THREADS)
+    grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m_kernel(
+        const void* input, void* output, const int K, const size_t input_stride_bytes,
+        const size_t output_stride_bytes) {
+  const int tensor_id = blockIdx.y;
+  const uint8_t* input_base =
+      reinterpret_cast<const uint8_t*>(input) + tensor_id * input_stride_bytes;
+  uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + tensor_id * output_stride_bytes;
+  extern __shared__ int4 slm_v4i[];
+  const int first_m_tile = blockIdx.x * M_TILES_PER_BLOCK;
+  swizzle_row_scaling_coalesced_full_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, M_TILES_PER_BLOCK>(
+      input_base, output_base, K, first_m_tile, slm_v4i);
+}
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int M_TILES_PER_BLOCK>
+void launch_swizzle_row_scaling_coalesced_full_m(const void* input, void* output, const int M,
+                                                 const int K, cudaStream_t stream) {
+  const int num_tiles_m = M / SF_TILE_DIM_M;
+  const int slm_size =
+      row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(K, sizeof(uint8_t)) *
+      M_TILES_PER_BLOCK;
+  static int cached_smem_size = -1;
+  set_dynamic_smem_if_needed(
+      swizzle_row_scaling_coalesced_full_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K,
+                                                  M_TILES_PER_BLOCK>,
+      slm_size, cached_smem_size);
+  swizzle_row_scaling_coalesced_full_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K, M_TILES_PER_BLOCK>
+      <<<DIVUP(num_tiles_m, M_TILES_PER_BLOCK), ROW_COALESCED_THREADS, slm_size, stream>>>(
+          input, output, K);
+}
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int M_TILES_PER_BLOCK>
+void launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m(
+    const void* input, void* output, const int M, const int K, const size_t input_stride_bytes,
+    const size_t output_stride_bytes, const int num_tensors, cudaStream_t stream) {
+  const int num_tiles_m = M / SF_TILE_DIM_M;
+  const int slm_size =
+      row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(K, sizeof(uint8_t)) *
+      M_TILES_PER_BLOCK;
+  static int cached_smem_size = -1;
+  set_dynamic_smem_if_needed(
+      grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m_kernel<
+          SF_TILE_DIM_M, SF_TILE_DIM_K, M_TILES_PER_BLOCK>,
+      slm_size, cached_smem_size);
+  grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m_kernel<
+      SF_TILE_DIM_M, SF_TILE_DIM_K, M_TILES_PER_BLOCK>
+      <<<dim3(DIVUP(num_tiles_m, M_TILES_PER_BLOCK), num_tensors), ROW_COALESCED_THREADS,
+         slm_size, stream>>>(input, output, K, input_stride_bytes, output_stride_bytes);
+}
+
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 __global__ void __launch_bounds__(COL_WARP_TILE_THREADS)
     grouped_swizzle_col_scaling_uniform_shape_warp_tile_kernel(
@@ -1427,7 +1603,7 @@ __global__ void __launch_bounds__(COL_WARP_TILE_THREADS)
   }
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __global__ void __launch_bounds__(COL_COALESCED_THREADS)
     grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel(
         const void* input, void* output, const int M, const int K, const int original_M,
@@ -1438,7 +1614,7 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
       reinterpret_cast<const uint8_t*>(input) + tensor_id * input_stride_bytes;
   uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + tensor_id * output_stride_bytes;
   extern __shared__ int slm_i32[];
-  swizzle_col_scaling_coalesced_batched_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+  swizzle_col_scaling_coalesced_batched_m_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, FULL_TILE>(
       input_base, output_base, M, K, original_M, original_K, blockIdx.y, blockIdx.x,
       k_tiles_per_block, m_tiles_per_block, slm_i32);
 }
@@ -1782,13 +1958,25 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
       const int m_tiles_per_block =
           row_coalesced_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(k, sizeof(uint8_t));
       const int slm_size = row_coalesced_slm_size * m_tiles_per_block;
-      static int cached_regular_row_coalesced_batched = -1;
-      set_dynamic_smem_if_needed(
-          swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
-          cached_regular_row_coalesced_batched);
-      swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-          <<<DIVUP(num_tiles_m, m_tiles_per_block), ROW_COALESCED_THREADS, slm_size, stream>>>(
-              input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, m_tiles_per_block);
+      const bool use_full_m_fast_path = original_M == m && num_tiles_m % m_tiles_per_block == 0;
+      if (use_full_m_fast_path && m_tiles_per_block == 8) {
+        launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 8>(
+            input_scale_inv_ptr, output_scale_inv_ptr, m, k, stream);
+      } else if (use_full_m_fast_path && m_tiles_per_block == 5) {
+        launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 5>(
+            input_scale_inv_ptr, output_scale_inv_ptr, m, k, stream);
+      } else if (use_full_m_fast_path && m_tiles_per_block == 1) {
+        launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 1>(
+            input_scale_inv_ptr, output_scale_inv_ptr, m, k, stream);
+      } else {
+        static int cached_regular_row_coalesced_batched = -1;
+        set_dynamic_smem_if_needed(
+            swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
+            cached_regular_row_coalesced_batched);
+        swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+            <<<DIVUP(num_tiles_m, m_tiles_per_block), ROW_COALESCED_THREADS, slm_size, stream>>>(
+                input_scale_inv_ptr, output_scale_inv_ptr, m, k, original_M, m_tiles_per_block);
+      }
     } else {
       const int m_tiles_per_block =
           row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k);
@@ -1869,14 +2057,29 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
           col_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(k_tiles_per_block);
       const dim3 num_blocks(DIVUP(num_tiles_k, k_tiles_per_block),
                             DIVUP(num_tiles_m, m_tiles_per_block));
-      static int cached_regular_col_coalesced = -1;
-      set_dynamic_smem_if_needed(
-          swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
-          cached_regular_col_coalesced);
-      swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-          <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
-              input->columnwise_scale_inv.dptr, output->columnwise_scale_inv.dptr, m, k,
-              original_M, original_K, k_tiles_per_block, m_tiles_per_block);
+      const bool use_full_tile_fast_path =
+          original_M == m && original_K == k && num_tiles_k % k_tiles_per_block == 0 &&
+          num_tiles_m % m_tiles_per_block == 0;
+      if (use_full_tile_fast_path) {
+        static int cached_regular_col_coalesced_full = -1;
+        set_dynamic_smem_if_needed(
+            swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K,
+                                                 /*FULL_TILE=*/true>,
+            slm_size, cached_regular_col_coalesced_full);
+        swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K, /*FULL_TILE=*/true>
+            <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
+                input->columnwise_scale_inv.dptr, output->columnwise_scale_inv.dptr, m, k,
+                original_M, original_K, k_tiles_per_block, m_tiles_per_block);
+      } else {
+        static int cached_regular_col_coalesced = -1;
+        set_dynamic_smem_if_needed(
+            swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>, slm_size,
+            cached_regular_col_coalesced);
+        swizzle_col_scaling_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+            <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
+                input->columnwise_scale_inv.dptr, output->columnwise_scale_inv.dptr, m, k,
+                original_M, original_K, k_tiles_per_block, m_tiles_per_block);
+      }
     } else if (num_tiles_m < TB_DIM && narrow_m_slm_size <= get_max_dynamic_smem()) {
       // Narrow-M: batch TB_DIM K-tiles per block, fully utilizing all threads.
       dim3 num_blocks_narrow(DIVUP(num_tiles_k, TB_DIM));
@@ -3334,27 +3537,67 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
       void* output_ptr = rowwise ? output->scale_inv.dptr : output->columnwise_scale_inv.dptr;
 
       if (use_row_coalesced) {
-        static int cached_grouped_uniform_row_coalesced_batched = -1;
-        set_dynamic_smem_if_needed(
-            grouped_swizzle_row_scaling_uniform_shape_coalesced_batched_m_kernel<
-                SF_TILE_DIM_M, SF_TILE_DIM_K>,
-            slm_size, cached_grouped_uniform_row_coalesced_batched);
-        grouped_swizzle_row_scaling_uniform_shape_coalesced_batched_m_kernel<SF_TILE_DIM_M,
-                                                                             SF_TILE_DIM_K>
-            <<<num_blocks, ROW_COALESCED_THREADS, slm_size, stream>>>(
-                input_ptr, output_ptr, padded_m, padded_k, original_M, input_stride_bytes,
-                output_stride_bytes, row_coalesced_m_tiles);
+        const bool use_full_m_fast_path =
+            original_M == static_cast<int>(padded_m) && num_tiles_m % row_coalesced_m_tiles == 0;
+        if (use_full_m_fast_path && row_coalesced_m_tiles == 8) {
+          launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m<
+              SF_TILE_DIM_M, SF_TILE_DIM_K, 8>(
+              input_ptr, output_ptr, static_cast<int>(padded_m), static_cast<int>(padded_k),
+              input_stride_bytes, output_stride_bytes, static_cast<int>(input->num_tensors),
+              stream);
+        } else if (use_full_m_fast_path && row_coalesced_m_tiles == 5) {
+          launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m<
+              SF_TILE_DIM_M, SF_TILE_DIM_K, 5>(
+              input_ptr, output_ptr, static_cast<int>(padded_m), static_cast<int>(padded_k),
+              input_stride_bytes, output_stride_bytes, static_cast<int>(input->num_tensors),
+              stream);
+        } else if (use_full_m_fast_path && row_coalesced_m_tiles == 1) {
+          launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m<
+              SF_TILE_DIM_M, SF_TILE_DIM_K, 1>(
+              input_ptr, output_ptr, static_cast<int>(padded_m), static_cast<int>(padded_k),
+              input_stride_bytes, output_stride_bytes, static_cast<int>(input->num_tensors),
+              stream);
+        } else {
+          static int cached_grouped_uniform_row_coalesced_batched = -1;
+          set_dynamic_smem_if_needed(
+              grouped_swizzle_row_scaling_uniform_shape_coalesced_batched_m_kernel<
+                  SF_TILE_DIM_M, SF_TILE_DIM_K>,
+              slm_size, cached_grouped_uniform_row_coalesced_batched);
+          grouped_swizzle_row_scaling_uniform_shape_coalesced_batched_m_kernel<SF_TILE_DIM_M,
+                                                                               SF_TILE_DIM_K>
+              <<<num_blocks, ROW_COALESCED_THREADS, slm_size, stream>>>(
+                  input_ptr, output_ptr, padded_m, padded_k, original_M, input_stride_bytes,
+                  output_stride_bytes, row_coalesced_m_tiles);
+        }
       } else if (use_col_coalesced) {
-        static int cached_grouped_uniform_col_coalesced = -1;
-        set_dynamic_smem_if_needed(
-            grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<SF_TILE_DIM_M,
-                                                                       SF_TILE_DIM_K>,
-            slm_size, cached_grouped_uniform_col_coalesced);
-        grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-            <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
-                input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
-                input_stride_bytes, output_stride_bytes, col_coalesced_k_tiles_per_block,
-                col_coalesced_m_tiles);
+        const bool use_full_tile_fast_path =
+            original_M == static_cast<int>(padded_m) && original_K == static_cast<int>(padded_k) &&
+            num_tiles_k % col_coalesced_k_tiles_per_block == 0 &&
+            num_tiles_m % col_coalesced_m_tiles == 0;
+        if (use_full_tile_fast_path) {
+          static int cached_grouped_uniform_col_coalesced_full = -1;
+          set_dynamic_smem_if_needed(
+              grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<
+                  SF_TILE_DIM_M, SF_TILE_DIM_K, /*FULL_TILE=*/true>,
+              slm_size, cached_grouped_uniform_col_coalesced_full);
+          grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<
+              SF_TILE_DIM_M, SF_TILE_DIM_K, /*FULL_TILE=*/true>
+              <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
+                  input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
+                  input_stride_bytes, output_stride_bytes, col_coalesced_k_tiles_per_block,
+                  col_coalesced_m_tiles);
+        } else {
+          static int cached_grouped_uniform_col_coalesced = -1;
+          set_dynamic_smem_if_needed(
+              grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<SF_TILE_DIM_M,
+                                                                         SF_TILE_DIM_K>,
+              slm_size, cached_grouped_uniform_col_coalesced);
+          grouped_swizzle_col_scaling_uniform_shape_coalesced_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+              <<<num_blocks, COL_COALESCED_THREADS, slm_size, stream>>>(
+                  input_ptr, output_ptr, padded_m, padded_k, original_M, original_K,
+                  input_stride_bytes, output_stride_bytes, col_coalesced_k_tiles_per_block,
+                  col_coalesced_m_tiles);
+        }
       } else if (use_narrow_k) {
         dim3 block_size_batched(TB_DIM, m_tiles_per_block);
         static int cached_grouped_uniform_row_batched = -1;
@@ -3446,15 +3689,30 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
         const int dynamic_smem_size = slm_size * m_tiles_per_block;
         if (can_use_stacked_rowwise) {
           const int stacked_num_tiles_m = static_cast<int>(stacked_m / SF_TILE_DIM_M);
-          static int cached_variable_row_stacked_coalesced = -1;
-          set_dynamic_smem_if_needed(
-              swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
-              dynamic_smem_size, cached_variable_row_stacked_coalesced);
-          swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
-              <<<DIVUP(stacked_num_tiles_m, m_tiles_per_block), ROW_COALESCED_THREADS,
-                 dynamic_smem_size, stream>>>(
-                  input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
-                  static_cast<int>(padded_k), static_cast<int>(stacked_m), m_tiles_per_block);
+          const bool use_full_m_fast_path = stacked_num_tiles_m % m_tiles_per_block == 0;
+          if (use_full_m_fast_path && m_tiles_per_block == 8) {
+            launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 8>(
+                input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
+                static_cast<int>(padded_k), stream);
+          } else if (use_full_m_fast_path && m_tiles_per_block == 5) {
+            launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 5>(
+                input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
+                static_cast<int>(padded_k), stream);
+          } else if (use_full_m_fast_path && m_tiles_per_block == 1) {
+            launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 1>(
+                input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
+                static_cast<int>(padded_k), stream);
+          } else {
+            static int cached_variable_row_stacked_coalesced = -1;
+            set_dynamic_smem_if_needed(
+                swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>,
+                dynamic_smem_size, cached_variable_row_stacked_coalesced);
+            swizzle_row_scaling_coalesced_batched_m_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
+                <<<DIVUP(stacked_num_tiles_m, m_tiles_per_block), ROW_COALESCED_THREADS,
+                   dynamic_smem_size, stream>>>(
+                    input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
+                    static_cast<int>(padded_k), static_cast<int>(stacked_m), m_tiles_per_block);
+          }
         } else {
           const size_t total_m_tiles_upper =
               DIVUP(stacked_m, static_cast<size_t>(SF_TILE_DIM_M)) + num_tensors;
