@@ -1089,13 +1089,13 @@ constexpr size_t round_up_to_multiple(size_t value, size_t multiple) {
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
-int row_swizzle_m_tiles_per_block(const int num_tiles_k) {
+int row_swizzle_m_tiles_per_block(const int num_tiles_k, const int reserved_smem_bytes = 0) {
   if (num_tiles_k <= 0) return 0;
   const int per_m_tile_slm_size =
       num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K * static_cast<int>(sizeof(int8_t));
-  const int max_smem = get_max_dynamic_smem();
-  if (per_m_tile_slm_size > max_smem) return 0;
-  return std::min(TB_DIM, max_smem / per_m_tile_slm_size);
+  const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
+  if (available_smem <= 0 || per_m_tile_slm_size > available_smem) return 0;
+  return std::min(TB_DIM, available_smem / per_m_tile_slm_size);
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
@@ -3319,7 +3319,8 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
         rowwise_done = true;
       } else {
         const int m_tiles_per_block =
-            row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k);
+            row_swizzle_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(num_tiles_k,
+                                                                        metadata_shmem);
         if (m_tiles_per_block > 1) {
           const int slm_size = m_tiles_per_block * num_tiles_k * SF_TILE_DIM_M * SF_TILE_DIM_K *
                                static_cast<int>(sizeof(int8_t));
@@ -3363,7 +3364,8 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
                 static_cast<int>(num_tensors), scale_elem_size, m, k_tiles_per_block);
         NVTE_CHECK_CUDA(cudaGetLastError());
         columnwise_done = true;
-      } else if (num_tiles_m < TB_DIM && narrow_m_slm_size <= get_max_dynamic_smem()) {
+      } else if (num_tiles_m < TB_DIM &&
+                 narrow_m_slm_size + metadata_shmem <= get_max_dynamic_smem()) {
         const int dynamic_smem_size = narrow_m_slm_size + metadata_shmem;
         const dim3 block_size(TB_DIM, TB_DIM);
         static int cached_variable_col_narrow_m = -1;
