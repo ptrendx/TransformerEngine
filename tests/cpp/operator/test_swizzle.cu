@@ -651,6 +651,19 @@ TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableDirect
   performTestGroupedSwizzleMXFP8Variable(shapes);
 }
 
+TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableAlignedStackedFastPath) {
+  // All M dimensions are already swizzle-tile aligned, so the grouped-variable
+  // scale buffers can be swizzled as one stacked scale matrix.
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {2 * MAT_TILE_DIM_M, 1024},
+      {5 * MAT_TILE_DIM_M, 1024},
+      {7 * MAT_TILE_DIM_M, 1024},
+      {11 * MAT_TILE_DIM_M, 1024},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
 TEST(SwizzleGroupedVariableSharedMemoryTest,
      TestGroupedSwizzleMXFP8VariableRowCoalescedSharedMemoryBoundary) {
   if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
