@@ -76,6 +76,24 @@ __device__ __forceinline__ void store_global_cs(uint4* ptr, const uint4 value) {
                : "memory");
 }
 
+__device__ __forceinline__ int4 load_global_cs(const int4* ptr) {
+  int4 value;
+  asm volatile("ld.global.cs.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(ptr)
+               : "memory");
+  return value;
+}
+
+__device__ __forceinline__ uint4 load_global_cs(const uint4* ptr) {
+  uint4 value;
+  asm volatile("ld.global.cs.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(ptr)
+               : "memory");
+  return value;
+}
+
 __device__ __forceinline__ void divmod_tile_col_v4(const int tile_idx, const int row_v4,
                                                    const bool row_v4_is_pow2,
                                                    const int row_v4_log2, int* row,
@@ -694,7 +712,7 @@ __device__ void swizzle_row_scaling_coalesced_tile_impl(const void* input, void*
     const int col_i32 = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
     int4 value;
     if (global_m + row < original_M) {
-      value = __ldg(input_v4 + input_tile_v4 + idx);
+      value = load_global_cs(input_v4 + input_tile_v4 + idx);
     } else {
       value = make_int4(0, 0, 0, 0);
     }
@@ -768,7 +786,7 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
 
       int4 value;
       if (global_m + row < original_M) {
-        value = __ldg(input_v4 + input_tile_v4 + tile_idx);
+        value = load_global_cs(input_v4 + input_tile_v4 + tile_idx);
       } else {
         value = make_int4(0, 0, 0, 0);
       }
@@ -823,7 +841,7 @@ __device__ __forceinline__ uint4 load_col_swizzle_segment(const uint8_t* input, 
     return make_uint4(0, 0, 0, 0);
   }
   if (m + static_cast<int>(sizeof(uint4)) <= original_M) {
-    return __ldg(reinterpret_cast<const uint4*>(input + static_cast<size_t>(k) * M + m));
+    return load_global_cs(reinterpret_cast<const uint4*>(input + static_cast<size_t>(k) * M + m));
   }
 
   uint4 value = make_uint4(0, 0, 0, 0);
