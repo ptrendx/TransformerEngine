@@ -41,15 +41,15 @@ constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr int ROW_COALESCED_THREADS = 256;
 constexpr int ROW_COALESCED_MIN_K = 32;
-// Keep row-coalesced CTAs small enough for occupancy on Blackwell, while still
-// batching the 32/64-scale-column cases enough to issue independent global loads
-// before the shared-memory permutation consumes them.
+// Keep row-coalesced CTAs small enough for occupancy on Blackwell. Narrow
+// scale-column cases need deeper M batching to expose independent global loads,
+// while wide scale-column cases were faster with smaller CTAs.
 constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 8;
-constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 48 * 1024;
+constexpr int ROW_COALESCED_NARROW_TARGET_SMEM_BYTES = 48 * 1024;
+constexpr int ROW_COALESCED_WIDE_TARGET_SMEM_BYTES = 24 * 1024;
 constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
 constexpr int COL_COALESCED_THREADS = 256;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
-constexpr int COL_COALESCED_M_TILES_PER_BLOCK = 4;
 constexpr int COL_WARP_TILE_WARPS = 8;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 
@@ -1273,7 +1273,9 @@ int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_
   const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
   if (slm_size > available_smem) return 0;
   const int smem_limited_tiles = available_smem / slm_size;
-  const int target_smem_tiles = std::max(1, ROW_COALESCED_TARGET_SMEM_BYTES / slm_size);
+  const int target_smem_bytes = padded_k <= 64 ? ROW_COALESCED_NARROW_TARGET_SMEM_BYTES
+                                               : ROW_COALESCED_WIDE_TARGET_SMEM_BYTES;
+  const int target_smem_tiles = std::max(1, target_smem_bytes / slm_size);
   return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK,
                   std::min(smem_limited_tiles, target_smem_tiles));
 }
@@ -1300,7 +1302,8 @@ int col_coalesced_slm_size_bytes(const int k_tiles_per_block) {
 }
 
 int col_coalesced_m_tiles_per_block(const int num_tiles_m) {
-  return std::min(COL_COALESCED_M_TILES_PER_BLOCK, std::max(1, num_tiles_m));
+  (void)num_tiles_m;
+  return 1;
 }
 
 bool use_blackwell_col_coalesced_swizzle(const size_t scale_elem_size) {
