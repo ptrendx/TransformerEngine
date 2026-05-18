@@ -41,8 +41,11 @@ constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr int ROW_COALESCED_THREADS = 256;
 constexpr int ROW_COALESCED_MIN_K = 32;
-constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 16;
-constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 72 * 1024;
+// Keep row-coalesced CTAs small enough to expose more independent memory work
+// on Blackwell. Large per-CTA M batching raised shared-memory residency and
+// serialized independent swizzle tiles in the benchmarked large cases.
+constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 4;
+constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 12 * 1024;
 constexpr int COL_COALESCED_THREADS = 256;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_WARP_TILE_WARPS = 8;
@@ -85,6 +88,17 @@ __device__ __forceinline__ void divmod_tile_col_v4(const int tile_idx, const int
     *row = tile_idx / row_v4;
     *col_v4 = tile_idx - *row * row_v4;
   }
+}
+
+__host__ __device__ constexpr int row_coalesced_smem_pad_i32(const int k_i32) {
+  // K_i32==8/16 correspond to 32/64 scale columns. A +1 pitch causes repeated
+  // shared-store bank hits for the row-major loading warp; +3 keeps shared reads
+  // conflict-free while spreading the stores across more banks.
+  return (k_i32 == 8 || k_i32 == 16) ? 3 : 1;
+}
+
+__host__ __device__ constexpr int row_coalesced_smem_stride_i32(const int k_i32) {
+  return k_i32 + row_coalesced_smem_pad_i32(k_i32);
 }
 
 __device__ __forceinline__ void transpose_4x4_bytes(const int32_t a, const int32_t b,
@@ -663,7 +677,7 @@ __device__ void swizzle_row_scaling_coalesced_tile_impl(const void* input, void*
   const int row_v4 = K / static_cast<int>(sizeof(int4));
   const int tile_v4 = SF_TILE_DIM_M * row_v4;
   const int K_i32 = K / static_cast<int>(sizeof(int));
-  const int smem_stride_i32 = K_i32 + 1;
+  const int smem_stride_i32 = row_coalesced_smem_stride_i32(K_i32);
   const int global_m = m_tile * SF_TILE_DIM_M;
   const bool row_v4_is_pow2 = (row_v4 & (row_v4 - 1)) == 0;
   const int row_v4_log2 = __ffs(row_v4) - 1;
@@ -725,7 +739,7 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
   const int row_v4 = K / static_cast<int>(sizeof(int4));
   const int tile_v4 = SF_TILE_DIM_M * row_v4;
   const int K_i32 = K / static_cast<int>(sizeof(int));
-  const int smem_stride_i32 = K_i32 + 1;
+  const int smem_stride_i32 = row_coalesced_smem_stride_i32(K_i32);
   const int smem_tile_i32 = SF_TILE_DIM_M * smem_stride_i32;
   const int num_m_tiles = M / SF_TILE_DIM_M;
   const int remaining_m_tiles = num_m_tiles - first_m_tile;
@@ -1138,8 +1152,13 @@ int row_swizzle_m_tiles_per_block(const int num_tiles_k, const int reserved_smem
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 int row_coalesced_slm_size_bytes(const int padded_k, const size_t scale_elem_size) {
-  return SF_TILE_DIM_M * (padded_k + static_cast<int>(sizeof(int))) *
-         static_cast<int>(scale_elem_size);
+  if (scale_elem_size != sizeof(uint8_t)) {
+    return SF_TILE_DIM_M * (padded_k + static_cast<int>(sizeof(int))) *
+           static_cast<int>(scale_elem_size);
+  }
+  const int k_i32 = padded_k / static_cast<int>(sizeof(int));
+  return SF_TILE_DIM_M * row_coalesced_smem_stride_i32(k_i32) *
+         static_cast<int>(sizeof(int));
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
