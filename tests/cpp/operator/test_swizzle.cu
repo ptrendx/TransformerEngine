@@ -325,6 +325,26 @@ TEST_P(SwizzleTestSuite, TestSwizzle) {
                        transa);
 }
 
+TEST(SwizzleFullTileFastPathTest, TestSwizzleMXFP8RegularFullTileFastPaths) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell full-tile swizzle fast paths require Blackwell or newer.";
+  }
+
+  // Rowwise K=1024 gives 32 scale columns and selects the M_TILES_PER_BLOCK=8
+  // full-M path when M has 8 swizzle tiles.
+  performTestSwizzle1D(/*num_tiles_M=*/8, /*num_tiles_K=*/8,
+                       /*rowwise=*/true, /*columnwise=*/false, /*transa=*/true);
+
+  // Rowwise K=2048 gives 64 scale columns and selects the M_TILES_PER_BLOCK=5
+  // full-M path when M has 5 swizzle tiles.
+  performTestSwizzle1D(/*num_tiles_M=*/5, /*num_tiles_K=*/16,
+                       /*rowwise=*/true, /*columnwise=*/false, /*transa=*/true);
+
+  // Columnwise M=4096, K=128 has no M/K padding and 32 coalesced K tile blocks.
+  performTestSwizzle1D(/*num_tiles_M=*/32, /*num_tiles_K=*/1,
+                       /*rowwise=*/false, /*columnwise=*/true, /*transa=*/true);
+}
+
 class UnswizzleTestSuite : public ::testing::TestWithParam<std::tuple<std::pair<size_t, size_t>, std::pair<bool, bool>, bool>> {};
 
 TEST_P(UnswizzleTestSuite, TestUnswizzle) {
@@ -664,6 +684,26 @@ TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableAligne
   performTestGroupedSwizzleMXFP8Variable(shapes);
 }
 
+TEST(SwizzleGroupedVariablePersistentTest,
+     TestGroupedSwizzleMXFP8VariableAlignedStackedFullM32And64ScaleColumns) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell aligned-stacked full-M swizzle requires Blackwell or newer.";
+  }
+
+  const std::vector<std::vector<std::pair<size_t, size_t>>> shape_sets{
+      // Total stacked M tiles = 8, so K=1024/32=32 scale columns reaches the
+      // M_TILES_PER_BLOCK=8 full-M branch.
+      {{2 * MAT_TILE_DIM_M, 1024}, {6 * MAT_TILE_DIM_M, 1024}},
+      // Total stacked M tiles = 5, so K=2048/32=64 scale columns reaches the
+      // M_TILES_PER_BLOCK=5 full-M branch.
+      {{2 * MAT_TILE_DIM_M, 2048}, {3 * MAT_TILE_DIM_M, 2048}},
+  };
+
+  for (const auto& shapes : shape_sets) {
+    performTestGroupedSwizzleMXFP8Variable(shapes);
+  }
+}
+
 TEST(SwizzleGroupedVariableSharedMemoryTest,
      TestGroupedSwizzleMXFP8VariableRowCoalescedSharedMemoryBoundary) {
   if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
@@ -849,6 +889,24 @@ TEST_P(SwizzleGroupedTestSuite, TestGroupedSwizzleMXFP8) {
   const auto M = std::get<1>(GetParam());
   const auto K = std::get<2>(GetParam());
   performTestGroupedSwizzleMXFP8(num_tensors, M, K);
+}
+
+TEST(SwizzleGroupedFullTileFastPathTest, TestGroupedSwizzleMXFP8UniformFullTileFastPaths) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell grouped full-tile swizzle fast paths require Blackwell or newer.";
+  }
+
+  // Grouped-uniform rowwise K=1024/2048 selects the 32/64-scale-column full-M
+  // row-coalesced branches when M has 8 or 5 swizzle tiles respectively.
+  performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/8 * MAT_TILE_DIM_M,
+                                 /*K=*/1024);
+  performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/5 * MAT_TILE_DIM_M,
+                                 /*K=*/2048);
+
+  // Grouped-uniform columnwise full-tile branch: no padding and 32 coalesced K
+  // tile blocks in the scale matrix.
+  performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/32 * MAT_TILE_DIM_M,
+                                 /*K=*/MAT_TILE_DIM_M);
 }
 
 INSTANTIATE_TEST_SUITE_P(
