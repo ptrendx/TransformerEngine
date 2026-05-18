@@ -638,7 +638,7 @@ TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReu
 
 TEST(SwizzleGroupedVariableSharedMemoryTest,
      TestGroupedSwizzleMXFP8VariableRowCoalescedMetadataBoundary) {
-  if (getDeviceComputeCapability() < blackwellComputeCapability) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
     GTEST_SKIP() << "Row-coalesced grouped variable swizzle requires Blackwell or newer.";
   }
 
@@ -727,7 +727,7 @@ TEST(SwizzleGroupedVariableSharedMemoryTest,
 
   const size_t padded_scale_k = boundary_num_tiles_k * scale_tile_k;
   size_t original_scale_k = padded_scale_k;
-  if (getDeviceComputeCapability() >= blackwellComputeCapability &&
+  if (test::getDeviceComputeCapability() >= test::blackwellComputeCapability &&
       padded_scale_k >= row_coalesced_min_k &&
       padded_scale_k % row_coalesced_k_alignment == 0) {
     original_scale_k = padded_scale_k - 1;
@@ -745,7 +745,7 @@ TEST(SwizzleGroupedVariableSharedMemoryTest,
 
 TEST(SwizzleGroupedVariableSharedMemoryTest,
      TestGroupedSwizzleMXFP8VariableColumnNarrowMMetadataBoundary) {
-  if (getDeviceComputeCapability() >= blackwellComputeCapability) {
+  if (test::getDeviceComputeCapability() >= test::blackwellComputeCapability) {
     GTEST_SKIP() << "Blackwell byte-scale columnwise swizzle uses the coalesced path.";
   }
 
