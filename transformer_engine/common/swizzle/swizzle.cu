@@ -41,7 +41,8 @@ constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr int ROW_COALESCED_THREADS = 256;
 constexpr int ROW_COALESCED_MIN_K = 32;
-constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 4;
+constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 16;
+constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 72 * 1024;
 constexpr int COL_COALESCED_THREADS = 256;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_WARP_TILE_WARPS = 8;
@@ -58,6 +59,31 @@ void set_dynamic_smem_if_needed(Kernel kernel_fn, int slm_size, int& cached_smem
     NVTE_CHECK_CUDA(
         cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, slm_size));
     cached_smem_size = slm_size;
+  }
+}
+
+__device__ __forceinline__ void store_global_cs(int4* ptr, const int4 value) {
+  asm volatile("st.global.cs.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x),
+               "r"(value.y), "r"(value.z), "r"(value.w)
+               : "memory");
+}
+
+__device__ __forceinline__ void store_global_cs(uint4* ptr, const uint4 value) {
+  asm volatile("st.global.cs.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x),
+               "r"(value.y), "r"(value.z), "r"(value.w)
+               : "memory");
+}
+
+__device__ __forceinline__ void divmod_tile_col_v4(const int tile_idx, const int row_v4,
+                                                   const bool row_v4_is_pow2,
+                                                   const int row_v4_log2, int* row,
+                                                   int* col_v4) {
+  if (row_v4_is_pow2) {
+    *row = tile_idx >> row_v4_log2;
+    *col_v4 = tile_idx & (row_v4 - 1);
+  } else {
+    *row = tile_idx / row_v4;
+    *col_v4 = tile_idx - *row * row_v4;
   }
 }
 
@@ -633,19 +659,23 @@ __device__ void swizzle_row_scaling_coalesced_tile_impl(const void* input, void*
                                                         const int m_tile, int4* slm_v4i) {
   (void)M;
   constexpr int SF_TILE_SIZE = SF_TILE_DIM_M * SF_TILE_DIM_K;
+  constexpr int TILE_OUTPUT_V4 = SF_TILE_SIZE / static_cast<int>(sizeof(int4));
   const int row_v4 = K / static_cast<int>(sizeof(int4));
   const int tile_v4 = SF_TILE_DIM_M * row_v4;
   const int K_i32 = K / static_cast<int>(sizeof(int));
   const int smem_stride_i32 = K_i32 + 1;
   const int global_m = m_tile * SF_TILE_DIM_M;
+  const bool row_v4_is_pow2 = (row_v4 & (row_v4 - 1)) == 0;
+  const int row_v4_log2 = __ffs(row_v4) - 1;
 
   const int4* input_v4 = reinterpret_cast<const int4*>(input);
   const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
   int* slm_i32 = reinterpret_cast<int*>(slm_v4i);
 
   for (int idx = threadIdx.x; idx < tile_v4; idx += blockDim.x) {
-    const int row = idx / row_v4;
-    const int col_i32 = (idx - row * row_v4) * static_cast<int>(sizeof(int4) / sizeof(int));
+    int row, col_v4;
+    divmod_tile_col_v4(idx, row_v4, row_v4_is_pow2, row_v4_log2, &row, &col_v4);
+    const int col_i32 = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
     int4 value;
     if (global_m + row < original_M) {
       value = __ldg(input_v4 + input_tile_v4 + idx);
@@ -665,13 +695,14 @@ __device__ void swizzle_row_scaling_coalesced_tile_impl(const void* input, void*
       reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(global_m) * K);
 
   for (int idx = threadIdx.x; idx < tile_v4; idx += blockDim.x) {
-    const int tile_k = idx / (SF_TILE_SIZE / static_cast<int>(sizeof(int4)));
-    const int row_in_new_tile = idx % (SF_TILE_SIZE / static_cast<int>(sizeof(int4)));
+    const int tile_k = idx / TILE_OUTPUT_V4;
+    const int row_in_new_tile = idx - tile_k * TILE_OUTPUT_V4;
     const int smem_base = row_in_new_tile * smem_stride_i32 + tile_k;
-    output_v4[idx] =
+    const int4 value =
         make_int4(slm_read_i32[smem_base], slm_read_i32[smem_base + 32 * smem_stride_i32],
                   slm_read_i32[smem_base + 64 * smem_stride_i32],
                   slm_read_i32[smem_base + 96 * smem_stride_i32]);
+    store_global_cs(output_v4 + idx, value);
   }
 }
 
@@ -690,6 +721,7 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
     const int first_m_tile, const int m_tiles_per_block, int4* slm_v4i) {
   (void)M;
   constexpr int SF_TILE_SIZE = SF_TILE_DIM_M * SF_TILE_DIM_K;
+  constexpr int TILE_OUTPUT_V4 = SF_TILE_SIZE / static_cast<int>(sizeof(int4));
   const int row_v4 = K / static_cast<int>(sizeof(int4));
   const int tile_v4 = SF_TILE_DIM_M * row_v4;
   const int K_i32 = K / static_cast<int>(sizeof(int));
@@ -704,46 +736,52 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
 
   const int4* input_v4 = reinterpret_cast<const int4*>(input);
   int* slm_i32 = reinterpret_cast<int*>(slm_v4i);
+  const bool row_v4_is_pow2 = (row_v4 & (row_v4 - 1)) == 0;
+  const int row_v4_log2 = __ffs(row_v4) - 1;
 
-  for (int idx = threadIdx.x; idx < active_m_tiles * tile_v4; idx += blockDim.x) {
-    const int local_m_tile = idx / tile_v4;
-    const int tile_idx = idx - local_m_tile * tile_v4;
-    const int row = tile_idx / row_v4;
-    const int col_i32 = (tile_idx - row * row_v4) * static_cast<int>(sizeof(int4) / sizeof(int));
+  for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
     const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
-
-    int4 value;
-    if (global_m + row < original_M) {
-      const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
-      value = __ldg(input_v4 + input_tile_v4 + tile_idx);
-    } else {
-      value = make_int4(0, 0, 0, 0);
-    }
-
+    const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
     int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
-    const int smem_base = row * smem_stride_i32 + col_i32;
-    smem_tile[smem_base + 0] = value.x;
-    smem_tile[smem_base + 1] = value.y;
-    smem_tile[smem_base + 2] = value.z;
-    smem_tile[smem_base + 3] = value.w;
+
+    for (int tile_idx = threadIdx.x; tile_idx < tile_v4; tile_idx += blockDim.x) {
+      int row, col_v4;
+      divmod_tile_col_v4(tile_idx, row_v4, row_v4_is_pow2, row_v4_log2, &row, &col_v4);
+      const int col_i32 = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
+
+      int4 value;
+      if (global_m + row < original_M) {
+        value = __ldg(input_v4 + input_tile_v4 + tile_idx);
+      } else {
+        value = make_int4(0, 0, 0, 0);
+      }
+
+      const int smem_base = row * smem_stride_i32 + col_i32;
+      smem_tile[smem_base + 0] = value.x;
+      smem_tile[smem_base + 1] = value.y;
+      smem_tile[smem_base + 2] = value.z;
+      smem_tile[smem_base + 3] = value.w;
+    }
   }
   __syncthreads();
 
   const int* slm_read_i32 = reinterpret_cast<const int*>(slm_v4i);
-  for (int idx = threadIdx.x; idx < active_m_tiles * tile_v4; idx += blockDim.x) {
-    const int local_m_tile = idx / tile_v4;
-    const int tile_idx = idx - local_m_tile * tile_v4;
-    const int tile_k = tile_idx / (SF_TILE_SIZE / static_cast<int>(sizeof(int4)));
-    const int row_in_new_tile = tile_idx % (SF_TILE_SIZE / static_cast<int>(sizeof(int4)));
-    const int smem_base = local_m_tile * smem_tile_i32 + row_in_new_tile * smem_stride_i32 +
-                          tile_k;
+  for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
     const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
     int4* output_v4 = reinterpret_cast<int4*>(
         reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(global_m) * K);
-    output_v4[tile_idx] =
-        make_int4(slm_read_i32[smem_base], slm_read_i32[smem_base + 32 * smem_stride_i32],
-                  slm_read_i32[smem_base + 64 * smem_stride_i32],
-                  slm_read_i32[smem_base + 96 * smem_stride_i32]);
+
+    for (int tile_idx = threadIdx.x; tile_idx < tile_v4; tile_idx += blockDim.x) {
+      const int tile_k = tile_idx / TILE_OUTPUT_V4;
+      const int row_in_new_tile = tile_idx - tile_k * TILE_OUTPUT_V4;
+      const int smem_base = local_m_tile * smem_tile_i32 + row_in_new_tile * smem_stride_i32 +
+                            tile_k;
+      const int4 value =
+          make_int4(slm_read_i32[smem_base], slm_read_i32[smem_base + 32 * smem_stride_i32],
+                    slm_read_i32[smem_base + 64 * smem_stride_i32],
+                    slm_read_i32[smem_base + 96 * smem_stride_i32]);
+      store_global_cs(output_v4 + tile_idx, value);
+    }
   }
 }
 
@@ -854,7 +892,7 @@ __device__ void swizzle_col_scaling_coalesced_tile_impl(
       }
       value_words[m_group] = word;
     }
-    output_v4[idx] = value;
+    store_global_cs(output_v4 + idx, value);
   }
 }
 
@@ -906,8 +944,8 @@ __device__ void swizzle_col_scaling_warp_tile_impl(const void* input, void* outp
     output_words[m_group] = word;
   }
 
-  output_v4[lane] =
-      make_uint4(output_words[0], output_words[1], output_words[2], output_words[3]);
+  store_global_cs(output_v4 + lane,
+                  make_uint4(output_words[0], output_words[1], output_words[2], output_words[3]));
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
@@ -1111,7 +1149,10 @@ int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_
       row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(padded_k, scale_elem_size);
   const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
   if (slm_size > available_smem) return 0;
-  return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK, available_smem / slm_size);
+  const int smem_limited_tiles = available_smem / slm_size;
+  const int target_smem_tiles = std::max(1, ROW_COALESCED_TARGET_SMEM_BYTES / slm_size);
+  return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK,
+                  std::min(smem_limited_tiles, target_smem_tiles));
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
