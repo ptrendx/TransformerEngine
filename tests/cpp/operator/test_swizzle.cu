@@ -631,7 +631,7 @@ TEST(SwizzleGroupedVariableTest, TestGroupedSwizzleMXFP8VariableRowwise32And64Sc
   }
 }
 
-TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReuse) {
+TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableDirectGridLargeWork) {
   int device = 0;
   NVTE_CHECK_CUDA(cudaGetDevice(&device));
   int sm_count = 0;
@@ -652,7 +652,7 @@ TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReu
 }
 
 TEST(SwizzleGroupedVariableSharedMemoryTest,
-     TestGroupedSwizzleMXFP8VariableRowCoalescedMetadataBoundary) {
+     TestGroupedSwizzleMXFP8VariableRowCoalescedSharedMemoryBoundary) {
   if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
     GTEST_SKIP() << "Row-coalesced grouped variable swizzle requires Blackwell or newer.";
   }
@@ -667,7 +667,6 @@ TEST(SwizzleGroupedVariableSharedMemoryTest,
   constexpr size_t scale_tile_m = 128;
   constexpr size_t row_coalesced_min_k = 32;
   constexpr size_t row_coalesced_k_alignment = sizeof(int4);
-  constexpr size_t variable_metadata_bytes = 16;
   const size_t max_scale_elems = static_cast<size_t>(max_smem) / scale_tile_m;
   if (max_scale_elems <= sizeof(int)) {
     GTEST_SKIP() << "Opt-in shared memory is too small for row-coalesced boundary coverage.";
@@ -680,7 +679,7 @@ TEST(SwizzleGroupedVariableSharedMemoryTest,
   while (padded_scale_k >= row_coalesced_min_k) {
     const size_t slm_size = scale_tile_m * (padded_scale_k + sizeof(int));
     if (slm_size <= static_cast<size_t>(max_smem) &&
-        slm_size + variable_metadata_bytes > static_cast<size_t>(max_smem)) {
+        slm_size + scale_tile_m * row_coalesced_k_alignment > static_cast<size_t>(max_smem)) {
       boundary_padded_scale_k = padded_scale_k;
       break;
     }
@@ -815,7 +814,7 @@ INSTANTIATE_TEST_SUITE_P(
     // Case 3: Mixed small/irregular shapes.
     std::vector<std::pair<size_t, size_t>>{{200, 160}, {33, 64}, {1, 32}},
 
-    // Case 4: Large workload to verify persistent grid
+    // Case 4: Large workload to verify multi-wave grouped-variable launch mapping.
     std::vector<std::pair<size_t, size_t>>(10, {4096, 4096}),
 
     // Case 5: Variable M, Uniform K (Semi-variable)
