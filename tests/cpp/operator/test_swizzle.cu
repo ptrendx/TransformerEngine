@@ -340,7 +340,7 @@ TEST(SwizzleFullTileFastPathTest, TestSwizzleMXFP8RegularFullTileFastPaths) {
   performTestSwizzle1D(/*num_tiles_M=*/5, /*num_tiles_K=*/16,
                        /*rowwise=*/true, /*columnwise=*/false, /*transa=*/true);
 
-  // Columnwise M=4096, K=128 has no M/K padding and 32 coalesced K tile blocks.
+  // Columnwise M=4096, K=128 has no M/K padding and 32 warp-block K tile groups.
   performTestSwizzle1D(/*num_tiles_M=*/32, /*num_tiles_K=*/1,
                        /*rowwise=*/false, /*columnwise=*/true, /*transa=*/true);
 }
@@ -903,8 +903,8 @@ TEST(SwizzleGroupedFullTileFastPathTest, TestGroupedSwizzleMXFP8UniformFullTileF
   performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/5 * MAT_TILE_DIM_M,
                                  /*K=*/2048);
 
-  // Grouped-uniform columnwise full-tile branch: no padding and 32 coalesced K
-  // tile blocks in the scale matrix.
+  // Grouped-uniform columnwise full-tile branch: no padding and 32 warp-block K
+  // tile groups in the scale matrix.
   performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/32 * MAT_TILE_DIM_M,
                                  /*K=*/MAT_TILE_DIM_M);
 }
