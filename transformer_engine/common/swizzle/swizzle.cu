@@ -42,10 +42,12 @@ constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr int ROW_COALESCED_THREADS = 256;
 constexpr int ROW_COALESCED_MIN_K = 32;
 // Keep row-coalesced CTAs small enough to expose more independent memory work
-// on Blackwell. Large per-CTA M batching raised shared-memory residency and
-// serialized independent swizzle tiles in the benchmarked large cases.
+// on Blackwell, while still batching the 32/64-scale-column cases enough to
+// issue independent global loads before the shared-memory permutation consumes
+// them.
 constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 4;
-constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 12 * 1024;
+constexpr int ROW_COALESCED_TARGET_SMEM_BYTES = 24 * 1024;
+constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
 constexpr int COL_COALESCED_THREADS = 256;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_WARP_TILE_WARPS = 8;
@@ -119,6 +121,14 @@ __host__ __device__ constexpr int row_coalesced_smem_physical_row(const int row)
   // Permute rows within each 32-row group so row-major int4 stores and the
   // later swizzled reads both address unique banks with the odd shared pitch.
   return (row & ~31) + (row & 3) + ((row & 12) << 1) + ((row & 16) >> 2);
+}
+
+__device__ __forceinline__ void store_row_coalesced_smem(int* smem_tile, const int smem_base,
+                                                         const int4 value) {
+  smem_tile[smem_base + 0] = value.x;
+  smem_tile[smem_base + 1] = value.y;
+  smem_tile[smem_base + 2] = value.z;
+  smem_tile[smem_base + 3] = value.w;
 }
 
 __device__ __forceinline__ void transpose_4x4_bytes(const int32_t a, const int32_t b,
@@ -717,10 +727,7 @@ __device__ void swizzle_row_scaling_coalesced_tile_impl(const void* input, void*
       value = make_int4(0, 0, 0, 0);
     }
     const int smem_base = row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32;
-    slm_i32[smem_base + 0] = value.x;
-    slm_i32[smem_base + 1] = value.y;
-    slm_i32[smem_base + 2] = value.z;
-    slm_i32[smem_base + 3] = value.w;
+    store_row_coalesced_smem(slm_i32, smem_base, value);
   }
   __syncthreads();
 
@@ -774,28 +781,79 @@ __device__ void swizzle_row_scaling_coalesced_batched_m_impl(
   const bool row_v4_is_pow2 = (row_v4 & (row_v4 - 1)) == 0;
   const int row_v4_log2 = __ffs(row_v4) - 1;
 
-  for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
-    const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
-    const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
-    int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
+  for (int tile_idx_base = threadIdx.x; tile_idx_base < tile_v4;
+       tile_idx_base += blockDim.x * ROW_COALESCED_LOAD_PREFETCH) {
+    int rows[ROW_COALESCED_LOAD_PREFETCH];
+    int col_i32s[ROW_COALESCED_LOAD_PREFETCH];
+    bool valid[ROW_COALESCED_LOAD_PREFETCH];
 
-    for (int tile_idx = threadIdx.x; tile_idx < tile_v4; tile_idx += blockDim.x) {
-      int row, col_v4;
-      divmod_tile_col_v4(tile_idx, row_v4, row_v4_is_pow2, row_v4_log2, &row, &col_v4);
-      const int col_i32 = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
+#pragma unroll
+    for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+      const int tile_idx = tile_idx_base + prefetch * blockDim.x;
+      valid[prefetch] = tile_idx < tile_v4;
+      if (valid[prefetch]) {
+        int col_v4;
+        divmod_tile_col_v4(tile_idx, row_v4, row_v4_is_pow2, row_v4_log2, &rows[prefetch],
+                           &col_v4);
+        col_i32s[prefetch] = col_v4 * static_cast<int>(sizeof(int4) / sizeof(int));
+      }
+    }
 
-      int4 value;
-      if (global_m + row < original_M) {
-        value = load_global_cs(input_v4 + input_tile_v4 + tile_idx);
-      } else {
-        value = make_int4(0, 0, 0, 0);
+    if (tile_v4 <= blockDim.x && active_m_tiles > 1) {
+      int4 values[ROW_COALESCED_MAX_M_TILES_PER_BLOCK];
+      const int row = rows[0];
+      const int col_i32 = col_i32s[0];
+      const int tile_idx = tile_idx_base;
+      const int smem_base = row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32;
+
+#pragma unroll
+      for (int local_m_tile = 0; local_m_tile < ROW_COALESCED_MAX_M_TILES_PER_BLOCK;
+           ++local_m_tile) {
+        if (local_m_tile < active_m_tiles) {
+          const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
+          const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
+          values[local_m_tile] = (global_m + row < original_M)
+                                     ? load_global_cs(input_v4 + input_tile_v4 + tile_idx)
+                                     : make_int4(0, 0, 0, 0);
+        }
       }
 
-      const int smem_base = row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32;
-      smem_tile[smem_base + 0] = value.x;
-      smem_tile[smem_base + 1] = value.y;
-      smem_tile[smem_base + 2] = value.z;
-      smem_tile[smem_base + 3] = value.w;
+#pragma unroll
+      for (int local_m_tile = 0; local_m_tile < ROW_COALESCED_MAX_M_TILES_PER_BLOCK;
+           ++local_m_tile) {
+        if (local_m_tile < active_m_tiles) {
+          int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
+          store_row_coalesced_smem(smem_tile, smem_base, values[local_m_tile]);
+        }
+      }
+    } else {
+      for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
+        const int global_m = (first_m_tile + local_m_tile) * SF_TILE_DIM_M;
+        const size_t input_tile_v4 = static_cast<size_t>(global_m) * row_v4;
+        int* smem_tile = slm_i32 + local_m_tile * smem_tile_i32;
+        int4 values[ROW_COALESCED_LOAD_PREFETCH];
+
+#pragma unroll
+        for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+          if (valid[prefetch]) {
+            const int row = rows[prefetch];
+            const int tile_idx = tile_idx_base + prefetch * blockDim.x;
+            values[prefetch] = (global_m + row < original_M)
+                                   ? load_global_cs(input_v4 + input_tile_v4 + tile_idx)
+                                   : make_int4(0, 0, 0, 0);
+          }
+        }
+
+#pragma unroll
+        for (int prefetch = 0; prefetch < ROW_COALESCED_LOAD_PREFETCH; ++prefetch) {
+          if (valid[prefetch]) {
+            const int row = rows[prefetch];
+            const int smem_base =
+                row_coalesced_smem_physical_row(row) * smem_stride_i32 + col_i32s[prefetch];
+            store_row_coalesced_smem(smem_tile, smem_base, values[prefetch]);
+          }
+        }
+      }
     }
   }
   __syncthreads();
