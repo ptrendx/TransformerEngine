@@ -45,6 +45,7 @@ constexpr int ROW_COALESCED_MIN_K = 32;
 // scale-column cases need deeper M batching to expose independent global loads,
 // while wide scale-column cases were faster with smaller CTAs.
 constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 8;
+constexpr int ROW_COALESCED_32COL_TARGET_SMEM_BYTES = 18 * 1024;
 constexpr int ROW_COALESCED_NARROW_TARGET_SMEM_BYTES = 48 * 1024;
 constexpr int ROW_COALESCED_WIDE_TARGET_SMEM_BYTES = 24 * 1024;
 constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
@@ -1398,8 +1399,12 @@ int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_
   const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
   if (slm_size > available_smem) return 0;
   const int smem_limited_tiles = available_smem / slm_size;
-  const int target_smem_bytes = padded_k <= 64 ? ROW_COALESCED_NARROW_TARGET_SMEM_BYTES
-                                               : ROW_COALESCED_WIDE_TARGET_SMEM_BYTES;
+  // The common 32-scale-column path was limited by register/shared-memory pressure
+  // with 8 M-tiles per CTA. Use a smaller full-M specialization there while keeping
+  // the previously tuned 64-column and wide-column choices.
+  const int target_smem_bytes = padded_k <= 32 ? ROW_COALESCED_32COL_TARGET_SMEM_BYTES
+                                : padded_k <= 64 ? ROW_COALESCED_NARROW_TARGET_SMEM_BYTES
+                                                 : ROW_COALESCED_WIDE_TARGET_SMEM_BYTES;
   const int target_smem_tiles = std::max(1, target_smem_bytes / slm_size);
   return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK,
                   std::min(smem_limited_tiles, target_smem_tiles));
@@ -1961,6 +1966,9 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
       const bool use_full_m_fast_path = original_M == m && num_tiles_m % m_tiles_per_block == 0;
       if (use_full_m_fast_path && m_tiles_per_block == 8) {
         launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 8>(
+            input_scale_inv_ptr, output_scale_inv_ptr, m, k, stream);
+      } else if (use_full_m_fast_path && m_tiles_per_block == 4) {
+        launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 4>(
             input_scale_inv_ptr, output_scale_inv_ptr, m, k, stream);
       } else if (use_full_m_fast_path && m_tiles_per_block == 5) {
         launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 5>(
@@ -3545,6 +3553,12 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
               input_ptr, output_ptr, static_cast<int>(padded_m), static_cast<int>(padded_k),
               input_stride_bytes, output_stride_bytes, static_cast<int>(input->num_tensors),
               stream);
+        } else if (use_full_m_fast_path && row_coalesced_m_tiles == 4) {
+          launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m<
+              SF_TILE_DIM_M, SF_TILE_DIM_K, 4>(
+              input_ptr, output_ptr, static_cast<int>(padded_m), static_cast<int>(padded_k),
+              input_stride_bytes, output_stride_bytes, static_cast<int>(input->num_tensors),
+              stream);
         } else if (use_full_m_fast_path && row_coalesced_m_tiles == 5) {
           launch_grouped_swizzle_row_scaling_uniform_shape_coalesced_full_m<
               SF_TILE_DIM_M, SF_TILE_DIM_K, 5>(
@@ -3692,6 +3706,10 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
           const bool use_full_m_fast_path = stacked_num_tiles_m % m_tiles_per_block == 0;
           if (use_full_m_fast_path && m_tiles_per_block == 8) {
             launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 8>(
+                input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
+                static_cast<int>(padded_k), stream);
+          } else if (use_full_m_fast_path && m_tiles_per_block == 4) {
+            launch_swizzle_row_scaling_coalesced_full_m<SF_TILE_DIM_M, SF_TILE_DIM_K, 4>(
                 input->scale_inv.dptr, output->scale_inv.dptr, static_cast<int>(stacked_m),
                 static_cast<int>(padded_k), stream);
           } else if (use_full_m_fast_path && m_tiles_per_block == 5) {
