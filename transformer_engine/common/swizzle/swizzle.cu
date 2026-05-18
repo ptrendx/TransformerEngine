@@ -1105,22 +1105,28 @@ int row_coalesced_slm_size_bytes(const int padded_k, const size_t scale_elem_siz
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
-int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_size) {
+int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_size,
+                                    const int reserved_smem_bytes = 0) {
   const int slm_size =
       row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(padded_k, scale_elem_size);
-  const int max_smem = get_max_dynamic_smem() - VARIABLE_SWIZZLE_METADATA_BYTES;
-  return std::max(
-      1, std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK, max_smem / slm_size));
+  const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
+  if (slm_size > available_smem) return 0;
+  return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK, available_smem / slm_size);
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 bool use_blackwell_row_coalesced_swizzle(const int padded_k, const int original_k,
-                                         const size_t scale_elem_size) {
+                                         const size_t scale_elem_size,
+                                         const int reserved_smem_bytes = 0) {
+  if (!(cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t) &&
+        original_k == padded_k && padded_k >= ROW_COALESCED_MIN_K &&
+        padded_k % static_cast<int>(sizeof(int4)) == 0)) {
+    return false;
+  }
   const int slm_size =
       row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(padded_k, scale_elem_size);
-  return cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t) && original_k == padded_k &&
-         padded_k >= ROW_COALESCED_MIN_K && padded_k % static_cast<int>(sizeof(int4)) == 0 &&
-         slm_size <= get_max_dynamic_smem();
+  const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
+  return slm_size <= available_smem;
 }
 
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
@@ -3290,12 +3296,14 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
       const size_t scale_elem_size = typeToSize(input->scale_inv.dtype);
       const int original_k = static_cast<int>(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)));
       if (use_blackwell_row_coalesced_swizzle<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-              static_cast<int>(padded_k), original_k, scale_elem_size)) {
+              static_cast<int>(padded_k), original_k, scale_elem_size,
+              VARIABLE_SWIZZLE_METADATA_BYTES)) {
         const int slm_size = row_coalesced_slm_size_bytes<SF_TILE_DIM_M, SF_TILE_DIM_K>(
             static_cast<int>(padded_k), scale_elem_size);
         const int m_tiles_per_block =
             row_coalesced_m_tiles_per_block<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-                static_cast<int>(padded_k), scale_elem_size);
+                static_cast<int>(padded_k), scale_elem_size,
+                VARIABLE_SWIZZLE_METADATA_BYTES);
         const int dynamic_smem_size =
             slm_size * m_tiles_per_block + VARIABLE_SWIZZLE_METADATA_BYTES;
         static int cached_variable_row_coalesced = -1;

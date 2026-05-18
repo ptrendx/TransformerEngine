@@ -635,6 +635,58 @@ TEST(SwizzleGroupedVariablePersistentTest, TestGroupedSwizzleMXFP8VariableCTAReu
   performTestGroupedSwizzleMXFP8Variable(shapes);
 }
 
+TEST(SwizzleGroupedVariableSharedMemoryTest,
+     TestGroupedSwizzleMXFP8VariableRowCoalescedMetadataBoundary) {
+  if (getDeviceComputeCapability() < blackwellComputeCapability) {
+    GTEST_SKIP() << "Row-coalesced grouped variable swizzle requires Blackwell or newer.";
+  }
+
+  int device = 0;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device));
+  int max_smem = 0;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&max_smem,
+                                         cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                         device));
+
+  constexpr size_t scale_tile_m = 128;
+  constexpr size_t row_coalesced_min_k = 32;
+  constexpr size_t row_coalesced_k_alignment = sizeof(int4);
+  constexpr size_t variable_metadata_bytes = 16;
+  const size_t max_scale_elems = static_cast<size_t>(max_smem) / scale_tile_m;
+  if (max_scale_elems <= sizeof(int)) {
+    GTEST_SKIP() << "Opt-in shared memory is too small for row-coalesced boundary coverage.";
+  }
+
+  size_t padded_scale_k =
+      ((max_scale_elems - sizeof(int)) / row_coalesced_k_alignment) *
+      row_coalesced_k_alignment;
+  size_t boundary_padded_scale_k = 0;
+  while (padded_scale_k >= row_coalesced_min_k) {
+    const size_t slm_size = scale_tile_m * (padded_scale_k + sizeof(int));
+    if (slm_size <= static_cast<size_t>(max_smem) &&
+        slm_size + variable_metadata_bytes > static_cast<size_t>(max_smem)) {
+      boundary_padded_scale_k = padded_scale_k;
+      break;
+    }
+    if (padded_scale_k < row_coalesced_min_k + row_coalesced_k_alignment) {
+      break;
+    }
+    padded_scale_k -= row_coalesced_k_alignment;
+  }
+
+  if (boundary_padded_scale_k == 0) {
+    GTEST_SKIP() << "No aligned common K reaches the row-coalesced metadata boundary.";
+  }
+
+  const size_t k_dim = boundary_padded_scale_k * MXFP8_BLOCK_SIZE;
+  const std::vector<std::pair<size_t, size_t>> shapes{
+      {MAT_TILE_DIM_M, k_dim},
+      {2 * MAT_TILE_DIM_M, k_dim},
+  };
+
+  performTestGroupedSwizzleMXFP8Variable(shapes);
+}
+
 INSTANTIATE_TEST_SUITE_P(
   OperatorTest,
   SwizzleGroupedVariableTestSuite,
