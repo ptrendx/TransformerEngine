@@ -41,10 +41,11 @@ constexpr __device__ __host__ int NEW_SF_TILE_DIM_K = 16;
 constexpr __device__ __host__ int N_SF_PER_TD_PER_TILE = 4;
 constexpr int ROW_COALESCED_THREADS = 256;
 constexpr int ROW_COALESCED_MIN_K = 32;
-// Keep row-coalesced CTAs small enough for occupancy on Blackwell. Narrow
-// scale-column cases need deeper M batching to expose independent global loads,
-// while wide scale-column cases were faster with smaller CTAs.
+// Keep row-coalesced CTAs small enough for occupancy on Blackwell. The 32-column
+// path is MIO/shared-memory pressure sensitive, so it uses a smaller batch than
+// the 64-column case while still batching enough M tiles to amortize CTA setup.
 constexpr int ROW_COALESCED_MAX_M_TILES_PER_BLOCK = 8;
+constexpr int ROW_COALESCED_32COL_TARGET_SMEM_BYTES = 18 * 1024;
 constexpr int ROW_COALESCED_NARROW_TARGET_SMEM_BYTES = 48 * 1024;
 constexpr int ROW_COALESCED_WIDE_TARGET_SMEM_BYTES = 24 * 1024;
 constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
@@ -1459,8 +1460,9 @@ int row_coalesced_m_tiles_per_block(const int padded_k, const size_t scale_elem_
   const int available_smem = get_max_dynamic_smem() - reserved_smem_bytes;
   if (slm_size > available_smem) return 0;
   const int smem_limited_tiles = available_smem / slm_size;
-  const int target_smem_bytes = padded_k <= 64 ? ROW_COALESCED_NARROW_TARGET_SMEM_BYTES
-                                               : ROW_COALESCED_WIDE_TARGET_SMEM_BYTES;
+  const int target_smem_bytes = padded_k <= 32 ? ROW_COALESCED_32COL_TARGET_SMEM_BYTES
+                                : padded_k <= 64 ? ROW_COALESCED_NARROW_TARGET_SMEM_BYTES
+                                                 : ROW_COALESCED_WIDE_TARGET_SMEM_BYTES;
   const int target_smem_tiles = std::max(1, target_smem_bytes / slm_size);
   return std::min(ROW_COALESCED_MAX_M_TILES_PER_BLOCK,
                   std::min(smem_limited_tiles, target_smem_tiles));

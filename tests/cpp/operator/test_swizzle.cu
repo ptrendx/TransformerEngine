@@ -330,9 +330,9 @@ TEST(SwizzleFullTileFastPathTest, TestSwizzleMXFP8RegularFullTileFastPaths) {
     GTEST_SKIP() << "Blackwell full-tile swizzle fast paths require Blackwell or newer.";
   }
 
-  // Rowwise K=1024 gives 32 scale columns and selects the M_TILES_PER_BLOCK=8
-  // full-M path when M has 8 swizzle tiles.
-  performTestSwizzle1D(/*num_tiles_M=*/8, /*num_tiles_K=*/8,
+  // Rowwise K=1024 gives 32 scale columns and selects the M_TILES_PER_BLOCK=4
+  // full-M path when M has 4 swizzle tiles.
+  performTestSwizzle1D(/*num_tiles_M=*/4, /*num_tiles_K=*/8,
                        /*rowwise=*/true, /*columnwise=*/false, /*transa=*/true);
 
   // Rowwise K=2048 gives 64 scale columns and selects the M_TILES_PER_BLOCK=5
@@ -691,9 +691,9 @@ TEST(SwizzleGroupedVariablePersistentTest,
   }
 
   const std::vector<std::vector<std::pair<size_t, size_t>>> shape_sets{
-      // Total stacked M tiles = 8, so K=1024/32=32 scale columns reaches the
-      // M_TILES_PER_BLOCK=8 full-M branch.
-      {{2 * MAT_TILE_DIM_M, 1024}, {6 * MAT_TILE_DIM_M, 1024}},
+      // Total stacked M tiles = 4, so K=1024/32=32 scale columns reaches the
+      // M_TILES_PER_BLOCK=4 full-M branch.
+      {{1 * MAT_TILE_DIM_M, 1024}, {3 * MAT_TILE_DIM_M, 1024}},
       // Total stacked M tiles = 5, so K=2048/32=64 scale columns reaches the
       // M_TILES_PER_BLOCK=5 full-M branch.
       {{2 * MAT_TILE_DIM_M, 2048}, {3 * MAT_TILE_DIM_M, 2048}},
@@ -897,8 +897,8 @@ TEST(SwizzleGroupedFullTileFastPathTest, TestGroupedSwizzleMXFP8UniformFullTileF
   }
 
   // Grouped-uniform rowwise K=1024/2048 selects the 32/64-scale-column full-M
-  // row-coalesced branches when M has 8 or 5 swizzle tiles respectively.
-  performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/8 * MAT_TILE_DIM_M,
+  // row-coalesced branches when M has 4 or 5 swizzle tiles respectively.
+  performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/4 * MAT_TILE_DIM_M,
                                  /*K=*/1024);
   performTestGroupedSwizzleMXFP8(/*num_tensors=*/3, /*M=*/5 * MAT_TILE_DIM_M,
                                  /*K=*/2048);
