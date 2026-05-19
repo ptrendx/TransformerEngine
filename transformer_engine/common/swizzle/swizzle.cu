@@ -52,6 +52,7 @@ constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
 constexpr int COL_COALESCED_THREADS = 256;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_DIRECT_WARPS = COL_COALESCED_THREADS / 32;
+constexpr int COL_DIRECT_ROW_QUADS = 8;
 constexpr int COL_WARP_TILE_WARPS = 8;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 constexpr size_t SMALL_SWIZZLE_OUTPUT_BYTES = 10 * 1024 * 1024;
@@ -1104,25 +1105,6 @@ __device__ __forceinline__ uint4 load_col_swizzle_segment_full_m(const uint8_t* 
   return load_global_cs(reinterpret_cast<const uint4*>(input + static_cast<size_t>(k) * M + m));
 }
 
-__device__ __forceinline__ uint32_t load_col_swizzle_word_full_tile(const uint8_t* input_tile,
-                                                                    const int M,
-                                                                    const int output_row,
-                                                                    const int m_group) {
-  const int row_group = output_row & ~3;
-  const int row_byte_shift = (output_row & 3) * 8;
-  const int m_offset = m_group * 32 + row_group;
-
-  uint32_t word = 0;
-#pragma unroll
-  for (int k_group = 0; k_group < 4; ++k_group) {
-    const uint32_t packed = load_global_cs_u32(
-        reinterpret_cast<const uint32_t*>(input_tile + static_cast<size_t>(k_group) * M +
-                                          m_offset));
-    word |= ((packed >> row_byte_shift) & 0xffu) << (8 * k_group);
-  }
-  return word;
-}
-
 __device__ __forceinline__ uint32_t shuffle_uint4_byte(const uint4 value, const int src_lane,
                                                        const int byte_idx) {
   const int component = byte_idx / static_cast<int>(sizeof(uint32_t));
@@ -1267,6 +1249,10 @@ __device__ void swizzle_col_scaling_direct_full_tile_impl(
 
   const int warp_id = threadIdx.x / 32;
   const int lane = threadIdx.x & 31;
+  const int load_k_group = lane / COL_DIRECT_ROW_QUADS;
+  const int load_row_quad = lane - load_k_group * COL_DIRECT_ROW_QUADS;
+  const int output_row_quad = lane / 4;
+  const int output_byte = lane & 3;
   const uint8_t* input_u8 = reinterpret_cast<const uint8_t*>(input);
 
   for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
@@ -1281,12 +1267,28 @@ __device__ void swizzle_col_scaling_direct_full_tile_impl(
           reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(m_tile) * SF_TILE_DIM_M * K +
           static_cast<size_t>(k_tile) * SF_TILE_SIZE);
 
-      const int output_row = lane;
-      const uint4 value =
-          make_uint4(load_col_swizzle_word_full_tile(input_tile, M, output_row, 0),
-                     load_col_swizzle_word_full_tile(input_tile, M, output_row, 1),
-                     load_col_swizzle_word_full_tile(input_tile, M, output_row, 2),
-                     load_col_swizzle_word_full_tile(input_tile, M, output_row, 3));
+      uint32_t loaded_words[4];
+#pragma unroll
+      for (int m_group = 0; m_group < 4; ++m_group) {
+        const int m_offset = m_group * 32 + load_row_quad * 4;
+        loaded_words[m_group] = load_global_cs_u32(
+            reinterpret_cast<const uint32_t*>(input_tile + static_cast<size_t>(load_k_group) * M +
+                                              m_offset));
+      }
+
+      uint4 value;
+      uint32_t* value_words = reinterpret_cast<uint32_t*>(&value);
+#pragma unroll
+      for (int m_group = 0; m_group < 4; ++m_group) {
+        uint32_t word = 0;
+#pragma unroll
+        for (int k_group = 0; k_group < 4; ++k_group) {
+          const int src_lane = k_group * COL_DIRECT_ROW_QUADS + output_row_quad;
+          const uint32_t packed = __shfl_sync(0xffffffff, loaded_words[m_group], src_lane);
+          word |= ((packed >> (8 * output_byte)) & 0xffu) << (8 * k_group);
+        }
+        value_words[m_group] = word;
+      }
       store_global_cs(output_v4 + lane, value);
     }
   }
