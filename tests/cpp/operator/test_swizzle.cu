@@ -10,6 +10,7 @@
 #include <memory>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <type_traits>
 
@@ -335,6 +336,78 @@ void performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise() {
   NVTE_CHECK_CUDA(cudaMemcpy(output_host.data(), output_scale.get(), total_scale_numel,
                              cudaMemcpyDeviceToHost));
   compareResults("large_tma_grouped_uniform_columnwise_swizzle", output_host.data(),
+                 ref_output.data(), total_scale_numel);
+}
+
+void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
+  using namespace test;
+
+  constexpr size_t num_tensors = 4;
+  constexpr size_t data_last_dim = 32 * 1024;
+  const std::vector<int64_t> first_dims{4096, 8192, 8192, 12288};
+  const size_t logical_first_dim =
+      static_cast<size_t>(std::accumulate(first_dims.begin(), first_dims.end(), int64_t{0}));
+  constexpr size_t scale_m = data_last_dim;
+  const size_t total_scale_numel = (logical_first_dim / MXFP8_BLOCK_SIZE) * scale_m;
+
+  ASSERT_GT(total_scale_numel, kSmallSwizzleOutputBytes);
+  ASSERT_EQ(logical_first_dim % MXFP8_BLOCK_SIZE, 0);
+  ASSERT_EQ(scale_m % (2 * MAT_TILE_DIM_M), 0);
+
+  std::vector<uint8_t> input_host(total_scale_numel);
+  fill_deterministic_scale_bytes(&input_host);
+  std::vector<uint8_t> ref_output(total_scale_numel);
+  size_t scale_offset = 0;
+  for (const int64_t first_dim : first_dims) {
+    const size_t scale_k = static_cast<size_t>(first_dim) / MXFP8_BLOCK_SIZE;
+    ASSERT_EQ(scale_k % MAT_TILE_DIM_M, 0);
+    compute_ref_swizzle<128, 4, false>(input_host.data() + scale_offset,
+                                       ref_output.data() + scale_offset, scale_m, scale_k);
+    scale_offset += scale_k * scale_m;
+  }
+  ASSERT_EQ(scale_offset, total_scale_numel);
+
+  auto dummy_data = cuda_alloc(1);
+  auto input_scale = cuda_alloc(total_scale_numel);
+  auto output_scale = cuda_alloc(total_scale_numel);
+  auto first_dims_dev = cuda_alloc(first_dims.size() * sizeof(int64_t));
+  NVTE_CHECK_CUDA(cudaMemcpy(input_scale.get(), input_host.data(), total_scale_numel,
+                             cudaMemcpyHostToDevice));
+  NVTE_CHECK_CUDA(cudaMemcpy(first_dims_dev.get(), first_dims.data(),
+                             first_dims.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+  NVTE_CHECK_CUDA(cudaMemset(output_scale.get(), 0xCD, total_scale_numel));
+
+  const std::vector<size_t> logical_shape{logical_first_dim, data_last_dim};
+  const std::vector<size_t> data_shape{logical_shape[0] * logical_shape[1]};
+  const std::vector<size_t> scale_shape{total_scale_numel};
+
+  GroupedTensorWrapper input(num_tensors, logical_shape, NVTE_MXFP8_1D_SCALING);
+  input.set_columnwise_data(dummy_data.get(), DType::kFloat8E4M3, data_shape);
+  input.set_columnwise_scale_inv(input_scale.get(), DType::kFloat8E8M0, scale_shape);
+  input.set_with_gemm_swizzled_scales(false);
+
+  GroupedTensorWrapper output(num_tensors, logical_shape, NVTE_MXFP8_1D_SCALING);
+  output.set_columnwise_data(dummy_data.get(), DType::kFloat8E4M3, data_shape);
+  output.set_columnwise_scale_inv(output_scale.get(), DType::kFloat8E8M0, scale_shape);
+  output.set_with_gemm_swizzled_scales(true);
+
+  size_t dims_len = first_dims.size();
+  NVTEShape dims_shape = nvte_make_shape(&dims_len, 1);
+  NVTEBasicTensor first_dims_tensor{first_dims_dev.get(), kNVTEInt64, dims_shape};
+  nvte_set_grouped_tensor_param(input.data(), kNVTEGroupedFirstDims, &first_dims_tensor,
+                                sizeof(first_dims_tensor));
+  nvte_set_grouped_tensor_param(output.data(), kNVTEGroupedFirstDims, &first_dims_tensor,
+                                sizeof(first_dims_tensor));
+
+  nvte_swizzle_grouped_scaling_factors(input.data(), output.data(), 0);
+  cudaDeviceSynchronize();
+  auto err = cudaGetLastError();
+  ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+
+  std::vector<uint8_t> output_host(total_scale_numel);
+  NVTE_CHECK_CUDA(cudaMemcpy(output_host.data(), output_scale.get(), total_scale_numel,
+                             cudaMemcpyDeviceToHost));
+  compareResults("large_tma_grouped_variable_columnwise_swizzle", output_host.data(),
                  ref_output.data(), total_scale_numel);
 }
 
@@ -1047,6 +1120,15 @@ TEST(SwizzleGroupedFullTileFastPathTest,
   }
 
   performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise();
+}
+
+TEST(SwizzleGroupedVariablePersistentTest,
+     TestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell grouped-variable TMA columnwise swizzle requires Blackwell or newer.";
+  }
+
+  performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise();
 }
 
 INSTANTIATE_TEST_SUITE_P(
