@@ -345,6 +345,11 @@ void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
   constexpr size_t num_tensors = 4;
   constexpr size_t data_last_dim = 32 * 1024;
   const std::vector<int64_t> first_dims{4096, 8192, 8192, 12288};
+  ASSERT_EQ(first_dims.size(), num_tensors);
+  std::vector<int64_t> tensor_offsets(num_tensors + 1, 0);
+  for (size_t i = 0; i < num_tensors; ++i) {
+    tensor_offsets[i + 1] = tensor_offsets[i] + first_dims[i] * data_last_dim;
+  }
   const size_t logical_first_dim =
       static_cast<size_t>(std::accumulate(first_dims.begin(), first_dims.end(), int64_t{0}));
   constexpr size_t scale_m = data_last_dim;
@@ -371,10 +376,13 @@ void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
   auto input_scale = cuda_alloc(total_scale_numel);
   auto output_scale = cuda_alloc(total_scale_numel);
   auto first_dims_dev = cuda_alloc(first_dims.size() * sizeof(int64_t));
+  auto tensor_offsets_dev = cuda_alloc(tensor_offsets.size() * sizeof(int64_t));
   NVTE_CHECK_CUDA(cudaMemcpy(input_scale.get(), input_host.data(), total_scale_numel,
                              cudaMemcpyHostToDevice));
   NVTE_CHECK_CUDA(cudaMemcpy(first_dims_dev.get(), first_dims.data(),
                              first_dims.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+  NVTE_CHECK_CUDA(cudaMemcpy(tensor_offsets_dev.get(), tensor_offsets.data(),
+                             tensor_offsets.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
   NVTE_CHECK_CUDA(cudaMemset(output_scale.get(), 0xCD, total_scale_numel));
 
   const std::vector<size_t> logical_shape{logical_first_dim, data_last_dim};
@@ -394,10 +402,17 @@ void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
   size_t dims_len = first_dims.size();
   NVTEShape dims_shape = nvte_make_shape(&dims_len, 1);
   NVTEBasicTensor first_dims_tensor{first_dims_dev.get(), kNVTEInt64, dims_shape};
+  size_t offsets_len = tensor_offsets.size();
+  NVTEShape offsets_shape = nvte_make_shape(&offsets_len, 1);
+  NVTEBasicTensor offsets_tensor{tensor_offsets_dev.get(), kNVTEInt64, offsets_shape};
   nvte_set_grouped_tensor_param(input.data(), kNVTEGroupedFirstDims, &first_dims_tensor,
                                 sizeof(first_dims_tensor));
   nvte_set_grouped_tensor_param(output.data(), kNVTEGroupedFirstDims, &first_dims_tensor,
                                 sizeof(first_dims_tensor));
+  nvte_set_grouped_tensor_param(input.data(), kNVTEGroupedTensorOffsets, &offsets_tensor,
+                                sizeof(offsets_tensor));
+  nvte_set_grouped_tensor_param(output.data(), kNVTEGroupedTensorOffsets, &offsets_tensor,
+                                sizeof(offsets_tensor));
 
   nvte_swizzle_grouped_scaling_factors(input.data(), output.data(), 0);
   cudaDeviceSynchronize();
