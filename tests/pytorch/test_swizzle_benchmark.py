@@ -140,4 +140,15 @@ def test_combined_grouped_case_byte_accounting(case_name, expected_classificatio
     assert input_bytes == row_bytes[0] + column_bytes[0]
     assert output_bytes == row_bytes[1] + column_bytes[1]
     assert processed_bytes == row_bytes[2] + column_bytes[2]
-    assert (output_bytes > 10 * 1024 * 1024) == (expected_classification == "large")
+    assert (output_bytes > benchmark_swizzle.SMALL_OUTPUT_LIMIT_BYTES) == (
+        expected_classification == "large"
+    )
+
+
+def test_small_cases_use_expanded_footprint():
+    cases = {case.name: case for case in benchmark_swizzle.build_cases()}
+
+    small_case_names = [case_name for case_name in cases if case_name.endswith("_small")]
+    for case_name in small_case_names:
+        _, output_bytes, _ = benchmark_swizzle.case_scale_bytes(cases[case_name])
+        assert 16 * 1024 * 1024 <= output_bytes <= benchmark_swizzle.SMALL_OUTPUT_LIMIT_BYTES

@@ -52,6 +52,7 @@ ROWWISE_DIRECTION = "rowwise"
 COLUMNWISE_DIRECTION = "columnwise"
 COMBINED_DIRECTION = "rowwise+columnwise"
 SCALE_DIRECTIONS = (ROWWISE_DIRECTION, COLUMNWISE_DIRECTION)
+SMALL_OUTPUT_LIMIT_BYTES = 30 * 1024 * 1024
 
 
 class NVTEShape(ctypes.Structure):
@@ -423,9 +424,9 @@ def make_case_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> Benc
 
 
 def build_cases() -> list[CaseSpec]:
-    uniform_combined_small = ((16384, 1024),) * 8
+    uniform_combined_small = ((32768, 1024),) * 8
     uniform_combined_large = ((65536, 4096),) * 8
-    variable_small = (
+    variable_small_base = (
         (16384, 1024),
         (24576, 1024),
         (32768, 1024),
@@ -435,15 +436,16 @@ def build_cases() -> list[CaseSpec]:
         (16384, 1024),
         (24576, 1024),
     )
+    variable_small = tuple((m * 2, k) for m, k in variable_small_base)
     variable_combined_small = tuple((m // 2, k) for m, k in variable_small)
-    variable_large = tuple((m * 8, k) for m, k in variable_small)
+    variable_large = tuple((m * 8, k) for m, k in variable_small_base)
     return [
-        CaseSpec("regular_rowwise_small", "regular", "rowwise", ((262144, 1024),)),
+        CaseSpec("regular_rowwise_small", "regular", "rowwise", ((524288, 1024),)),
         CaseSpec("regular_rowwise_large", "regular", "rowwise", ((524288, 4096),)),
-        CaseSpec("regular_columnwise_small", "regular", "columnwise", ((262144, 1024),)),
+        CaseSpec("regular_columnwise_small", "regular", "columnwise", ((524288, 1024),)),
         CaseSpec("regular_columnwise_large", "regular", "columnwise", ((4096, 524288),)),
         CaseSpec(
-            "grouped_uniform_rowwise_small", "grouped_uniform", "rowwise", ((32768, 1024),) * 8
+            "grouped_uniform_rowwise_small", "grouped_uniform", "rowwise", ((65536, 1024),) * 8
         ),
         CaseSpec(
             "grouped_uniform_rowwise_large", "grouped_uniform", "rowwise", ((65536, 4096),) * 8
@@ -452,7 +454,7 @@ def build_cases() -> list[CaseSpec]:
             "grouped_uniform_columnwise_small",
             "grouped_uniform",
             "columnwise",
-            ((32768, 1024),) * 8,
+            ((65536, 1024),) * 8,
         ),
         CaseSpec(
             "grouped_uniform_columnwise_large",
@@ -635,7 +637,7 @@ def run_case(
             ]
         },
         "buffer_count": count,
-        "classification": "large" if output_bytes > 10 * 1024 * 1024 else "small",
+        "classification": "large" if output_bytes > SMALL_OUTPUT_LIMIT_BYTES else "small",
         "warmup_iterations": args.warmup_iterations,
         "measurement_iterations": args.measurement_iterations,
         "launches_per_sample": launches_per_sample,
