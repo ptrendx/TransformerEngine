@@ -59,6 +59,10 @@ constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 constexpr int COL_TMA_TILE_DIM = 128;
 constexpr int COL_TMA_TILE_BYTES = COL_TMA_TILE_DIM * COL_TMA_TILE_DIM;
 constexpr int COL_TMA_STAGES = 2;
+// The 128B atom swizzle pattern repeats every 1024 bytes. Aligning the staging
+// tile to that repeat boundary keeps the decode helper's row-relative indices
+// valid for all dynamic shared-memory base addresses.
+constexpr size_t COL_TMA_SWIZZLE_ALIGNMENT = 1024;
 // Keep multiple independent columnwise CTAs resident so TMA/shared-memory
 // dependency stalls are hidden instead of serializing one block per SM. TMA
 // kernels still cap this target by the runtime occupancy query because their
@@ -1412,8 +1416,8 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
   extern __shared__ __align__(128) char dynamic_shmem[];
   uintptr_t base_shmem_ptr = reinterpret_cast<uintptr_t>(dynamic_shmem);
   uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(
-      (base_shmem_ptr + TMA_SHMEM_ALIGNMENT - 1) &
-      ~static_cast<uintptr_t>(TMA_SHMEM_ALIGNMENT - 1));
+      (base_shmem_ptr + COL_TMA_SWIZZLE_ALIGNMENT - 1) &
+      ~static_cast<uintptr_t>(COL_TMA_SWIZZLE_ALIGNMENT - 1));
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ alignas(8) uint64_t mbar[COL_TMA_STAGES];
@@ -1487,8 +1491,8 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
   extern __shared__ __align__(128) char dynamic_shmem[];
   uintptr_t base_shmem_ptr = reinterpret_cast<uintptr_t>(dynamic_shmem);
   uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(
-      (base_shmem_ptr + TMA_SHMEM_ALIGNMENT - 1) &
-      ~static_cast<uintptr_t>(TMA_SHMEM_ALIGNMENT - 1));
+      (base_shmem_ptr + COL_TMA_SWIZZLE_ALIGNMENT - 1) &
+      ~static_cast<uintptr_t>(COL_TMA_SWIZZLE_ALIGNMENT - 1));
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ alignas(8) uint64_t mbar[COL_TMA_STAGES];
@@ -2680,7 +2684,8 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
         const int num_k_blocks = DIVUP(num_tiles_k, k_tiles_per_block);
         const int num_m_blocks = DIVUP(num_tiles_m, m_tiles_per_block);
         const int total_blocks = num_k_blocks * num_m_blocks;
-        const int tma_smem_size = COL_TMA_STAGES * COL_TMA_TILE_BYTES + TMA_SHMEM_ALIGNMENT;
+        const int tma_smem_size =
+            COL_TMA_STAGES * COL_TMA_TILE_BYTES + COL_TMA_SWIZZLE_ALIGNMENT;
         const int persistent_blocks = col_tma_persistent_grid_blocks(
             total_blocks, swizzle_col_scaling_tma_persistent_full_tile_kernel<SF_TILE_DIM_M,
                                                                                SF_TILE_DIM_K>,
@@ -4050,8 +4055,8 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
   extern __shared__ __align__(128) char dynamic_shmem[];
   uintptr_t base_shmem_ptr = reinterpret_cast<uintptr_t>(dynamic_shmem);
   uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(
-      (base_shmem_ptr + TMA_SHMEM_ALIGNMENT - 1) &
-      ~static_cast<uintptr_t>(TMA_SHMEM_ALIGNMENT - 1));
+      (base_shmem_ptr + COL_TMA_SWIZZLE_ALIGNMENT - 1) &
+      ~static_cast<uintptr_t>(COL_TMA_SWIZZLE_ALIGNMENT - 1));
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ alignas(8) uint64_t mbar[1];
@@ -4431,7 +4436,8 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
           const int num_m_blocks = DIVUP(num_tiles_m, col_coalesced_m_tiles);
           const int blocks_per_tensor = num_k_blocks * num_m_blocks;
           const int total_blocks = static_cast<int>(input->num_tensors) * blocks_per_tensor;
-          const int tma_smem_size = COL_TMA_STAGES * COL_TMA_TILE_BYTES + TMA_SHMEM_ALIGNMENT;
+          const int tma_smem_size =
+              COL_TMA_STAGES * COL_TMA_TILE_BYTES + COL_TMA_SWIZZLE_ALIGNMENT;
           const int persistent_blocks = col_tma_persistent_grid_blocks(
               total_blocks,
               grouped_swizzle_col_scaling_uniform_shape_tma_persistent_full_tile_kernel<
@@ -4666,7 +4672,7 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
               input_map, input->columnwise_scale_inv.dptr,
               static_cast<uint64_t>(input->logical_shape.data[0] / MXFP8_BLOCK_SIZE),
               static_cast<uint64_t>(padded_m));
-          const int tma_smem_size = COL_TMA_TILE_BYTES + TMA_SHMEM_ALIGNMENT;
+          const int tma_smem_size = COL_TMA_TILE_BYTES + COL_TMA_SWIZZLE_ALIGNMENT;
           const int persistent_blocks = col_tma_persistent_grid_blocks(
               total_blocks,
               grouped_swizzle_col_scaling_variable_shape_tma_persistent_full_tile_kernel<
