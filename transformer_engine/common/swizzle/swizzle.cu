@@ -1136,6 +1136,18 @@ __device__ __forceinline__ uint32_t load_col_swizzle_shared_byte_from_word(
   return (packed >> byte_shift) & 0xffu;
 }
 
+__device__ __forceinline__ const uint8_t* col_tma_swizzled_atom_32b_ptr(
+    const uint8_t* tile_u8, const int row, const int byte_col) {
+  // Matches CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B for a 128-byte tile row.
+  constexpr int CHUNK_BYTES = static_cast<int>(sizeof(uint4));
+  constexpr int CHUNKS_PER_ROW = COL_TMA_TILE_DIM / CHUNK_BYTES;
+  const int chunk_col = byte_col / CHUNK_BYTES;
+  const int chunk_byte = byte_col - chunk_col * CHUNK_BYTES;
+  const int swizzled_chunk_col = chunk_col ^ ((row * 2) % CHUNKS_PER_ROW);
+  return tile_u8 + static_cast<size_t>(row) * COL_TMA_TILE_DIM +
+         swizzled_chunk_col * CHUNK_BYTES + chunk_byte;
+}
+
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __device__ void swizzle_col_scaling_coalesced_tile_impl(
     const void* input, void* output, const int M, const int K, const int original_M,
@@ -1331,7 +1343,6 @@ __device__ __forceinline__ void store_col_swizzle_tma_tile(const uint8_t* tile_u
                 "TMA columnwise swizzle assumes 128x128 full tiles.");
   constexpr int SF_TILE_SIZE = SF_TILE_DIM_M * SF_TILE_DIM_K;
   constexpr int K_TILES_PER_TMA = COL_TMA_TILE_DIM / SF_TILE_DIM_K;
-  constexpr int TILE_ROW_STRIDE_BYTES = COL_TMA_TILE_DIM;
   constexpr int OUTPUT_V4_PER_TILE = SF_TILE_SIZE / static_cast<int>(sizeof(uint4));
   static_assert(COL_DIRECT_WARPS * 32 == COL_COALESCED_THREADS,
                 "TMA columnwise swizzle expects a whole number of warps.");
@@ -1355,8 +1366,7 @@ __device__ __forceinline__ void store_col_swizzle_tma_tile(const uint8_t* tile_u
     for (int m_group = 0; m_group < 4; ++m_group) {
       const int m_offset = m_group * 32 + load_row_quad * 4;
       loaded_words[m_group] = *reinterpret_cast<const uint32_t*>(
-          tile_u8 + static_cast<size_t>(k_rel_base + load_k_group) * TILE_ROW_STRIDE_BYTES +
-          m_offset);
+          col_tma_swizzled_atom_32b_ptr(tile_u8, k_rel_base + load_k_group, m_offset));
     }
 
     uint4 value;
@@ -1850,7 +1860,7 @@ void get_col_swizzle_tma_input_map(CUtensorMap& input_map, void* input_ptr,
                                 DType::kByte);
   create_2D_tensor_map(new_map, input_map_tensor, global_y, global_x, COL_TMA_TILE_DIM,
                        COL_TMA_TILE_DIM, static_cast<uint32_t>(global_x), 0, 8,
-                       CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+                       CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B);
   cache.push_back({input_ptr, global_y, global_x, new_map});
   input_map = new_map;
 }
