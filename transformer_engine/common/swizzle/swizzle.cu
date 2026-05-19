@@ -58,6 +58,9 @@ constexpr int COL_WARP_TILE_WARPS = 8;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
 constexpr int COL_TMA_TILE_DIM = 128;
 constexpr int COL_TMA_TILE_BYTES = COL_TMA_TILE_DIM * COL_TMA_TILE_DIM;
+// Keep multiple independent columnwise CTAs resident so TMA/shared-memory
+// dependency stalls are hidden instead of serializing one block per SM.
+constexpr int COL_PERSISTENT_BLOCKS_PER_SM = 8;
 constexpr size_t SMALL_SWIZZLE_OUTPUT_BYTES = 30 * 1024 * 1024;
 
 // output is in ~K-major interleaved blocks
@@ -1850,6 +1853,10 @@ bool use_blackwell_col_coalesced_swizzle(const size_t scale_elem_size) {
   return cuda::sm_arch() >= 100 && scale_elem_size == sizeof(uint8_t);
 }
 
+int col_persistent_grid_blocks(const int total_blocks, const int num_sms = cuda::sm_count()) {
+  return std::min(total_blocks, num_sms * COL_PERSISTENT_BLOCKS_PER_SM);
+}
+
 template <typename LType, int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 __global__ void __launch_bounds__(TB_DIM* TB_DIM)
     grouped_swizzle_row_scaling_uniform_shape_kernel(const void* input, void* output, const int M,
@@ -2562,7 +2569,7 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
         const int num_k_blocks = DIVUP(num_tiles_k, k_tiles_per_block);
         const int num_m_blocks = DIVUP(num_tiles_m, m_tiles_per_block);
         const int total_blocks = num_k_blocks * num_m_blocks;
-        const int persistent_blocks = std::min(total_blocks, cuda::sm_count());
+        const int persistent_blocks = col_persistent_grid_blocks(total_blocks);
         const int tma_smem_size = COL_TMA_TILE_BYTES + TMA_SHMEM_ALIGNMENT;
         swizzle_col_scaling_tma_persistent_full_tile_kernel<SF_TILE_DIM_M, SF_TILE_DIM_K>
             <<<persistent_blocks, COL_COALESCED_THREADS, tma_smem_size, stream>>>(
@@ -4205,7 +4212,7 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
           const int num_m_blocks = DIVUP(num_tiles_m, col_coalesced_m_tiles);
           const int blocks_per_tensor = num_k_blocks * num_m_blocks;
           const int total_blocks = static_cast<int>(input->num_tensors) * blocks_per_tensor;
-          const int persistent_blocks = std::min(total_blocks, cuda::sm_count());
+          const int persistent_blocks = col_persistent_grid_blocks(total_blocks);
           const int tma_smem_size = COL_TMA_TILE_BYTES + TMA_SHMEM_ALIGNMENT;
           grouped_swizzle_col_scaling_uniform_shape_tma_persistent_full_tile_kernel<
               SF_TILE_DIM_M, SF_TILE_DIM_K>
@@ -4427,7 +4434,7 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
                 (input->logical_shape.data[0] / MXFP8_BLOCK_SIZE) * padded_m;
         if (can_use_direct_full_tile) {
           const int total_blocks = static_cast<int>(num_blocks);
-          const int persistent_blocks = std::min(total_blocks, num_SMs);
+          const int persistent_blocks = col_persistent_grid_blocks(total_blocks, num_SMs);
           grouped_swizzle_col_scaling_variable_shape_direct_full_tile_kernel<SF_TILE_DIM_M,
                                                                              SF_TILE_DIM_K>
               <<<persistent_blocks, COL_COALESCED_THREADS, 0, stream>>>(
