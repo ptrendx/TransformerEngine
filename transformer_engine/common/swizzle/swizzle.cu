@@ -1139,18 +1139,6 @@ __device__ __forceinline__ uint32_t load_col_swizzle_shared_byte_from_word(
   return (packed >> byte_shift) & 0xffu;
 }
 
-__device__ __forceinline__ const uint8_t* col_tma_swizzled_atom_32b_ptr(
-    const uint8_t* tile_u8, const int row, const int byte_col) {
-  // Matches CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B for a 128-byte tile row.
-  constexpr int CHUNK_BYTES = static_cast<int>(sizeof(uint4));
-  constexpr int CHUNKS_PER_ROW = COL_TMA_TILE_DIM / CHUNK_BYTES;
-  const int chunk_col = byte_col / CHUNK_BYTES;
-  const int chunk_byte = byte_col - chunk_col * CHUNK_BYTES;
-  const int swizzled_chunk_col = chunk_col ^ ((row * 2) % CHUNKS_PER_ROW);
-  return tile_u8 + static_cast<size_t>(row) * COL_TMA_TILE_DIM +
-         swizzled_chunk_col * CHUNK_BYTES + chunk_byte;
-}
-
 __device__ __forceinline__ uint32_t pack_col_swizzle_k_bytes(const uint32_t k0,
                                                              const uint32_t k1,
                                                              const uint32_t k2,
@@ -1372,16 +1360,24 @@ __device__ __forceinline__ void store_col_swizzle_tma_tile(const uint8_t* tile_u
   const int load_row_quad = lane - load_k_group * COL_DIRECT_ROW_QUADS;
   const int output_row_quad = lane / 4;
   const int output_byte = lane & 3;
+  // CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B xors 16B chunks by (row * 2) % 8.
+  // Since each swizzle scale tile spans four K rows, the tile_rel term drops out.
+  const int swizzled_chunk_xor = load_k_group * 2;
+  const int load_chunk_subcol = load_row_quad >> 2;
+  const int load_chunk_byte = (load_row_quad & 3) * static_cast<int>(sizeof(uint32_t));
 
   for (int tile_rel = warp_id; tile_rel < K_TILES_PER_TMA; tile_rel += COL_DIRECT_WARPS) {
     const int k_rel_base = tile_rel * SF_TILE_DIM_K;
+    const int load_row_base = (k_rel_base + load_k_group) * COL_TMA_TILE_DIM;
 
     uint32_t loaded_words[4];
 #pragma unroll
     for (int m_group = 0; m_group < 4; ++m_group) {
-      const int m_offset = m_group * 32 + load_row_quad * 4;
+      const int chunk_col = m_group * 2 + load_chunk_subcol;
+      const int swizzled_chunk_col = chunk_col ^ swizzled_chunk_xor;
       loaded_words[m_group] = *reinterpret_cast<const uint32_t*>(
-          col_tma_swizzled_atom_32b_ptr(tile_u8, k_rel_base + load_k_group, m_offset));
+          tile_u8 + load_row_base +
+          swizzled_chunk_col * static_cast<int>(sizeof(uint4)) + load_chunk_byte);
     }
 
     uint4 value;
@@ -3995,6 +3991,123 @@ __global__ void __launch_bounds__(COL_WARP_TILE_THREADS)
       k_tile_block, k_tiles_per_block, m_tiles_per_block);
 }
 
+__device__ __forceinline__ size_t shfl_sync_size_t(const size_t value, const int src_lane) {
+  const uint64_t value_u64 = static_cast<uint64_t>(value);
+  uint32_t lo = static_cast<uint32_t>(value_u64);
+  uint32_t hi = static_cast<uint32_t>(value_u64 >> 32);
+  lo = __shfl_sync(0xffffffff, lo, src_lane);
+  hi = __shfl_sync(0xffffffff, hi, src_lane);
+  return static_cast<size_t>((static_cast<uint64_t>(hi) << 32) | lo);
+}
+
+struct GroupedVariableColBlockInfo {
+  int found;
+  int m_tile_block;
+  int k_tile_block;
+  int first_k_tile;
+  int active_k_tiles;
+  int padded_k;
+  size_t scale_base;
+  size_t k_base;
+};
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+__device__ __forceinline__ GroupedVariableColBlockInfo find_grouped_variable_col_block_warp(
+    const int linear_block_id, const int64_t* k_array, const int num_tensors,
+    const size_t scale_elem_size, const int padded_m, const int num_m_blocks,
+    const int k_tiles_per_block) {
+  const int lane = threadIdx.x & 31;
+  int found = 0;
+  int m_tile_block = 0;
+  int k_tile_block = 0;
+  int first_k_tile = 0;
+  int active_k_tiles = 0;
+  int padded_k = 0;
+  size_t scale_base = 0;
+  size_t k_base = 0;
+
+  if (lane == 0) {
+    int current_block_base = 0;
+    size_t current_scale_base = 0;
+    size_t current_k_base = 0;
+    size_t k = 0;
+    int tensor_blocks = 0;
+    int num_k_blocks = 0;
+    int num_tiles_k = 0;
+
+    for (int i = 0; i < num_tensors; ++i) {
+      k = static_cast<size_t>(k_array[i]);
+      const size_t tensor_padded_k =
+          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                               static_cast<size_t>(SF_TILE_DIM_K));
+      num_tiles_k = static_cast<int>(tensor_padded_k / SF_TILE_DIM_K);
+      num_k_blocks = DIVUP(num_tiles_k, k_tiles_per_block);
+      tensor_blocks = num_m_blocks * num_k_blocks;
+      if (linear_block_id < current_block_base + tensor_blocks) {
+        found = 1;
+        padded_k = static_cast<int>(tensor_padded_k);
+        break;
+      }
+      current_block_base += tensor_blocks;
+      current_scale_base += static_cast<size_t>(padded_m) * tensor_padded_k * scale_elem_size;
+      current_k_base += tensor_padded_k;
+    }
+
+    if (found) {
+      const int local_block_id = linear_block_id - current_block_base;
+      m_tile_block = local_block_id / num_k_blocks;
+      k_tile_block = local_block_id - m_tile_block * num_k_blocks;
+      first_k_tile = k_tile_block * k_tiles_per_block;
+      const int remaining_k_tiles = num_tiles_k - first_k_tile;
+      active_k_tiles =
+          remaining_k_tiles < k_tiles_per_block ? remaining_k_tiles : k_tiles_per_block;
+      scale_base = current_scale_base;
+      k_base = current_k_base;
+    }
+  }
+
+  found = __shfl_sync(0xffffffff, found, 0);
+  m_tile_block = __shfl_sync(0xffffffff, m_tile_block, 0);
+  k_tile_block = __shfl_sync(0xffffffff, k_tile_block, 0);
+  first_k_tile = __shfl_sync(0xffffffff, first_k_tile, 0);
+  active_k_tiles = __shfl_sync(0xffffffff, active_k_tiles, 0);
+  padded_k = __shfl_sync(0xffffffff, padded_k, 0);
+  scale_base = shfl_sync_size_t(scale_base, 0);
+  k_base = shfl_sync_size_t(k_base, 0);
+
+  return {found, m_tile_block, k_tile_block, first_k_tile,
+          active_k_tiles, padded_k, scale_base, k_base};
+}
+
+struct GroupedVariableColTileInfo {
+  int valid;
+  int full_k_tile;
+  int m_tile;
+  int k_tile_block;
+  int first_k_tile;
+  int padded_k;
+  size_t scale_base;
+  size_t k_base;
+};
+
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+__device__ __forceinline__ GroupedVariableColTileInfo find_grouped_variable_col_tile_warp(
+    const int linear_tile_id, const int64_t* k_array, const int num_tensors,
+    const size_t scale_elem_size, const int padded_m, const int num_tiles_m,
+    const int num_m_blocks, const int k_tiles_per_block, const int m_tiles_per_block) {
+  const int linear_block_id = linear_tile_id / m_tiles_per_block;
+  const int local_m_tile = linear_tile_id - linear_block_id * m_tiles_per_block;
+  const GroupedVariableColBlockInfo block =
+      find_grouped_variable_col_block_warp<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+          linear_block_id, k_array, num_tensors, scale_elem_size, padded_m, num_m_blocks,
+          k_tiles_per_block);
+  const int m_tile = block.m_tile_block * m_tiles_per_block + local_m_tile;
+  const int valid = block.found && m_tile < num_tiles_m;
+  const int full_k_tile = valid && block.active_k_tiles == k_tiles_per_block;
+  return {valid, full_k_tile, m_tile, block.k_tile_block,
+          block.first_k_tile, block.padded_k, block.scale_base, block.k_base};
+}
+
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
 __global__ void __launch_bounds__(COL_COALESCED_THREADS)
     grouped_swizzle_col_scaling_variable_shape_direct_full_tile_kernel(
@@ -4007,42 +4120,18 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
 
   for (int linear_block_id = static_cast<int>(blockIdx.x); linear_block_id < total_blocks;
        linear_block_id += gridDim.x) {
-    int current_block_base = 0;
-    size_t current_scale_base = 0;
-    size_t k = 0;
-    int tensor_blocks = 0;
-    int num_k_blocks = 0;
-    bool found_tensor = false;
+    const GroupedVariableColBlockInfo block =
+        find_grouped_variable_col_block_warp<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+            linear_block_id, k_array, num_tensors, scale_elem_size, padded_m, num_m_blocks,
+            k_tiles_per_block);
+    if (!block.found) continue;
 
-    for (int i = 0; i < num_tensors; ++i) {
-      k = static_cast<size_t>(k_array[i]);
-      const size_t padded_k =
-          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
-                               static_cast<size_t>(SF_TILE_DIM_K));
-      const int num_tiles_k = static_cast<int>(padded_k / SF_TILE_DIM_K);
-      num_k_blocks = DIVUP(num_tiles_k, k_tiles_per_block);
-      tensor_blocks = num_m_blocks * num_k_blocks;
-      if (linear_block_id < current_block_base + tensor_blocks) {
-        found_tensor = true;
-        break;
-      }
-      current_block_base += tensor_blocks;
-      current_scale_base += static_cast<size_t>(padded_m) * padded_k * scale_elem_size;
-    }
-    if (!found_tensor) continue;
-
-    const int local_block_id = linear_block_id - current_block_base;
-    const int m_tile_block = local_block_id / num_k_blocks;
-    const int k_tile_block = local_block_id - m_tile_block * num_k_blocks;
-    const int padded_k =
-        static_cast<int>(round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
-                                              static_cast<size_t>(SF_TILE_DIM_K)));
-    const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current_scale_base;
-    uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current_scale_base;
+    const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + block.scale_base;
+    uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + block.scale_base;
 
     swizzle_col_scaling_direct_full_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-        input_base, output_base, padded_m, padded_k, m_tile_block, k_tile_block, k_tiles_per_block,
-        m_tiles_per_block);
+        input_base, output_base, padded_m, block.padded_k, block.m_tile_block, block.k_tile_block,
+        k_tiles_per_block, m_tiles_per_block);
   }
 }
 
@@ -4074,95 +4163,63 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
   const bool is_master_thread = threadIdx.x == 0;
   initialize_barriers<COL_TMA_STAGES, THREADS_PER_BLOCK>(mbar, is_master_thread);
 
-  int stage0_parity = 0;
-  int stage1_parity = 0;
-  for (int linear_block_id = static_cast<int>(blockIdx.x); linear_block_id < total_blocks;
-       linear_block_id += gridDim.x) {
-    int current_block_base = 0;
-    size_t current_scale_base = 0;
-    size_t current_k_base = 0;
-    size_t k = 0;
-    int tensor_blocks = 0;
-    int num_k_blocks = 0;
-    int num_tiles_k = 0;
-    bool found_tensor = false;
+  int stage_parity[COL_TMA_STAGES] = {0, 0};
+  const int total_tiles = total_blocks * m_tiles_per_block;
+  const int first_tile = static_cast<int>(blockIdx.x);
+  GroupedVariableColTileInfo current =
+      first_tile < total_tiles
+          ? find_grouped_variable_col_tile_warp<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+                first_tile, k_array, num_tensors, scale_elem_size, padded_m, num_tiles_m,
+                num_m_blocks, k_tiles_per_block, m_tiles_per_block)
+          : GroupedVariableColTileInfo{0, 0, 0, 0, 0, 0, 0, 0};
+  if (current.valid && current.full_k_tile) {
+    copy_2d_to_shared(tile_u8, reinterpret_cast<const void*>(&input_map),
+                      static_cast<size_t>(current.m_tile) * SF_TILE_DIM_M,
+                      current.k_base + static_cast<size_t>(current.first_k_tile) * SF_TILE_DIM_K,
+                      COL_TMA_TILE_BYTES, &mbar[0], is_master_thread);
+  }
 
-    for (int i = 0; i < num_tensors; ++i) {
-      k = static_cast<size_t>(k_array[i]);
-      const size_t padded_k =
-          round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
-                               static_cast<size_t>(SF_TILE_DIM_K));
-      num_tiles_k = static_cast<int>(padded_k / SF_TILE_DIM_K);
-      num_k_blocks = DIVUP(num_tiles_k, k_tiles_per_block);
-      tensor_blocks = num_m_blocks * num_k_blocks;
-      if (linear_block_id < current_block_base + tensor_blocks) {
-        found_tensor = true;
-        break;
-      }
-      current_block_base += tensor_blocks;
-      current_scale_base += static_cast<size_t>(padded_m) * padded_k * scale_elem_size;
-      current_k_base += padded_k;
-    }
-    if (!found_tensor) continue;
+  for (int linear_tile_id = first_tile, iter = 0; linear_tile_id < total_tiles;
+       linear_tile_id += gridDim.x, ++iter) {
+    const int stage = iter % COL_TMA_STAGES;
+    const int next_tile_id = linear_tile_id + gridDim.x;
+    GroupedVariableColTileInfo next =
+        next_tile_id < total_tiles
+            ? find_grouped_variable_col_tile_warp<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+                  next_tile_id, k_array, num_tensors, scale_elem_size, padded_m, num_tiles_m,
+                  num_m_blocks, k_tiles_per_block, m_tiles_per_block)
+            : GroupedVariableColTileInfo{0, 0, 0, 0, 0, 0, 0, 0};
 
-    const int local_block_id = linear_block_id - current_block_base;
-    const int m_tile_block = local_block_id / num_k_blocks;
-    const int k_tile_block = local_block_id - m_tile_block * num_k_blocks;
-    const int first_k_tile = k_tile_block * k_tiles_per_block;
-    const int remaining_k_tiles = num_tiles_k - first_k_tile;
-    const int active_k_tiles =
-        remaining_k_tiles < k_tiles_per_block ? remaining_k_tiles : k_tiles_per_block;
-    const int padded_k =
-        static_cast<int>(round_up_to_multiple(DIVUP(k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
-                                              static_cast<size_t>(SF_TILE_DIM_K)));
-    const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current_scale_base;
-    uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current_scale_base;
-
-    if (active_k_tiles != k_tiles_per_block) {
-      swizzle_col_scaling_direct_full_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-          input_base, output_base, padded_m, padded_k, m_tile_block, k_tile_block,
-          k_tiles_per_block, m_tiles_per_block);
-      continue;
+    if (next.valid && next.full_k_tile) {
+      const int next_stage = (iter + 1) % COL_TMA_STAGES;
+      ptx::cp_async_bulk_wait_group_read<1>();
+      copy_2d_to_shared(tile_u8 + next_stage * COL_TMA_TILE_BYTES,
+                        reinterpret_cast<const void*>(&input_map),
+                        static_cast<size_t>(next.m_tile) * SF_TILE_DIM_M,
+                        next.k_base + static_cast<size_t>(next.first_k_tile) * SF_TILE_DIM_K,
+                        COL_TMA_TILE_BYTES, &mbar[next_stage], is_master_thread);
     }
 
-    const int first_m_tile = m_tile_block * m_tiles_per_block;
-    if (first_m_tile < num_tiles_m) {
-      copy_2d_to_shared(tile_u8, reinterpret_cast<const void*>(&input_map),
-                        static_cast<size_t>(first_m_tile) * SF_TILE_DIM_M,
-                        current_k_base + static_cast<size_t>(first_k_tile) * SF_TILE_DIM_K,
-                        COL_TMA_TILE_BYTES, &mbar[0], is_master_thread);
-    }
-
-    for (int local_m_tile = 0; local_m_tile < m_tiles_per_block; ++local_m_tile) {
-      const int m_tile = first_m_tile + local_m_tile;
-      if (m_tile >= num_tiles_m) break;
-
-      const int next_m_tile = m_tile + 1;
-      if (local_m_tile + 1 < m_tiles_per_block && next_m_tile < num_tiles_m) {
-        const int next_stage = (local_m_tile + 1) % COL_TMA_STAGES;
-        ptx::cp_async_bulk_wait_group_read<1>();
-        copy_2d_to_shared(tile_u8 + next_stage * COL_TMA_TILE_BYTES,
-                          reinterpret_cast<const void*>(&input_map),
-                          static_cast<size_t>(next_m_tile) * SF_TILE_DIM_M,
-                          current_k_base + static_cast<size_t>(first_k_tile) * SF_TILE_DIM_K,
-                          COL_TMA_TILE_BYTES, &mbar[next_stage], is_master_thread);
-      }
-
-      const int stage = local_m_tile % COL_TMA_STAGES;
+    if (current.valid && current.full_k_tile) {
       ptx::fence_proxy_async_shared_cta();
-      const int parity = stage == 0 ? stage0_parity : stage1_parity;
-      ptx::mbarrier_wait_parity(&mbar[stage], parity);
-      if (stage == 0) {
-        stage0_parity ^= 1;
-      } else {
-        stage1_parity ^= 1;
-      }
+      ptx::mbarrier_wait_parity(&mbar[stage], stage_parity[stage]);
+      stage_parity[stage] ^= 1;
 
+      uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current.scale_base;
       store_col_swizzle_tma_tile<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-          tile_u8 + stage * COL_TMA_TILE_BYTES, output_base, m_tile, first_k_tile, padded_k);
+          tile_u8 + stage * COL_TMA_TILE_BYTES, output_base, current.m_tile, current.first_k_tile,
+          current.padded_k);
       __syncthreads();
       ptx::fence_proxy_async_shared_cta();
+    } else if (current.valid) {
+      const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current.scale_base;
+      uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current.scale_base;
+      swizzle_col_scaling_direct_full_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+          input_base, output_base, padded_m, current.padded_k, current.m_tile,
+          current.k_tile_block, k_tiles_per_block, 1);
     }
+
+    current = next;
   }
 
   destroy_barriers<COL_TMA_STAGES>(mbar, is_master_thread);
