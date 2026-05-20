@@ -1410,6 +1410,7 @@ __device__ __forceinline__ void store_col_swizzle_tma_tile(const uint8_t* tile_u
   const int load_chunk_subcol = load_row_quad >> 2;
   const int load_chunk_byte = (load_row_quad & 3) * static_cast<int>(sizeof(uint32_t));
 
+#pragma unroll
   for (int tile_rel = warp_id; tile_rel < K_TILES_PER_TMA; tile_rel += TMA_WARPS) {
     const int k_rel_base = tile_rel * SF_TILE_DIM_K;
     const int load_row_base = (k_rel_base + load_k_group) * COL_TMA_TILE_DIM;
@@ -4107,6 +4108,15 @@ __device__ __forceinline__ size_t shfl_sync_size_t(const size_t value, const int
   return static_cast<size_t>((static_cast<uint64_t>(hi) << 32) | lo);
 }
 
+__device__ __forceinline__ size_t shfl_up_sync_size_t(const size_t value, const int delta) {
+  const uint64_t value_u64 = static_cast<uint64_t>(value);
+  uint32_t lo = static_cast<uint32_t>(value_u64);
+  uint32_t hi = static_cast<uint32_t>(value_u64 >> 32);
+  lo = __shfl_up_sync(0xffffffff, lo, delta);
+  hi = __shfl_up_sync(0xffffffff, hi, delta);
+  return static_cast<size_t>((static_cast<uint64_t>(hi) << 32) | lo);
+}
+
 struct GroupedVariableColBlockInfo {
   int found;
   int m_tile_block;
@@ -4132,6 +4142,70 @@ __device__ __forceinline__ GroupedVariableColBlockInfo find_grouped_variable_col
   int padded_k = 0;
   size_t scale_base = 0;
   size_t k_base = 0;
+
+  if (num_tensors <= 32) {
+    const bool lane_has_tensor = lane < num_tensors;
+    const size_t tensor_k = lane_has_tensor ? static_cast<size_t>(k_array[lane]) : 0;
+    const size_t tensor_padded_k =
+        lane_has_tensor
+            ? round_up_to_multiple(DIVUP(tensor_k, static_cast<size_t>(MXFP8_BLOCK_SIZE)),
+                                   static_cast<size_t>(SF_TILE_DIM_K))
+            : 0;
+    const int tensor_num_tiles_k = static_cast<int>(tensor_padded_k / SF_TILE_DIM_K);
+    const int tensor_num_k_blocks = DIVUP(tensor_num_tiles_k, k_tiles_per_block);
+    const int tensor_blocks = lane_has_tensor ? num_m_blocks * tensor_num_k_blocks : 0;
+    const size_t tensor_scale_bytes =
+        lane_has_tensor ? static_cast<size_t>(padded_m) * tensor_padded_k * scale_elem_size : 0;
+
+    int inclusive_blocks = tensor_blocks;
+    size_t inclusive_scale_bytes = tensor_scale_bytes;
+    size_t inclusive_k = tensor_padded_k;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+      const int other_blocks = __shfl_up_sync(0xffffffff, inclusive_blocks, offset);
+      const size_t other_scale_bytes = shfl_up_sync_size_t(inclusive_scale_bytes, offset);
+      const size_t other_k = shfl_up_sync_size_t(inclusive_k, offset);
+      if (lane >= offset) {
+        inclusive_blocks += other_blocks;
+        inclusive_scale_bytes += other_scale_bytes;
+        inclusive_k += other_k;
+      }
+    }
+
+    const int block_base = inclusive_blocks - tensor_blocks;
+    const size_t scale_bytes_base = inclusive_scale_bytes - tensor_scale_bytes;
+    const size_t k_prefix_base = inclusive_k - tensor_padded_k;
+    const bool lane_found =
+        lane_has_tensor && linear_block_id >= block_base && linear_block_id < inclusive_blocks;
+    const unsigned int found_mask = __ballot_sync(0xffffffff, lane_found);
+    const int src_lane = __ffs(static_cast<int>(found_mask)) - 1;
+    if (lane_found) {
+      found = 1;
+      const int local_block_id = linear_block_id - block_base;
+      m_tile_block = local_block_id / tensor_num_k_blocks;
+      k_tile_block = local_block_id - m_tile_block * tensor_num_k_blocks;
+      first_k_tile = k_tile_block * k_tiles_per_block;
+      const int remaining_k_tiles = tensor_num_tiles_k - first_k_tile;
+      active_k_tiles =
+          remaining_k_tiles < k_tiles_per_block ? remaining_k_tiles : k_tiles_per_block;
+      padded_k = static_cast<int>(tensor_padded_k);
+      scale_base = scale_bytes_base;
+      k_base = k_prefix_base;
+    }
+
+    found = found_mask != 0;
+    if (found) {
+      m_tile_block = __shfl_sync(0xffffffff, m_tile_block, src_lane);
+      k_tile_block = __shfl_sync(0xffffffff, k_tile_block, src_lane);
+      first_k_tile = __shfl_sync(0xffffffff, first_k_tile, src_lane);
+      active_k_tiles = __shfl_sync(0xffffffff, active_k_tiles, src_lane);
+      padded_k = __shfl_sync(0xffffffff, padded_k, src_lane);
+      scale_base = shfl_sync_size_t(scale_base, src_lane);
+      k_base = shfl_sync_size_t(k_base, src_lane);
+    }
+    return {found, m_tile_block, k_tile_block, first_k_tile,
+            active_k_tiles, padded_k, scale_base, k_base};
+  }
 
   if (lane == 0) {
     int current_block_base = 0;
