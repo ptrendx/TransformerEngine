@@ -120,6 +120,29 @@ def test_build_cases_includes_grouped_combined_modes():
     )
 
 
+def test_build_cases_include_isolated_256row_tma_columnwise_modes():
+    cases = {case.name: case for case in benchmark_swizzle.build_cases()}
+
+    regular = cases["regular_columnwise_256row_tma_large"]
+    assert regular.api == "regular"
+    assert regular.direction == "columnwise"
+    assert regular.data_shapes == ((8192, 262144),)
+    assert regular.columnwise_tma_tile_rows == 256
+    assert regular.columnwise_tma_k_tiles_per_block == 64
+
+    grouped = cases["grouped_uniform_columnwise_256row_tma_large"]
+    assert grouped.api == "grouped_uniform"
+    assert grouped.direction == "columnwise"
+    assert grouped.data_shapes == ((8192, 32768),) * 8
+    assert grouped.columnwise_tma_tile_rows == 256
+    assert grouped.columnwise_tma_k_tiles_per_block == 64
+
+    for spec in (regular, grouped):
+        _, output_bytes, _ = benchmark_swizzle.case_scale_bytes(spec)
+        assert output_bytes > benchmark_swizzle.SMALL_OUTPUT_LIMIT_BYTES
+        assert benchmark_swizzle.bandwidth_threshold_tbps(output_bytes) == 6.0
+
+
 @pytest.mark.parametrize(
     ("case_name", "expected_classification"),
     [
@@ -152,3 +175,13 @@ def test_small_cases_use_expanded_footprint():
     for case_name in small_case_names:
         _, output_bytes, _ = benchmark_swizzle.case_scale_bytes(cases[case_name])
         assert 16 * 1024 * 1024 <= output_bytes <= benchmark_swizzle.SMALL_OUTPUT_LIMIT_BYTES
+
+
+def test_bandwidth_thresholds_match_case_classification():
+    assert benchmark_swizzle.bandwidth_threshold_tbps(16 * 1024 * 1024) == 3.0
+    assert (
+        benchmark_swizzle.bandwidth_threshold_tbps(
+            benchmark_swizzle.SMALL_OUTPUT_LIMIT_BYTES + 1
+        )
+        == 6.0
+    )

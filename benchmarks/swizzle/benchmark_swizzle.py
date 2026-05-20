@@ -53,6 +53,8 @@ COLUMNWISE_DIRECTION = "columnwise"
 COMBINED_DIRECTION = "rowwise+columnwise"
 SCALE_DIRECTIONS = (ROWWISE_DIRECTION, COLUMNWISE_DIRECTION)
 SMALL_OUTPUT_LIMIT_BYTES = 30 * 1024 * 1024
+SMALL_BANDWIDTH_THRESHOLD_TBPS = 3.0
+LARGE_BANDWIDTH_THRESHOLD_TBPS = 6.0
 
 
 class NVTEShape(ctypes.Structure):
@@ -192,6 +194,8 @@ class CaseSpec:
     direction: str
     data_shapes: tuple[tuple[int, int], ...]
     variable_first_dims: bool = False
+    columnwise_tma_tile_rows: int | None = None
+    columnwise_tma_k_tiles_per_block: int | None = None
 
     @property
     def num_tensors(self) -> int:
@@ -289,6 +293,12 @@ def case_scale_bytes(spec: CaseSpec) -> tuple[int, int, int]:
         output_elems += direction_output
         processed_elems += direction_processed
     return input_elems, output_elems, processed_elems
+
+
+def bandwidth_threshold_tbps(output_scale_bytes: int) -> float:
+    if output_scale_bytes > SMALL_OUTPUT_LIMIT_BYTES:
+        return LARGE_BANDWIDTH_THRESHOLD_TBPS
+    return SMALL_BANDWIDTH_THRESHOLD_TBPS
 
 
 def make_regular_buffer(api: NvteAPI, spec: CaseSpec, device: torch.device) -> BenchBuffer:
@@ -443,7 +453,22 @@ def build_cases() -> list[CaseSpec]:
         CaseSpec("regular_rowwise_small", "regular", "rowwise", ((524288, 1024),)),
         CaseSpec("regular_rowwise_large", "regular", "rowwise", ((524288, 4096),)),
         CaseSpec("regular_columnwise_small", "regular", "columnwise", ((524288, 1024),)),
-        CaseSpec("regular_columnwise_large", "regular", "columnwise", ((4096, 524288),)),
+        CaseSpec(
+            "regular_columnwise_large",
+            "regular",
+            "columnwise",
+            ((4096, 524288),),
+            columnwise_tma_tile_rows=128,
+            columnwise_tma_k_tiles_per_block=32,
+        ),
+        CaseSpec(
+            "regular_columnwise_256row_tma_large",
+            "regular",
+            "columnwise",
+            ((8192, 262144),),
+            columnwise_tma_tile_rows=256,
+            columnwise_tma_k_tiles_per_block=64,
+        ),
         CaseSpec(
             "grouped_uniform_rowwise_small", "grouped_uniform", "rowwise", ((65536, 1024),) * 8
         ),
@@ -461,6 +486,16 @@ def build_cases() -> list[CaseSpec]:
             "grouped_uniform",
             "columnwise",
             ((4096, 65536),) * 8,
+            columnwise_tma_tile_rows=128,
+            columnwise_tma_k_tiles_per_block=32,
+        ),
+        CaseSpec(
+            "grouped_uniform_columnwise_256row_tma_large",
+            "grouped_uniform",
+            "columnwise",
+            ((8192, 32768),) * 8,
+            columnwise_tma_tile_rows=256,
+            columnwise_tma_k_tiles_per_block=64,
         ),
         CaseSpec(
             "grouped_uniform_rowwise_columnwise_small",
@@ -615,6 +650,8 @@ def run_case(
     median_us = statistics.median(samples_us)
     bandwidth_tbps = processed_bytes / (median_us * 1.0e-6) / 1.0e12
     props = torch.cuda.get_device_properties(device)
+    classification = "large" if output_bytes > SMALL_OUTPUT_LIMIT_BYTES else "small"
+    threshold_tbps = bandwidth_threshold_tbps(output_bytes)
 
     case_report: dict[str, Any] = {
         "case_name": spec.name,
@@ -637,7 +674,10 @@ def run_case(
             ]
         },
         "buffer_count": count,
-        "classification": "large" if output_bytes > SMALL_OUTPUT_LIMIT_BYTES else "small",
+        "classification": classification,
+        "bandwidth_threshold_TBps": threshold_tbps,
+        "threshold_metric": "bandwidth_TBps",
+        "threshold_unit": "TB/s",
         "warmup_iterations": args.warmup_iterations,
         "measurement_iterations": args.measurement_iterations,
         "launches_per_sample": launches_per_sample,
@@ -652,6 +692,12 @@ def run_case(
         case_report["K"] = spec.data_shapes[0][1]
     else:
         case_report["shapes"] = [list(shape) for shape in spec.data_shapes]
+    if spec.columnwise_tma_tile_rows is not None:
+        case_report["columnwise_tma_tile_rows"] = spec.columnwise_tma_tile_rows
+    if spec.columnwise_tma_k_tiles_per_block is not None:
+        case_report["columnwise_tma_k_tiles_per_block"] = (
+            spec.columnwise_tma_k_tiles_per_block
+        )
     return case_report
 
 

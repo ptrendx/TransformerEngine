@@ -228,16 +228,19 @@ void fill_deterministic_scale_bytes(std::vector<uint8_t> *buf) {
   }
 }
 
-void performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise() {
+void performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise(
+    const size_t data_first_dim, const char *comparison_name) {
   using namespace test;
 
   // Columnwise swizzle only reads scale_inv. Keep the logical data shape
   // large enough to select the TMA path without allocating that data tensor.
-  constexpr size_t data_first_dim = 4096;
+  // data_first_dim=4096 selects the 32-K-tile/128-row TMA variant, while
+  // data_first_dim=8192 selects the 64-K-tile/256-row TMA variant.
   constexpr size_t data_last_dim = 256 * 1024;
-  constexpr size_t scale_k = data_first_dim / MXFP8_BLOCK_SIZE;
+  ASSERT_EQ(data_first_dim % MXFP8_BLOCK_SIZE, 0);
+  const size_t scale_k = data_first_dim / MXFP8_BLOCK_SIZE;
   constexpr size_t scale_m = data_last_dim;
-  constexpr size_t scale_numel = scale_k * scale_m;
+  const size_t scale_numel = scale_k * scale_m;
 
   ASSERT_GT(scale_numel, kSmallSwizzleOutputBytes);
   ASSERT_EQ(scale_k % MAT_TILE_DIM_M, 0);
@@ -276,22 +279,24 @@ void performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise() {
   std::vector<uint8_t> output_host(scale_numel);
   NVTE_CHECK_CUDA(cudaMemcpy(output_host.data(), output_scale.get(), scale_numel,
                              cudaMemcpyDeviceToHost));
-  compareResults("large_tma_regular_columnwise_swizzle", output_host.data(), ref_output.data(),
-                 scale_numel);
+  compareResults(comparison_name, output_host.data(), ref_output.data(), scale_numel);
 }
 
-void performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise() {
+void performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise(
+    const size_t data_first_dim, const char *comparison_name) {
   using namespace test;
 
   // Four uniform tensors keep each per-tensor scale buffer moderate while the
   // grouped output scale storage still crosses the large-case TMA threshold.
+  // data_first_dim=4096 selects the 32-K-tile/128-row TMA variant, while
+  // data_first_dim=8192 selects the 64-K-tile/256-row TMA variant.
   constexpr size_t num_tensors = 4;
-  constexpr size_t data_first_dim = 4096;
   constexpr size_t data_last_dim = 64 * 1024;
-  constexpr size_t scale_k = data_first_dim / MXFP8_BLOCK_SIZE;
+  ASSERT_EQ(data_first_dim % MXFP8_BLOCK_SIZE, 0);
+  const size_t scale_k = data_first_dim / MXFP8_BLOCK_SIZE;
   constexpr size_t scale_m = data_last_dim;
-  constexpr size_t per_tensor_scale_numel = scale_k * scale_m;
-  constexpr size_t total_scale_numel = num_tensors * per_tensor_scale_numel;
+  const size_t per_tensor_scale_numel = scale_k * scale_m;
+  const size_t total_scale_numel = num_tensors * per_tensor_scale_numel;
 
   ASSERT_GT(total_scale_numel, kSmallSwizzleOutputBytes);
   ASSERT_EQ(scale_k % MAT_TILE_DIM_M, 0);
@@ -335,8 +340,7 @@ void performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise() {
   std::vector<uint8_t> output_host(total_scale_numel);
   NVTE_CHECK_CUDA(cudaMemcpy(output_host.data(), output_scale.get(), total_scale_numel,
                              cudaMemcpyDeviceToHost));
-  compareResults("large_tma_grouped_uniform_columnwise_swizzle", output_host.data(),
-                 ref_output.data(), total_scale_numel);
+  compareResults(comparison_name, output_host.data(), ref_output.data(), total_scale_numel);
 }
 
 void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
@@ -561,7 +565,18 @@ TEST(SwizzleFullTileFastPathTest, TestSwizzleMXFP8RegularLargeFullTileTMAColumnw
     GTEST_SKIP() << "Blackwell TMA columnwise swizzle requires Blackwell or newer.";
   }
 
-  performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise();
+  performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise(
+      /*data_first_dim=*/4096, "large_tma_regular_columnwise_swizzle_128_rows");
+}
+
+TEST(SwizzleFullTileFastPathTest,
+     TestSwizzleMXFP8RegularLargeFullTileTMAColumnwise64KTiles) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell TMA columnwise swizzle requires Blackwell or newer.";
+  }
+
+  performTestSwizzleMXFP8RegularLargeFullTileTMAColumnwise(
+      /*data_first_dim=*/8192, "large_tma_regular_columnwise_swizzle_256_rows");
 }
 
 class UnswizzleTestSuite : public ::testing::TestWithParam<std::tuple<std::pair<size_t, size_t>, std::pair<bool, bool>, bool>> {};
@@ -1134,7 +1149,18 @@ TEST(SwizzleGroupedFullTileFastPathTest,
     GTEST_SKIP() << "Blackwell grouped TMA columnwise swizzle requires Blackwell or newer.";
   }
 
-  performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise();
+  performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise(
+      /*data_first_dim=*/4096, "large_tma_grouped_uniform_columnwise_swizzle_128_rows");
+}
+
+TEST(SwizzleGroupedFullTileFastPathTest,
+     TestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise64KTiles) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell grouped TMA columnwise swizzle requires Blackwell or newer.";
+  }
+
+  performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise(
+      /*data_first_dim=*/8192, "large_tma_grouped_uniform_columnwise_swizzle_256_rows");
 }
 
 TEST(SwizzleGroupedVariablePersistentTest,
