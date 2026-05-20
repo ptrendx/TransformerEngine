@@ -50,7 +50,7 @@ constexpr int ROW_COALESCED_32COL_TARGET_SMEM_BYTES = 18 * 1024;
 constexpr int ROW_COALESCED_NARROW_TARGET_SMEM_BYTES = 48 * 1024;
 constexpr int ROW_COALESCED_WIDE_TARGET_SMEM_BYTES = 24 * 1024;
 constexpr int ROW_COALESCED_LOAD_PREFETCH = 4;
-constexpr int COL_COALESCED_THREADS = 256;
+constexpr int COL_COALESCED_THREADS = 512;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_DIRECT_WARPS = COL_COALESCED_THREADS / 32;
 constexpr int COL_DIRECT_ROW_QUADS = 8;
@@ -64,10 +64,9 @@ constexpr int COL_TMA_STAGES = 2;
 // valid for all dynamic shared-memory base addresses.
 constexpr size_t COL_TMA_SWIZZLE_ALIGNMENT = 1024;
 // Keep multiple independent columnwise CTAs resident so TMA/shared-memory
-// dependency stalls are hidden instead of serializing one block per SM. TMA
-// kernels still cap this target by the runtime occupancy query because their
-// dynamic shared-memory footprint can be the tighter limit.
-constexpr int COL_PERSISTENT_TARGET_BLOCKS_PER_SM = 8;
+// dependency stalls are hidden instead of serializing one block per SM. With
+// 16-warp columnwise CTAs, four resident CTAs fill the warp scheduler budget.
+constexpr int COL_PERSISTENT_TARGET_BLOCKS_PER_SM = 4;
 constexpr size_t SMALL_SWIZZLE_OUTPUT_BYTES = 30 * 1024 * 1024;
 
 // output is in ~K-major interleaved blocks
