@@ -343,13 +343,13 @@ void performTestGroupedSwizzleMXFP8UniformLargeFullTileTMAColumnwise(
   compareResults(comparison_name, output_host.data(), ref_output.data(), total_scale_numel);
 }
 
-void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
+void performTestGroupedSwizzleMXFP8VariableLargeTMAColumnwise(
+    const std::vector<int64_t>& first_dims, const char *comparison_name) {
   using namespace test;
 
-  constexpr size_t num_tensors = 4;
   constexpr size_t data_last_dim = 32 * 1024;
-  const std::vector<int64_t> first_dims{4096, 8192, 8192, 12288};
-  ASSERT_EQ(first_dims.size(), num_tensors);
+  const size_t num_tensors = first_dims.size();
+  ASSERT_GT(num_tensors, 0);
   std::vector<int64_t> tensor_offsets(num_tensors + 1, 0);
   for (size_t i = 0; i < num_tensors; ++i) {
     tensor_offsets[i + 1] = tensor_offsets[i] + first_dims[i] * data_last_dim;
@@ -369,7 +369,8 @@ void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
   size_t scale_offset = 0;
   for (const int64_t first_dim : first_dims) {
     const size_t scale_k = static_cast<size_t>(first_dim) / MXFP8_BLOCK_SIZE;
-    ASSERT_EQ(scale_k % MAT_TILE_DIM_M, 0);
+    ASSERT_EQ(first_dim % MXFP8_BLOCK_SIZE, 0);
+    ASSERT_EQ(scale_k % 4, 0);
     compute_ref_swizzle<128, 4, false>(input_host.data() + scale_offset,
                                        ref_output.data() + scale_offset, scale_m, scale_k);
     scale_offset += scale_k * scale_m;
@@ -426,8 +427,7 @@ void performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise() {
   std::vector<uint8_t> output_host(total_scale_numel);
   NVTE_CHECK_CUDA(cudaMemcpy(output_host.data(), output_scale.get(), total_scale_numel,
                              cudaMemcpyDeviceToHost));
-  compareResults("large_tma_grouped_variable_columnwise_swizzle", output_host.data(),
-                 ref_output.data(), total_scale_numel);
+  compareResults(comparison_name, output_host.data(), ref_output.data(), total_scale_numel);
 }
 
 }  // namespace
@@ -1169,7 +1169,22 @@ TEST(SwizzleGroupedVariablePersistentTest,
     GTEST_SKIP() << "Blackwell grouped-variable TMA columnwise swizzle requires Blackwell or newer.";
   }
 
-  performTestGroupedSwizzleMXFP8VariableLargeFullTileTMAColumnwise();
+  performTestGroupedSwizzleMXFP8VariableLargeTMAColumnwise(
+      {4096, 8192, 8192, 12288}, "large_tma_grouped_variable_columnwise_swizzle");
+}
+
+TEST(SwizzleGroupedVariablePersistentTest,
+     TestGroupedSwizzleMXFP8VariableLargePartialKTMAColumnwise64KTiles) {
+  if (test::getDeviceComputeCapability() < test::blackwellComputeCapability) {
+    GTEST_SKIP() << "Blackwell grouped-variable TMA columnwise swizzle requires Blackwell or newer.";
+  }
+
+  // Average per-tensor K coverage selects the 64-K-tile TMA kernel, while the
+  // 6144- and 10240-row tensors leave trailing partial K blocks with more than
+  // the 8 active warps available in the 256-thread TMA CTA.
+  performTestGroupedSwizzleMXFP8VariableLargeTMAColumnwise(
+      {10240, 6144, 8192, 8192},
+      "large_tma_grouped_variable_partial_k_columnwise_swizzle_64_k_tiles");
 }
 
 INSTANTIATE_TEST_SUITE_P(

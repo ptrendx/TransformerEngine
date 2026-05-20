@@ -1266,14 +1266,17 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
       m_tiles_per_block, slm_i32);
 }
 
-template <int SF_TILE_DIM_M, int SF_TILE_DIM_K>
+template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, int CTA_WARPS = COL_DIRECT_WARPS>
 __device__ void swizzle_col_scaling_direct_full_tile_impl(
     const void* input, void* output, const int M, const int K, const int m_tile_block,
     const int k_tile_block, const int k_tiles_per_block, const int m_tiles_per_block) {
   static_assert(SF_TILE_DIM_M == 128 && SF_TILE_DIM_K == 4,
                 "Direct columnwise swizzle assumes the MXFP8 swizzle tile shape.");
   constexpr int SF_TILE_SIZE = SF_TILE_DIM_M * SF_TILE_DIM_K;
-  static_assert(COL_DIRECT_WARPS * 32 == COL_COALESCED_THREADS,
+  static_assert(CTA_WARPS == COL_DIRECT_WARPS || CTA_WARPS == COL_TMA_WARPS,
+                "Column direct swizzle warp count must match the caller launch shape.");
+  static_assert(CTA_WARPS * 32 == COL_COALESCED_THREADS ||
+                    CTA_WARPS * 32 == COL_TMA_THREADS,
                 "Column direct swizzle expects a whole number of warps.");
 
   const int num_tiles_m = M / SF_TILE_DIM_M;
@@ -1302,7 +1305,7 @@ __device__ void swizzle_col_scaling_direct_full_tile_impl(
   for (int local_m_tile = 0; local_m_tile < active_m_tiles; ++local_m_tile) {
     const int m_tile = first_m_tile + local_m_tile;
     for (int local_k_tile = warp_id; local_k_tile < active_k_tiles;
-         local_k_tile += COL_DIRECT_WARPS) {
+         local_k_tile += CTA_WARPS) {
       const int k_tile = first_k_tile + local_k_tile;
       const uint8_t* input_tile =
           input_u8 + static_cast<size_t>(k_tile) * SF_TILE_DIM_K * M +
@@ -4220,7 +4223,7 @@ __global__ void __launch_bounds__(COL_TMA_THREADS, COL_TMA_TARGET_BLOCKS_PER_SM)
     } else if (current.valid) {
       const uint8_t* input_base = reinterpret_cast<const uint8_t*>(input) + current.scale_base;
       uint8_t* output_base = reinterpret_cast<uint8_t*>(output) + current.scale_base;
-      swizzle_col_scaling_direct_full_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+      swizzle_col_scaling_direct_full_tile_impl<SF_TILE_DIM_M, SF_TILE_DIM_K, COL_TMA_WARPS>(
           input_base, output_base, padded_m, current.padded_k, current.m_tile,
           current.k_tile_block, k_tiles_per_block, 1);
     }
