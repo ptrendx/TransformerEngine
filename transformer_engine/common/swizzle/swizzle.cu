@@ -1151,6 +1151,18 @@ __device__ __forceinline__ const uint8_t* col_tma_swizzled_atom_32b_ptr(
          swizzled_chunk_col * CHUNK_BYTES + chunk_byte;
 }
 
+__device__ __forceinline__ uint32_t pack_col_swizzle_k_bytes(const uint32_t k0,
+                                                             const uint32_t k1,
+                                                             const uint32_t k2,
+                                                             const uint32_t k3,
+                                                             const int byte_idx) {
+  const uint32_t selector =
+      static_cast<uint32_t>(byte_idx) | (static_cast<uint32_t>(byte_idx + 4) << 4);
+  const uint32_t lo = __byte_perm(k0, k1, selector);
+  const uint32_t hi = __byte_perm(k2, k3, selector);
+  return (lo & 0x0000ffffu) | (hi << 16);
+}
+
 template <int SF_TILE_DIM_M, int SF_TILE_DIM_K, bool FULL_TILE = false>
 __device__ void swizzle_col_scaling_coalesced_tile_impl(
     const void* input, void* output, const int M, const int K, const int original_M,
@@ -1315,14 +1327,14 @@ __device__ void swizzle_col_scaling_direct_full_tile_impl(
       uint32_t* value_words = reinterpret_cast<uint32_t*>(&value);
 #pragma unroll
       for (int m_group = 0; m_group < 4; ++m_group) {
-        uint32_t word = 0;
-#pragma unroll
-        for (int k_group = 0; k_group < 4; ++k_group) {
-          const int src_lane = k_group * COL_DIRECT_ROW_QUADS + output_row_quad;
-          const uint32_t packed = __shfl_sync(0xffffffff, loaded_words[m_group], src_lane);
-          word |= ((packed >> (8 * output_byte)) & 0xffu) << (8 * k_group);
-        }
-        value_words[m_group] = word;
+        const uint32_t k0 = __shfl_sync(0xffffffff, loaded_words[m_group], output_row_quad);
+        const uint32_t k1 =
+            __shfl_sync(0xffffffff, loaded_words[m_group], COL_DIRECT_ROW_QUADS + output_row_quad);
+        const uint32_t k2 = __shfl_sync(
+            0xffffffff, loaded_words[m_group], 2 * COL_DIRECT_ROW_QUADS + output_row_quad);
+        const uint32_t k3 = __shfl_sync(
+            0xffffffff, loaded_words[m_group], 3 * COL_DIRECT_ROW_QUADS + output_row_quad);
+        value_words[m_group] = pack_col_swizzle_k_bytes(k0, k1, k2, k3, output_byte);
       }
       store_global_cs(output_v4 + lane, value);
     }
@@ -1376,14 +1388,14 @@ __device__ __forceinline__ void store_col_swizzle_tma_tile(const uint8_t* tile_u
     uint32_t* value_words = reinterpret_cast<uint32_t*>(&value);
 #pragma unroll
     for (int m_group = 0; m_group < 4; ++m_group) {
-      uint32_t word = 0;
-#pragma unroll
-      for (int k_group = 0; k_group < SF_TILE_DIM_K; ++k_group) {
-        const int src_lane = k_group * COL_DIRECT_ROW_QUADS + output_row_quad;
-        const uint32_t packed = __shfl_sync(0xffffffff, loaded_words[m_group], src_lane);
-        word |= ((packed >> (8 * output_byte)) & 0xffu) << (8 * k_group);
-      }
-      value_words[m_group] = word;
+      const uint32_t k0 = __shfl_sync(0xffffffff, loaded_words[m_group], output_row_quad);
+      const uint32_t k1 =
+          __shfl_sync(0xffffffff, loaded_words[m_group], COL_DIRECT_ROW_QUADS + output_row_quad);
+      const uint32_t k2 = __shfl_sync(0xffffffff, loaded_words[m_group],
+                                      2 * COL_DIRECT_ROW_QUADS + output_row_quad);
+      const uint32_t k3 = __shfl_sync(0xffffffff, loaded_words[m_group],
+                                      3 * COL_DIRECT_ROW_QUADS + output_row_quad);
+      value_words[m_group] = pack_col_swizzle_k_bytes(k0, k1, k2, k3, output_byte);
     }
     store_global_cs(output_v4 + tile_rel * OUTPUT_V4_PER_TILE + lane, value);
   }
@@ -4058,11 +4070,12 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
       ~static_cast<uintptr_t>(COL_TMA_SWIZZLE_ALIGNMENT - 1));
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ alignas(8) uint64_t mbar[1];
+  __shared__ alignas(8) uint64_t mbar[COL_TMA_STAGES];
   const bool is_master_thread = threadIdx.x == 0;
-  initialize_barriers<1, THREADS_PER_BLOCK>(mbar, is_master_thread);
+  initialize_barriers<COL_TMA_STAGES, THREADS_PER_BLOCK>(mbar, is_master_thread);
 
-  int parity = 0;
+  int stage0_parity = 0;
+  int stage1_parity = 0;
   for (int linear_block_id = static_cast<int>(blockIdx.x); linear_block_id < total_blocks;
        linear_block_id += gridDim.x) {
     int current_block_base = 0;
@@ -4112,26 +4125,47 @@ __global__ void __launch_bounds__(COL_COALESCED_THREADS)
       continue;
     }
 
-    for (int local_m_tile = 0; local_m_tile < m_tiles_per_block; ++local_m_tile) {
-      const int m_tile = m_tile_block * m_tiles_per_block + local_m_tile;
-      if (m_tile >= num_tiles_m) continue;
-
+    const int first_m_tile = m_tile_block * m_tiles_per_block;
+    if (first_m_tile < num_tiles_m) {
       copy_2d_to_shared(tile_u8, reinterpret_cast<const void*>(&input_map),
-                        static_cast<size_t>(m_tile) * SF_TILE_DIM_M,
+                        static_cast<size_t>(first_m_tile) * SF_TILE_DIM_M,
                         current_k_base + static_cast<size_t>(first_k_tile) * SF_TILE_DIM_K,
                         COL_TMA_TILE_BYTES, &mbar[0], is_master_thread);
-      ptx::fence_proxy_async_shared_cta();
-      ptx::mbarrier_wait_parity(&mbar[0], parity);
-      parity ^= 1;
+    }
 
-      store_col_swizzle_tma_tile<SF_TILE_DIM_M, SF_TILE_DIM_K>(tile_u8, output_base, m_tile,
-                                                               first_k_tile, padded_k);
+    for (int local_m_tile = 0; local_m_tile < m_tiles_per_block; ++local_m_tile) {
+      const int m_tile = first_m_tile + local_m_tile;
+      if (m_tile >= num_tiles_m) break;
+
+      const int next_m_tile = m_tile + 1;
+      if (local_m_tile + 1 < m_tiles_per_block && next_m_tile < num_tiles_m) {
+        const int next_stage = (local_m_tile + 1) % COL_TMA_STAGES;
+        ptx::cp_async_bulk_wait_group_read<1>();
+        copy_2d_to_shared(tile_u8 + next_stage * COL_TMA_TILE_BYTES,
+                          reinterpret_cast<const void*>(&input_map),
+                          static_cast<size_t>(next_m_tile) * SF_TILE_DIM_M,
+                          current_k_base + static_cast<size_t>(first_k_tile) * SF_TILE_DIM_K,
+                          COL_TMA_TILE_BYTES, &mbar[next_stage], is_master_thread);
+      }
+
+      const int stage = local_m_tile % COL_TMA_STAGES;
+      ptx::fence_proxy_async_shared_cta();
+      const int parity = stage == 0 ? stage0_parity : stage1_parity;
+      ptx::mbarrier_wait_parity(&mbar[stage], parity);
+      if (stage == 0) {
+        stage0_parity ^= 1;
+      } else {
+        stage1_parity ^= 1;
+      }
+
+      store_col_swizzle_tma_tile<SF_TILE_DIM_M, SF_TILE_DIM_K>(
+          tile_u8 + stage * COL_TMA_TILE_BYTES, output_base, m_tile, first_k_tile, padded_k);
       __syncthreads();
       ptx::fence_proxy_async_shared_cta();
     }
   }
 
-  destroy_barriers<1>(mbar, is_master_thread);
+  destroy_barriers<COL_TMA_STAGES>(mbar, is_master_thread);
 #else
   NVTE_DEVICE_ERROR(
       "grouped_swizzle_col_scaling_variable_shape_tma_persistent_full_tile_kernel requires SM "
@@ -4671,7 +4705,8 @@ void swizzle_grouped_scaling_factors(const GroupedTensor* input, GroupedTensor* 
               input_map, input->columnwise_scale_inv.dptr,
               static_cast<uint64_t>(input->logical_shape.data[0] / MXFP8_BLOCK_SIZE),
               static_cast<uint64_t>(padded_m));
-          const int tma_smem_size = COL_TMA_TILE_BYTES + COL_TMA_SWIZZLE_ALIGNMENT;
+          const int tma_smem_size =
+              COL_TMA_STAGES * COL_TMA_TILE_BYTES + COL_TMA_SWIZZLE_ALIGNMENT;
           const int persistent_blocks = col_tma_persistent_grid_blocks(
               total_blocks,
               grouped_swizzle_col_scaling_variable_shape_tma_persistent_full_tile_kernel<
