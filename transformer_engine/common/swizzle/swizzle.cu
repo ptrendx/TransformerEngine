@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <mutex>
 #include <numeric>
 #include <type_traits>
@@ -63,9 +64,9 @@ constexpr int COL_TMA_K_TILE_DIM = 256;
 constexpr int COL_TMA_K_TILES_SMALL = COL_TMA_TILE_DIM / 4;
 constexpr int COL_TMA_K_TILES_LARGE = COL_TMA_K_TILE_DIM / 4;
 constexpr int COL_TMA_STAGES = 1;
-// The 128B atom swizzle pattern repeats every 1024 bytes. Aligning the staging
-// tile to that repeat boundary keeps the decode helper's row-relative indices
-// valid without spending an extra 1 KiB of dynamic shared memory per CTA.
+// The 128B atom swizzle pattern repeats every 1024 bytes. The TMA kernels
+// manually round the dynamic shared-memory base up to this boundary before
+// decoding the staged tile.
 constexpr size_t COL_TMA_SWIZZLE_ALIGNMENT = 1024;
 // Keep multiple independent columnwise CTAs resident so TMA/shared-memory
 // dependency stalls are hidden instead of serializing one block per SM.
@@ -80,9 +81,34 @@ constexpr int col_tma_tile_bytes() {
 
 template <int SF_TILE_DIM_K, int K_TILES_PER_TMA>
 constexpr int col_tma_dynamic_smem_bytes() {
-  return COL_TMA_STAGES *
-         (col_tma_tile_bytes<SF_TILE_DIM_K, K_TILES_PER_TMA>() +
-          static_cast<int>(sizeof(uint64_t)));
+  return static_cast<int>(COL_TMA_SWIZZLE_ALIGNMENT - 1) +
+         COL_TMA_STAGES * col_tma_tile_bytes<SF_TILE_DIM_K, K_TILES_PER_TMA>() +
+         COL_TMA_STAGES * static_cast<int>(sizeof(uint64_t));
+}
+
+struct ColTmaDynamicSmemLayout {
+  uint8_t* tile_u8;
+  uint64_t* mbar;
+};
+
+template <int SF_TILE_DIM_K, int K_TILES_PER_TMA>
+__device__ __forceinline__ ColTmaDynamicSmemLayout col_tma_dynamic_smem_layout(
+    char* dynamic_shmem) {
+  static_assert((COL_TMA_SWIZZLE_ALIGNMENT & (COL_TMA_SWIZZLE_ALIGNMENT - 1)) == 0,
+                "TMA swizzle alignment must be a power of two.");
+  constexpr int TMA_TILE_BYTES = col_tma_tile_bytes<SF_TILE_DIM_K, K_TILES_PER_TMA>();
+  static_assert(TMA_TILE_BYTES % static_cast<int>(sizeof(uint64_t)) == 0,
+                "TMA tile bytes must keep mbarriers aligned.");
+
+  // __align__ on extern dynamic shared memory does not guarantee the returned
+  // pointer alignment, so reserve padding and explicitly round the tile base.
+  const uintptr_t base_shmem_ptr = reinterpret_cast<uintptr_t>(dynamic_shmem);
+  const uintptr_t aligned_shmem_ptr =
+      (base_shmem_ptr + COL_TMA_SWIZZLE_ALIGNMENT - 1) &
+      ~(static_cast<uintptr_t>(COL_TMA_SWIZZLE_ALIGNMENT) - 1);
+  uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(aligned_shmem_ptr);
+  uint64_t* mbar = reinterpret_cast<uint64_t*>(tile_u8 + COL_TMA_STAGES * TMA_TILE_BYTES);
+  return {tile_u8, mbar};
 }
 
 // output is in ~K-major interleaved blocks
@@ -1448,9 +1474,10 @@ __global__ void __launch_bounds__(COL_TMA_THREADS, COL_TMA_TARGET_BLOCKS_PER_SM)
   if (k_tiles_per_block != K_TILES_PER_TMA) return;
 
   extern __shared__ __align__(COL_TMA_SWIZZLE_ALIGNMENT) char dynamic_shmem[];
-  uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(dynamic_shmem);
-
-  uint64_t* mbar = reinterpret_cast<uint64_t*>(tile_u8 + COL_TMA_STAGES * TMA_TILE_BYTES);
+  ColTmaDynamicSmemLayout smem =
+      col_tma_dynamic_smem_layout<SF_TILE_DIM_K, K_TILES_PER_TMA>(dynamic_shmem);
+  uint8_t* tile_u8 = smem.tile_u8;
+  uint64_t* mbar = smem.mbar;
   const bool is_master_thread = threadIdx.x == 0;
   initialize_barriers<COL_TMA_STAGES, THREADS_PER_BLOCK>(mbar, is_master_thread);
 
@@ -1524,9 +1551,10 @@ __global__ void __launch_bounds__(COL_TMA_THREADS, COL_TMA_TARGET_BLOCKS_PER_SM)
   if (k_tiles_per_block != K_TILES_PER_TMA) return;
 
   extern __shared__ __align__(COL_TMA_SWIZZLE_ALIGNMENT) char dynamic_shmem[];
-  uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(dynamic_shmem);
-
-  uint64_t* mbar = reinterpret_cast<uint64_t*>(tile_u8 + COL_TMA_STAGES * TMA_TILE_BYTES);
+  ColTmaDynamicSmemLayout smem =
+      col_tma_dynamic_smem_layout<SF_TILE_DIM_K, K_TILES_PER_TMA>(dynamic_shmem);
+  uint8_t* tile_u8 = smem.tile_u8;
+  uint64_t* mbar = smem.mbar;
   const bool is_master_thread = threadIdx.x == 0;
   initialize_barriers<COL_TMA_STAGES, THREADS_PER_BLOCK>(mbar, is_master_thread);
 
@@ -4232,9 +4260,10 @@ __global__ void __launch_bounds__(COL_TMA_THREADS, COL_TMA_TARGET_BLOCKS_PER_SM)
   const int num_m_blocks = DIVUP(num_tiles_m, m_tiles_per_block);
 
   extern __shared__ __align__(COL_TMA_SWIZZLE_ALIGNMENT) char dynamic_shmem[];
-  uint8_t* tile_u8 = reinterpret_cast<uint8_t*>(dynamic_shmem);
-
-  uint64_t* mbar = reinterpret_cast<uint64_t*>(tile_u8 + COL_TMA_STAGES * TMA_TILE_BYTES);
+  ColTmaDynamicSmemLayout smem =
+      col_tma_dynamic_smem_layout<SF_TILE_DIM_K, K_TILES_PER_TMA>(dynamic_shmem);
+  uint8_t* tile_u8 = smem.tile_u8;
+  uint64_t* mbar = smem.mbar;
   const bool is_master_thread = threadIdx.x == 0;
   initialize_barriers<COL_TMA_STAGES, THREADS_PER_BLOCK>(mbar, is_master_thread);
 
