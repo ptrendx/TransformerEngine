@@ -1180,8 +1180,8 @@ TEST(SwizzleGroupedVariablePersistentTest,
   }
 
   // Average per-tensor K coverage selects the 64-K-tile TMA kernel, while the
-  // 6144- and 10240-row tensors leave trailing partial K blocks with more than
-  // the 8 active warps available in the 256-thread TMA CTA.
+  // 6144- and 10240-row tensors leave trailing partial K blocks, so this covers
+  // the direct partial-block fallback used beside the full-block TMA path.
   performTestGroupedSwizzleMXFP8VariableLargeTMAColumnwise(
       {10240, 6144, 8192, 8192},
       "large_tma_grouped_variable_partial_k_columnwise_swizzle_64_k_tiles");

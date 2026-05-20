@@ -55,7 +55,10 @@ constexpr int COL_COALESCED_THREADS = 512;
 constexpr int COL_COALESCED_K_TILES_PER_BLOCK = 32;
 constexpr int COL_DIRECT_WARPS = COL_COALESCED_THREADS / 32;
 constexpr int COL_DIRECT_ROW_QUADS = 8;
-constexpr int COL_TMA_THREADS = 256;
+// Use enough output warps per TMA CTA to hide the shared-tile decode latency
+// that dominates the columnwise Blackwell path. The occupancy helper below
+// still caps the persistent grid by the actual register/shared-memory limit.
+constexpr int COL_TMA_THREADS = 512;
 constexpr int COL_TMA_WARPS = COL_TMA_THREADS / 32;
 constexpr int COL_WARP_TILE_WARPS = 8;
 constexpr int COL_WARP_TILE_THREADS = COL_WARP_TILE_WARPS * 32;
@@ -71,7 +74,7 @@ constexpr size_t COL_TMA_SWIZZLE_ALIGNMENT = 1024;
 // Keep multiple independent columnwise CTAs resident so TMA/shared-memory
 // dependency stalls are hidden instead of serializing one block per SM.
 constexpr int COL_PERSISTENT_TARGET_BLOCKS_PER_SM = 4;
-constexpr int COL_TMA_TARGET_BLOCKS_PER_SM = 6;
+constexpr int COL_TMA_TARGET_BLOCKS_PER_SM = 4;
 constexpr size_t SMALL_SWIZZLE_OUTPUT_BYTES = 30 * 1024 * 1024;
 
 template <int SF_TILE_DIM_K, int K_TILES_PER_TMA>
