@@ -83,6 +83,10 @@ from ..cpp_extensions import (
 __all__ = ["LayerNormLinear"]
 
 
+_NO_FP8_QUANTIZERS = (None, None, None, None, None, None)
+_NO_WEIGHT_QUANTIZERS = (None,)
+
+
 class _LayerNormLinear(torch.autograd.Function):
     """LayerNormLinear semi-top level module
     Calls custom cuda extensions.
@@ -1712,7 +1716,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
 
     def _get_quantizers(self, fp8_output, fp8_grad, is_grad_enabled):
         if not self.fp8:
-            return [None] * 6
+            return _NO_FP8_QUANTIZERS
         grad_input_quantizer = None
         grad_weight_quantizer = None
         grad_output_quantizer = None
@@ -1908,7 +1912,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
     def _get_weight_quantizers(self) -> List[Quantizer]:
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
-            return [None]
+            return _NO_WEIGHT_QUANTIZERS
         weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         weight_quantizer.internal = True
-        return [weight_quantizer]
+        return (weight_quantizer,)

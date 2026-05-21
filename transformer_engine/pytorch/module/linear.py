@@ -80,6 +80,10 @@ from ...debug.pytorch.debug_state import TEDebugState
 __all__ = ["Linear"]
 
 
+_NO_FP8_QUANTIZERS = (None, None, None, None, None, None)
+_NO_WEIGHT_QUANTIZERS = (None,)
+
+
 def _check_fp8_reduce_and_update():
     """Check if this is the first FP8 module (for backward reduce-and-update)."""
     qstate = FP8GlobalStateManager.quantization_state
@@ -1723,7 +1727,7 @@ class Linear(TransformerEngineBaseModule):
 
     def _get_quantizers(self, fp8_output, fp8_grad, is_grad_enabled):
         if not self.fp8:
-            return [None] * 6
+            return _NO_FP8_QUANTIZERS
         grad_input_quantizer = None
         grad_weight_quantizer = None
         grad_output_quantizer = None
@@ -1910,7 +1914,7 @@ class Linear(TransformerEngineBaseModule):
     def _get_weight_quantizers(self) -> List[Quantizer]:
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
-            return [None]
+            return _NO_WEIGHT_QUANTIZERS
         weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         weight_quantizer.internal = True
-        return [weight_quantizer]
+        return (weight_quantizer,)

@@ -93,6 +93,10 @@ from ...debug.pytorch.debug_state import TEDebugState
 __all__ = ["LayerNormMLP"]
 
 
+_NO_FP8_QUANTIZERS = (None, None, None, None, None, None, None, None, None, None, None, None)
+_NO_WEIGHT_QUANTIZERS = (None, None)
+
+
 def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
     if recipe is None:
         # bf16 (recipe is None):
@@ -2336,6 +2340,8 @@ class LayerNormMLP(TransformerEngineBaseModule):
         return out
 
     def _get_quantizers(self, fp8_output, is_grad_enabled):
+        if not self.fp8 and not self.fp8_calibration:
+            return _NO_FP8_QUANTIZERS
         (
             fc1_input_quantizer,
             fc1_output_quantizer,
@@ -2625,12 +2631,12 @@ class LayerNormMLP(TransformerEngineBaseModule):
     def _get_weight_quantizers(self) -> List[Quantizer]:
         """Get the weight quantizers of the module."""
         if not self.fp8 and not self.fp8_calibration:
-            return [None, None]
+            return _NO_WEIGHT_QUANTIZERS
         fc1_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         fc1_weight_quantizer.internal = True
         fc2_weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM2_WEIGHT]
         fc2_weight_quantizer.internal = True
-        return [fc1_weight_quantizer, fc2_weight_quantizer]
+        return (fc1_weight_quantizer, fc2_weight_quantizer)
 
     def backward_dw(self):
         """
