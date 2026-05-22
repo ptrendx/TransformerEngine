@@ -32,6 +32,7 @@ def _run_benchmark(args):
 def _assert_raw_report(data, expected_case_ids=None):
     assert data["schema_version"] == "benchmark_raw_report/v1"
     required_keys = {
+        "schema_version",
         "command",
         "working_directory",
         "repo_ref",
