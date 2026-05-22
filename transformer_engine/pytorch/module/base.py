@@ -772,6 +772,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.fp8_initialized = False
         self.fp8 = False
         self.fp8_calibration = False
+        self.fp8_parameters = False
         self.fp8_meta = {}
         self.fp8_meta["fp8_checkpoint"] = False
         self.fp8_meta["fp8_group"] = None
@@ -786,6 +787,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.fsdp_wrapped = False
         self.fsdp_group = None
         self._fp8_workspaces: Dict[str, QuantizedTensor] = {}
+        self._fp8_workspace_versions: Dict[str, int] = {}
         self.activation_dtype: Optional[torch.dtype] = None
         self.wgrad_accumulation_and_reduce_hooks = []
         self.wgrad_store = None
@@ -1137,6 +1139,69 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.fast_setattr("tp_group", tp_group)
         self.fast_setattr("tp_group_initialized", True)
 
+    def _should_defer_fp8_backward_tensors(self, debug: bool, is_grad_enabled: bool) -> bool:
+        """Whether FP8 tensors used only by backward can be materialized in backward."""
+        return (
+            is_grad_enabled
+            and self.fp8
+            and not self.fp8_calibration
+            and not debug
+            and self.tp_size == 1
+            and self.fsdp_group is None
+            and not self.is_fsdp2
+            and not self.fp8_parameters
+            and not self.primary_weights_in_fp8
+            and self.fp8_meta["recipe"].mxfp8()
+        )
+
+    def _get_fp8_weight_workspace(
+        self,
+        cache_name: str,
+        weight: torch.Tensor,
+        is_first_microbatch: Optional[bool],
+        *,
+        auto_cache: bool,
+    ) -> Tuple[Optional[str], Optional[QuantizedTensor], bool]:
+        """Get a cached FP8 weight workspace and whether it needs refreshing."""
+        if self.is_fsdp2:
+            return None, None, True
+
+        if is_first_microbatch is not None:
+            return cache_name, self._fp8_workspaces.get(cache_name), is_first_microbatch
+
+        if not auto_cache:
+            return None, None, True
+
+        workspace = self._fp8_workspaces.get(cache_name)
+        weight_version = getattr(weight, "_version", None)
+        update_workspace = (
+            workspace is None
+            or weight_version is None
+            or self._fp8_workspace_versions.get(cache_name) != weight_version
+        )
+        return cache_name, workspace, update_workspace
+
+    def _store_fp8_weight_workspace(
+        self,
+        cache_name: Optional[str],
+        weight: torch.Tensor,
+        new_workspace: Optional[QuantizedTensor],
+        update_workspace: bool,
+    ) -> None:
+        """Store a cached FP8 weight workspace and its source tensor version."""
+        if cache_name is None:
+            return
+        if new_workspace is not None:
+            if isinstance(new_workspace, torch.Tensor):
+                new_workspace = new_workspace.detach()
+            self._fp8_workspaces[cache_name] = new_workspace
+        if update_workspace or new_workspace is not None:
+            weight_version = getattr(weight, "_version", None)
+            if weight_version is None:
+                self._fp8_workspace_versions.pop(cache_name, None)
+            else:
+                self._fp8_workspace_versions[cache_name] = weight_version
+
     def _get_fp8_params(self) -> Union[List[torch.Tensor], None]:
         """returns the FP8 weights."""
         fp8_params = []
@@ -1153,13 +1218,28 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         """Initialize fp8 related metadata and tensors during fprop."""
         meta = self.fp8_meta
 
-        fp8 = FP8GlobalStateManager.is_fp8_enabled()
-        fp8_parameters = FP8GlobalStateManager.with_fp8_parameters()
-        fp8_calibration = FP8GlobalStateManager.is_fp8_calibration()
+        qstate = FP8GlobalStateManager.quantization_state
+        fp8 = qstate.fp8_enabled
+        fp8_parameters = qstate.fp8_parameters
+        fp8_calibration = qstate.fp8_calibration
+        fp8_enabled = fp8 or fp8_calibration
+        if not fp8_parameters and not fp8_enabled:
+            meta["fp8_checkpoint"] = False
+            if (
+                self.fp8
+                or self.fp8_calibration
+                or self.fp8_initialized
+                or getattr(self, "fp8_parameters", False)
+            ):
+                self.fast_setattr("fp8_parameters", False)
+                self.fast_setattr("fp8", False)
+                self.fast_setattr("fp8_calibration", False)
+                self.fast_setattr("fp8_initialized", False)
+            return
+
         self.fast_setattr("fp8_parameters", fp8_parameters)
         self.fast_setattr("fp8", fp8)
         self.fast_setattr("fp8_calibration", fp8_calibration)
-        fp8_enabled = fp8 or fp8_calibration
         meta["fp8_checkpoint"] = fp8_enabled
 
         _original_recipe = None
@@ -1207,6 +1287,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             )
             # Clear cached workspaces as they were created with the old recipe/quantizer type
             self._fp8_workspaces.clear()
+            self._fp8_workspace_versions.clear()
 
     def prepare_forward(
         self,

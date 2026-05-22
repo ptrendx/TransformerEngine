@@ -11,6 +11,7 @@ from functools import reduce
 from operator import mul as multiply_op
 
 import torch
+import torch.nn.functional as F
 from torch.nn import init
 
 import transformer_engine_torch as tex
@@ -143,10 +144,12 @@ class _LayerNormLinear(torch.autograd.Function):
             ub_name,
             fsdp_group,
             cache_weight,
+            update_weight_workspace,
             skip_fp8_weight_update,
             symmetric_ar_type,
             debug,
             is_fsdp2,
+            defer_fp8_backward_tensors,
         ) = non_tensor_args
         if fp8:
             backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
@@ -212,7 +215,11 @@ class _LayerNormLinear(torch.autograd.Function):
                 raise ValueError("Missing quantizer for input tensor")
             input_quantizer.set_usage(
                 rowwise=True,
-                columnwise=backward_needs_input and backward_override is None,
+                columnwise=(
+                    backward_needs_input
+                    and backward_override is None
+                    and not defer_fp8_backward_tensors
+                ),
             )
             if with_input_all_gather and input_quantizer.supports_only_rowwise_all_gather():
                 # All-gather is not supported with FP8 column-wise data
@@ -227,6 +234,7 @@ class _LayerNormLinear(torch.autograd.Function):
             and not return_layernorm_output
             and not return_layernorm_output_gathered
             and backward_override is None
+            and not defer_fp8_backward_tensors
             and not custom  # TODO(negvet): and not FP8GlobalStateManager.get_fp8_recipe().custom()
         )
 
@@ -250,7 +258,11 @@ class _LayerNormLinear(torch.autograd.Function):
         ln_out_return = None
         if return_layernorm_output or return_layernorm_output_gathered:
             ln_out_return = ln_out
-        ln_out_hp = ln_out if backward_override == "high_precision" else None
+        ln_out_hp = (
+            ln_out
+            if backward_override == "high_precision" or defer_fp8_backward_tensors
+            else None
+        )
 
         # ------------------------------------------------------
         # Prepare GEMM input tensor
@@ -318,16 +330,20 @@ class _LayerNormLinear(torch.autograd.Function):
                 # FSDP2 all-gather will recreate them. (Issue #2681)
                 weight_quantizer.set_usage(
                     rowwise=True,
-                    columnwise=is_grad_enabled and not is_fsdp2 and backward_override is None,
+                    columnwise=(
+                        is_grad_enabled
+                        and not is_fsdp2
+                        and backward_override is None
+                        and not defer_fp8_backward_tensors
+                    ),
                 )
 
             # Get quantized weight
-            update_ws = is_first_microbatch is None or is_first_microbatch
             weightmat, new_weight_workspace = quantize_weight(
                 tensor=weight,
                 quantizer=weight_quantizer,
                 workspace=weight_workspace,
-                update_workspace=update_ws,
+                update_workspace=update_weight_workspace,
                 skip_update_flag=skip_fp8_weight_update,
                 fsdp_group=fsdp_group,
                 workspace_dtype=activation_dtype,
@@ -435,7 +451,7 @@ class _LayerNormLinear(torch.autograd.Function):
 
         if is_grad_enabled:
             ln_out_to_save = ln_out
-            if backward_override == "high_precision":
+            if backward_override == "high_precision" or defer_fp8_backward_tensors:
                 ln_out_to_save = ln_out_hp
             ctx.weight_quantizer = weight_quantizer
             ctx.ln_out_needs_gather = (
@@ -443,7 +459,11 @@ class _LayerNormLinear(torch.autograd.Function):
             )
 
             # Input with column-wise usage is needed for wgrad GEMM.
-            if backward_needs_input and backward_override is None:
+            if (
+                backward_needs_input
+                and backward_override is None
+                and not defer_fp8_backward_tensors
+            ):
                 if isinstance(ln_out, QuantizedTensorStorage):
                     # For sequence parallel in vanilla FP8, rowwise data is
                     # to gather the input. For MXFP8, columnwise only data
@@ -466,7 +486,11 @@ class _LayerNormLinear(torch.autograd.Function):
                 fsdp_group,
                 mu,
                 rsigma,
-                weightmat if fp8 and not is_weight_param_quantized else None,
+                (
+                    weightmat
+                    if fp8 and not defer_fp8_backward_tensors and not is_weight_param_quantized
+                    else None
+                ),
                 ln_out_to_save if weight.requires_grad else None,
             )
             nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
@@ -484,7 +508,7 @@ class _LayerNormLinear(torch.autograd.Function):
             # Backward will re-quantize from FSDP2 all-gathered weight.
             # (Issue #2681)
             wt_save = weightmat
-            if is_fsdp2 and weightmat is not weight:
+            if (is_fsdp2 or defer_fp8_backward_tensors) and weightmat is not weight:
                 wt_save = None
             tensors_to_save, tensor_objects = prepare_for_saving(
                 inputmat,
@@ -1585,7 +1609,9 @@ class LayerNormLinear(TransformerEngineBaseModule):
 
         debug = self.is_debug_iter()
 
-        if FP8GlobalStateManager.fp8_graph_capturing():
+        qstate = FP8GlobalStateManager.quantization_state
+        fp8_state_enabled = self.fp8 or qstate.fp8_enabled or qstate.fp8_calibration
+        if fp8_state_enabled and FP8GlobalStateManager.fp8_graph_capturing():
             skip_fp8_weight_update = (
                 FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
             )
@@ -1610,95 +1636,145 @@ class LayerNormLinear(TransformerEngineBaseModule):
         )
 
         try:
-            # Get concatenated weight and bias tensors
-            weight_tensor, bias_tensor = self._get_weight_and_bias_tensors()
-
-            quantizers = (
-                self._get_quantizers(fp8_output, fp8_grad, is_grad_enabled)
-                if not debug
-                else self._get_debug_quantizers(fp8_output, fp8_grad, is_grad_enabled)
-            )
-            if debug:
-                if self.no_debug_features_active(quantizers):
-                    debug = False
-                    quantizers = self._get_quantizers(fp8_output, fp8_grad, is_grad_enabled)
-
-            (
-                input_quantizer,
-                weight_quantizer,
-                output_quantizer,
-                grad_input_quantizer,
-                grad_weight_quantizer,
-                grad_output_quantizer,
-            ) = quantizers
-
-            if is_grad_enabled:
-                fwd_fn = _LayerNormLinear.apply
-                autograd_ctx = []
+            single_weight = len(self.weight_names) == 1 and len(self.bias_names) == 1
+            if single_weight:
+                weight_tensor = getattr(self, self.weight_names[0])
+                bias_tensor = getattr(self, self.bias_names[0]) if self.use_bias else None
             else:
-                fwd_fn = _LayerNormLinear.forward
-                autograd_ctx = [None]
-            cache_name = None if (is_first_microbatch is None or self.is_fsdp2) else "weight"
-            weight_workspace = (
-                self._fp8_workspaces.get(cache_name) if cache_name is not None else None
-            )
+                weight_tensor, bias_tensor = self._get_weight_and_bias_tensors()
 
-            non_tensor_args = (
-                self.eps,
-                is_first_microbatch,
-                self.fp8,
-                self.fp8_calibration,
-                self.wgrad_store,
-                self.fuse_wgrad_accumulation,
-                input_quantizer,
-                weight_quantizer,
-                output_quantizer,
-                grad_input_quantizer,
-                grad_weight_quantizer,
-                grad_output_quantizer,
-                is_cpu_offload_enabled(),
-                self.tp_group,
-                self.tp_size,
-                self.sequence_parallel,
-                self.tp_size > 1,
-                self.activation_dtype,
-                self.parallel_mode,
-                self.return_layernorm_output,
-                self.return_layernorm_output_gathered,
-                is_grad_enabled,
-                self.fwd_ln_sm_margin if is_grad_enabled else self.inf_ln_sm_margin,
-                self.bwd_ln_sm_margin,
-                self.zero_centered_gamma,
-                self.normalization,
-                self.ub_overlap_ag_fprop,
-                self.ub_overlap_rs_fprop,
-                self.ub_overlap_ag_dgrad,
-                self.ub_overlap_rs_dgrad,
-                self.ub_bulk_wgrad,
-                self.ub_bulk_dgrad,
-                self.ub_name,
-                self.fsdp_group,
-                cache_name is not None,
-                skip_fp8_weight_update,
-                self.symmetric_ar_type,
-                debug,
-                self.is_fsdp2,
+            cpu_offloading = is_cpu_offload_enabled()
+            use_torch_fast_path = (
+                not self.fp8
+                and not self.fp8_calibration
+                and not debug
+                and single_weight
+                and self.parallel_mode is None
+                and self.tp_size == 1
+                and not self.sequence_parallel
+                and not self.return_layernorm_output
+                and not self.return_layernorm_output_gathered
+                and not self.gemm_bias_unfused_add
+                and not self.fuse_wgrad_accumulation
+                and not self.zero_centered_gamma
+                and self.normalization == "LayerNorm"
+                and not cpu_offloading
+                and not self.wgrad_store.delay_wgrad_compute()
+                and not isinstance(weight_tensor, (QuantizedTensor, QuantizedTensorStorage))
             )
-            out, ln_out, new_weight_workspace = fwd_fn(
-                *autograd_ctx,
-                inp,
-                self.layer_norm_weight,
-                self.layer_norm_bias,
-                weight_tensor,
-                weight_workspace,
-                bias_tensor if self.apply_bias and not self.gemm_bias_unfused_add else None,
-                non_tensor_args,
-            )
+            if use_torch_fast_path:
+                ln_out = F.layer_norm(
+                    cast_if_needed(inp, self.activation_dtype),
+                    (self.in_features,),
+                    cast_if_needed(self.layer_norm_weight, self.activation_dtype),
+                    cast_if_needed(self.layer_norm_bias, self.activation_dtype),
+                    self.eps,
+                )
+                out = F.linear(
+                    ln_out,
+                    cast_if_needed(weight_tensor, self.activation_dtype),
+                    (
+                        cast_if_needed(bias_tensor, self.activation_dtype)
+                        if self.apply_bias
+                        else None
+                    ),
+                )
+                new_weight_workspace = None
+            else:
+                quantizers = (
+                    self._get_quantizers(fp8_output, fp8_grad, is_grad_enabled)
+                    if not debug
+                    else self._get_debug_quantizers(fp8_output, fp8_grad, is_grad_enabled)
+                )
+                if debug:
+                    if self.no_debug_features_active(quantizers):
+                        debug = False
+                        quantizers = self._get_quantizers(fp8_output, fp8_grad, is_grad_enabled)
 
-            if new_weight_workspace is not None and cache_name is not None:
-                if isinstance(new_weight_workspace, torch.Tensor):
-                    new_weight_workspace = new_weight_workspace.detach()
-                self._fp8_workspaces[cache_name] = new_weight_workspace
+                (
+                    input_quantizer,
+                    weight_quantizer,
+                    output_quantizer,
+                    grad_input_quantizer,
+                    grad_weight_quantizer,
+                    grad_output_quantizer,
+                ) = quantizers
+
+                if is_grad_enabled:
+                    fwd_fn = _LayerNormLinear.apply
+                    autograd_ctx = []
+                else:
+                    fwd_fn = _LayerNormLinear.forward
+                    autograd_ctx = [None]
+                defer_fp8_backward_tensors = self._should_defer_fp8_backward_tensors(
+                    debug, is_grad_enabled
+                )
+                cache_name, weight_workspace, update_weight_workspace = (
+                    self._get_fp8_weight_workspace(
+                        "weight",
+                        weight_tensor,
+                        is_first_microbatch,
+                        auto_cache=defer_fp8_backward_tensors,
+                    )
+                )
+
+                non_tensor_args = (
+                    self.eps,
+                    is_first_microbatch,
+                    self.fp8,
+                    self.fp8_calibration,
+                    self.wgrad_store,
+                    self.fuse_wgrad_accumulation,
+                    input_quantizer,
+                    weight_quantizer,
+                    output_quantizer,
+                    grad_input_quantizer,
+                    grad_weight_quantizer,
+                    grad_output_quantizer,
+                    cpu_offloading,
+                    self.tp_group,
+                    self.tp_size,
+                    self.sequence_parallel,
+                    self.tp_size > 1,
+                    self.activation_dtype,
+                    self.parallel_mode,
+                    self.return_layernorm_output,
+                    self.return_layernorm_output_gathered,
+                    is_grad_enabled,
+                    self.fwd_ln_sm_margin if is_grad_enabled else self.inf_ln_sm_margin,
+                    self.bwd_ln_sm_margin,
+                    self.zero_centered_gamma,
+                    self.normalization,
+                    self.ub_overlap_ag_fprop,
+                    self.ub_overlap_rs_fprop,
+                    self.ub_overlap_ag_dgrad,
+                    self.ub_overlap_rs_dgrad,
+                    self.ub_bulk_wgrad,
+                    self.ub_bulk_dgrad,
+                    self.ub_name,
+                    self.fsdp_group,
+                    cache_name is not None,
+                    update_weight_workspace,
+                    skip_fp8_weight_update,
+                    self.symmetric_ar_type,
+                    debug,
+                    self.is_fsdp2,
+                    defer_fp8_backward_tensors,
+                )
+                out, ln_out, new_weight_workspace = fwd_fn(
+                    *autograd_ctx,
+                    inp,
+                    self.layer_norm_weight,
+                    self.layer_norm_bias,
+                    weight_tensor,
+                    weight_workspace,
+                    bias_tensor if self.apply_bias and not self.gemm_bias_unfused_add else None,
+                    non_tensor_args,
+                )
+
+                self._store_fp8_weight_workspace(
+                    cache_name, weight_tensor, new_weight_workspace, update_weight_workspace
+                )
 
         finally:
             self.end_forward()
