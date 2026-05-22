@@ -307,16 +307,24 @@ def _linear_forward_impl(
         elif isinstance(weight, QuantizedTensor):
             weight_quantizer = weight._quantizer
         # Get quantized weight
-        weightmat, new_weight_workspace = quantize_weight(
-            tensor=weight,
-            quantizer=weight_quantizer,
-            workspace=weight_workspace,
-            update_workspace=update_weight_workspace,
-            skip_update_flag=skip_fp8_weight_update,
-            fsdp_group=fsdp_group,
-            workspace_dtype=activation_dtype,
-            cache=cache_weight,
-        )
+        restore_weight_optimize_for_gemm = None
+        if defer_fp8_backward_tensors and isinstance(weight_quantizer, MXFP8Quantizer):
+            restore_weight_optimize_for_gemm = weight_quantizer.optimize_for_gemm
+            weight_quantizer.optimize_for_gemm = True
+        try:
+            weightmat, new_weight_workspace = quantize_weight(
+                tensor=weight,
+                quantizer=weight_quantizer,
+                workspace=weight_workspace,
+                update_workspace=update_weight_workspace,
+                skip_update_flag=skip_fp8_weight_update,
+                fsdp_group=fsdp_group,
+                workspace_dtype=activation_dtype,
+                cache=cache_weight,
+            )
+        finally:
+            if restore_weight_optimize_for_gemm is not None:
+                weight_quantizer.optimize_for_gemm = restore_weight_optimize_for_gemm
         weightmat.update_usage(rowwise_usage=True)
 
     else:

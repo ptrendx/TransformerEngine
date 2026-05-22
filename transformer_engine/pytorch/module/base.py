@@ -649,6 +649,8 @@ def _is_weight_workspace_valid(
         ):
             return False
     elif isinstance(workspace, MXFP8TensorStorage):
+        if workspace._with_gemm_swizzled_scales != quantizer.optimize_for_gemm:
+            return False
         if quantizer.rowwise_usage and workspace._rowwise_data is None:
             return False
         if quantizer.columnwise_usage and workspace._columnwise_data is None:

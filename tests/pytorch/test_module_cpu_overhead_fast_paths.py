@@ -290,8 +290,11 @@ def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path(
         ref_out = reference_module(ref_inp)
 
     workspace = module._fp8_transient_workspaces["linear_input"]
+    weight_workspace = module._fp8_workspaces["weight"]
     cached_rowwise_data = workspace._rowwise_data.detach().clone()
     assert not reference_module._fp8_transient_workspaces
+    assert workspace._with_gemm_swizzled_scales
+    assert weight_workspace._with_gemm_swizzled_scales
     _assert_tensors_close(out, ref_out, _MXFP8_TOLS)
 
     with mock.patch.object(
@@ -306,6 +309,7 @@ def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path(
     with te.autocast(enabled=True, recipe=fp8_recipe):
         ref_out = reference_module(ref_inp)
     assert module._fp8_transient_workspaces["linear_input"] is workspace
+    assert module._fp8_workspaces["weight"] is weight_workspace
     torch.testing.assert_close(
         cached_rowwise_data,
         workspace._rowwise_data,
