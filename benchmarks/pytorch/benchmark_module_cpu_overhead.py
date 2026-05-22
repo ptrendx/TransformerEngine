@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
+import shlex
 import statistics
+import subprocess
 import sys
 import time
 from contextlib import contextmanager, nullcontext
@@ -41,6 +44,7 @@ class BenchmarkConfig:
     warmup: int
     iterations: int
     json_output: Optional[Path]
+    detail_json_output: Optional[Path]
     report_output: Optional[Path]
     profile: bool
     profile_module: str
@@ -106,7 +110,16 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> BenchmarkConfig:
     parser.add_argument("--ffn-hidden-size", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
-    parser.add_argument("--json-output", type=Path)
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        help="Write an Orchestra benchmark_raw_report/v1 JSON file.",
+    )
+    parser.add_argument(
+        "--detail-json-output",
+        type=Path,
+        help="Write detailed TE-specific per-case JSON output.",
+    )
     parser.add_argument("--report-output", type=Path)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-module", choices=MODULES, default="linear")
@@ -146,6 +159,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> BenchmarkConfig:
         warmup=args.warmup,
         iterations=args.iterations,
         json_output=args.json_output,
+        detail_json_output=args.detail_json_output,
         report_output=args.report_output,
         profile=args.profile,
         profile_module=args.profile_module,
@@ -283,14 +297,14 @@ def _measure_forward(
     _synchronize()
 
     samples_us: List[float] = []
-    with _profile_capture(profile, label):
-        for _ in range(iterations):
-            _synchronize()
+    for _ in range(iterations):
+        _synchronize()
+        with _profile_capture(profile, label):
             start = time.perf_counter_ns()
             _run_forward(module, inp)
             end = time.perf_counter_ns()
-            _synchronize()
-            samples_us.append((end - start) / 1000.0)
+        _synchronize()
+        samples_us.append((end - start) / 1000.0)
     return samples_us
 
 
@@ -311,18 +325,18 @@ def _measure_backward(
     _synchronize()
 
     samples_us: List[float] = []
-    with _profile_capture(profile, label):
-        for _ in range(iterations):
-            _clear_grads(module, inp)
-            out = _run_forward(module, inp)
-            grad_output = torch.ones_like(out)
-            _synchronize()
-            _clear_grads(module, inp)
+    for _ in range(iterations):
+        _clear_grads(module, inp)
+        out = _run_forward(module, inp)
+        grad_output = torch.ones_like(out)
+        _synchronize()
+        _clear_grads(module, inp)
+        with _profile_capture(profile, label):
             start = time.perf_counter_ns()
             out.backward(grad_output)
             end = time.perf_counter_ns()
-            _synchronize()
-            samples_us.append((end - start) / 1000.0)
+        _synchronize()
+        samples_us.append((end - start) / 1000.0)
     return samples_us
 
 
@@ -476,6 +490,13 @@ def _metadata(config: BenchmarkConfig) -> Dict[str, object]:
             "ffn_hidden_size": config.ffn_hidden_size,
             "warmup": config.warmup,
             "iterations": config.iterations,
+            "json_output": str(config.json_output) if config.json_output is not None else None,
+            "detail_json_output": (
+                str(config.detail_json_output) if config.detail_json_output is not None else None
+            ),
+            "report_output": (
+                str(config.report_output) if config.report_output is not None else None
+            ),
             "profile": config.profile,
             "profile_module": config.profile_module,
             "profile_mode": config.profile_mode,
@@ -538,6 +559,116 @@ def run_benchmark(config: BenchmarkConfig) -> Dict[str, object]:
     return {"schema_version": "te_module_cpu_overhead/v1", "metadata": metadata, "cases": cases}
 
 
+def _command_line(argv: Optional[Sequence[str]]) -> str:
+    if argv is None:
+        command = [sys.executable, *sys.argv]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), *argv]
+    return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def _repo_ref() -> str:
+    for name in ("ORCHESTRA_REPO_REF", "GIT_COMMIT", "BUILDKITE_COMMIT"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _append_measurement(
+    measurements: List[Dict[str, object]],
+    case_id: str,
+    metric: str,
+    value: object,
+    unit: str,
+    higher_is_better: bool,
+) -> None:
+    if value is None:
+        return
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
+        return
+    measurements.append(
+        {
+            "case_id": case_id,
+            "metric": metric,
+            "value": numeric_value,
+            "unit": unit,
+            "iteration": 0,
+            "higher_is_better": higher_is_better,
+        }
+    )
+
+
+def make_raw_report(
+    result: Dict[str, object],
+    config: BenchmarkConfig,
+    command_line: str,
+    exit_code: int,
+) -> Dict[str, object]:
+    metadata = result["metadata"]
+    measurements: List[Dict[str, object]] = []
+    for case in result["cases"]:
+        if case["status"] != "measured":
+            continue
+        case_id = str(case["case_id"])
+        _append_measurement(
+            measurements, case_id, "te_us", case["te_us"], "us_per_invocation", False
+        )
+        _append_measurement(
+            measurements,
+            case_id,
+            "torch_bf16_us",
+            case["torch_us"],
+            "us_per_invocation",
+            False,
+        )
+        _append_measurement(
+            measurements, case_id, "te_vs_torch_ratio", case["ratio"], "ratio", False
+        )
+        _append_measurement(
+            measurements,
+            case_id,
+            "passes_goal",
+            1.0 if case["passed"] else 0.0,
+            "boolean",
+            True,
+        )
+
+    raw_report = {
+        "schema_version": "benchmark_raw_report/v1",
+        "command": command_line,
+        "working_directory": os.getcwd(),
+        "repo_ref": _repo_ref(),
+        "cluster_name": os.environ.get("ORCHESTRA_CLUSTER_NAME")
+        or os.environ.get("HOSTNAME")
+        or platform.node()
+        or "unknown",
+        "gpu_type": os.environ.get("ORCHESTRA_GPU_TYPE")
+        or str(metadata.get("cuda_device_name") or "cuda_unavailable"),
+        "benchmark_output_path": (
+            str(config.json_output) if config.json_output is not None else "stdout"
+        ),
+        "exit_code": exit_code,
+        "measurements": measurements,
+    }
+
+    environment_artifact_uri = os.environ.get("ORCHESTRA_ENVIRONMENT_ARTIFACT_URI")
+    if environment_artifact_uri:
+        raw_report["environment_artifact_uri"] = environment_artifact_uri
+    return raw_report
+
+
 def _format_us(value: Optional[float]) -> str:
     if value is None:
         return "-"
@@ -588,9 +719,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config = _parse_args(argv)
     result = run_benchmark(config)
     report = make_report(result)
+    raw_report = make_raw_report(result, config, _command_line(argv), exit_code=0)
 
     if config.json_output is not None:
-        _write_text(config.json_output, json.dumps(result, indent=2, sort_keys=True) + "\n")
+        _write_text(config.json_output, json.dumps(raw_report, indent=2, sort_keys=True) + "\n")
+    if config.detail_json_output is not None:
+        _write_text(config.detail_json_output, json.dumps(result, indent=2, sort_keys=True) + "\n")
     if config.report_output is not None:
         _write_text(config.report_output, report + "\n")
     print(report)
