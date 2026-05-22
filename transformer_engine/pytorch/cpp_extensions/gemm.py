@@ -24,6 +24,7 @@ from ...debug.pytorch.debug_quantization import DebugQuantizer
 
 __all__ = [
     "general_gemm",
+    "mxfp8_gemm_tn",
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
 ]
@@ -100,6 +101,32 @@ def _nvfp4_row_scaled_gemm_inputs(
         NVFP4TensorStorage(**A_metadata),
         NVFP4TensorStorage(**B_metadata),
         (rhs_rowwise_amax * weight_amax).view(-1, 1),
+    )
+
+
+def mxfp8_gemm_tn(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+    use_split_accumulator: bool = False,
+) -> torch.Tensor:
+    """Simple TN GEMM for GEMM-ready rowwise MXFP8 tensors."""
+
+    workspace = get_cublas_workspace(A.device.index, False, False)
+    return tex.mxfp8_gemm_tn(
+        A._rowwise_data,
+        A._rowwise_scale_inv,
+        A._fp8_dtype,
+        B._rowwise_data,
+        B._rowwise_scale_inv,
+        B._fp8_dtype,
+        bias,
+        TE_DType[out_dtype],
+        TE_DType[torch.bfloat16 if bias is None else bias.dtype],
+        workspace,
+        workspace.shape[0],
+        use_split_accumulator,
     )
 
 

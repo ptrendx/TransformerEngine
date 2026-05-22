@@ -142,6 +142,11 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
                              MaybeTensor extra_output = std::nullopt, bool bulk_overlap = false,
                              float alpha = 1.0f, std::optional<float> beta = std::nullopt);
 
+at::Tensor mxfp8_gemm_tn(at::Tensor A_data, at::Tensor A_scale_inv, DType A_type,
+                         at::Tensor B_data, at::Tensor B_scale_inv, DType B_type,
+                         MaybeTensor bias, DType output_dtype, DType bias_type,
+                         at::Tensor workspace, size_t workspaceSize, bool use_split_accumulator);
+
 void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
                     std::vector<int64_t> A_scaling_mode, bool transa, at::Tensor B,
                     at::Tensor B_scale_inverse, DType B_type, std::vector<int64_t> B_scaling_mode,

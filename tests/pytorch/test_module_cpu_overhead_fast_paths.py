@@ -301,10 +301,15 @@ def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path(
         te_linear_module.tex,
         "quantize",
         wraps=te_linear_module.tex.quantize,
-    ) as quantize_mock:
+    ) as quantize_mock, mock.patch.object(
+        te_linear_module.tex,
+        "mxfp8_gemm_tn",
+        wraps=te_linear_module.tex.mxfp8_gemm_tn,
+    ) as fast_gemm_mock:
         with te.autocast(enabled=True, recipe=fp8_recipe):
             out = module(inp)
     assert quantize_mock.call_count == 0
+    assert fast_gemm_mock.call_count == 1
     ref_inp = inp.detach().clone().requires_grad_(True)
     with te.autocast(enabled=True, recipe=fp8_recipe):
         ref_out = reference_module(ref_inp)
@@ -317,6 +322,18 @@ def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path(
         check_device=True,
     )
     _assert_tensors_close(out, ref_out, _MXFP8_TOLS)
+
+    _reset_rng(7890)
+    grad_output = torch.randn_like(out)
+    out.backward(grad_output)
+    ref_out.backward(grad_output.detach().clone())
+    assert inp.grad is not None
+    assert ref_inp.grad is not None
+    _assert_tensors_close(inp.grad, ref_inp.grad, _MXFP8_TOLS)
+    _assert_grads_close(module, reference_module, _MXFP8_TOLS)
+    module.zero_grad(set_to_none=True)
+    reference_module.zero_grad(set_to_none=True)
+    inp.grad = None
 
     new_inp = _make_input(seed=6789)
     new_ref_inp = new_inp.detach().clone().requires_grad_(True)

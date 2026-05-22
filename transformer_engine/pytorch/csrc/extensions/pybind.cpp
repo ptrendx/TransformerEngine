@@ -155,6 +155,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("comm_overlap") = nullptr, py::arg("comm_type") = std::nullopt,
         py::arg("extra_output") = std::nullopt, py::arg("bulk_overlap") = false,
         py::arg("alpha") = 1.0f, py::arg("beta") = std::nullopt);
+  m.def("mxfp8_gemm_tn", transformer_engine::pytorch::mxfp8_gemm_tn,
+        "Compute a simple TN GEMM from GEMM-ready rowwise MXFP8 inputs", py::arg("A_data"),
+        py::arg("A_scale_inv"), py::arg("A_type"), py::arg("B_data"), py::arg("B_scale_inv"),
+        py::arg("B_type"), py::arg("bias"), py::arg("output_dtype"), py::arg("bias_type"),
+        py::arg("workspace"), py::arg("workspace_size"), py::arg("use_split_accumulator"));
   /* GLU (sigmoid gate) */
   m.def("glu", transformer_engine::pytorch::glu, "GLU activation", py::arg("input"),
         py::arg("quantizer"));
