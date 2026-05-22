@@ -270,3 +270,36 @@ def test_module_cpu_overhead_mxfp8_weight_update_refreshes_cached_workspace(modu
     refreshed_workspace = module._fp8_workspaces[cache_key]
     assert module._fp8_workspace_versions[cache_key] == weight._version
     assert not torch.equal(cached_rowwise_data, refreshed_workspace._rowwise_data)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not bf16_available, reason=reason_for_no_bf16)
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path():
+    _reset_rng()
+    module = _make_module("linear")
+    reference_module = _make_module("linear")
+    reference_module.load_state_dict(module.state_dict())
+    reference_module._get_fp8_transient_workspace = lambda *args, **kwargs: None
+    fp8_recipe = MXFP8BlockScaling()
+
+    inp = _make_input()
+    ref_inp = inp.detach().clone().requires_grad_(True)
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        out = module(inp)
+        ref_out = reference_module(ref_inp)
+
+    workspace = module._fp8_transient_workspaces["linear_input"]
+    cached_rowwise_data = workspace._rowwise_data.detach().clone()
+    assert not reference_module._fp8_transient_workspaces
+    _assert_tensors_close(out, ref_out, _MXFP8_TOLS)
+
+    new_inp = _make_input(seed=6789)
+    new_ref_inp = new_inp.detach().clone().requires_grad_(True)
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        out = module(new_inp)
+        ref_out = reference_module(new_ref_inp)
+
+    assert module._fp8_transient_workspaces["linear_input"] is workspace
+    assert not torch.equal(cached_rowwise_data, workspace._rowwise_data)
+    _assert_tensors_close(out, ref_out, _MXFP8_TOLS)

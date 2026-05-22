@@ -143,6 +143,7 @@ def _linear_forward_impl(
         is_fsdp2,
         defer_fp8_backward_tensors,
         quantizers,
+        input_workspace,
     ) = non_tensor_args
     (
         input_quantizer,
@@ -255,7 +256,14 @@ def _linear_forward_impl(
                         and backward_override is None
                     ),
                 )
-                inputmat = input_quantizer(inputmat)
+                if (
+                    input_workspace is not None
+                    and input_quantizer.rowwise_usage
+                    and not input_quantizer.columnwise_usage
+                ):
+                    inputmat = tex.quantize(inputmat, input_quantizer, input_workspace)
+                else:
+                    inputmat = input_quantizer(inputmat)
                 own_quantized_input = True
         else:
             inputmat = cast_if_needed(inp, activation_dtype)  # Cast for AMP
@@ -526,6 +534,7 @@ def _linear_setup_ctx(
         _is_fsdp2,
         _defer_fp8_backward_tensors,
         quantizers,
+        _input_workspace,
     ) = non_tensor_args
     (
         input_quantizer,
@@ -1701,6 +1710,19 @@ class Linear(TransformerEngineBaseModule):
                         auto_cache=defer_fp8_backward_tensors,
                     )
                 )
+                input_workspace = None
+                if (
+                    defer_fp8_backward_tensors
+                    and not custom
+                    and isinstance(input_quantizer, MXFP8Quantizer)
+                    and not isinstance(inp, QuantizedTensorStorage)
+                ):
+                    input_quantizer.set_usage(rowwise=True, columnwise=False)
+                    input_workspace = self._get_fp8_transient_workspace(
+                        "linear_input",
+                        inp,
+                        input_quantizer,
+                    )
 
                 if debug:
                     ub_overlap_rs_fprop = False
@@ -1759,6 +1781,7 @@ class Linear(TransformerEngineBaseModule):
                         grad_weight_quantizer,
                         grad_output_quantizer,
                     ),
+                    input_workspace,
                 )
                 out, new_weight_workspace = linear_fn(
                     *autograd_ctx,

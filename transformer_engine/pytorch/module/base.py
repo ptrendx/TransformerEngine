@@ -788,6 +788,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.fsdp_group = None
         self._fp8_workspaces: Dict[str, QuantizedTensor] = {}
         self._fp8_workspace_versions: Dict[str, int] = {}
+        self._fp8_transient_workspaces: Dict[str, QuantizedTensor] = {}
         self.activation_dtype: Optional[torch.dtype] = None
         self.wgrad_accumulation_and_reduce_hooks = []
         self.wgrad_store = None
@@ -1202,6 +1203,31 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             else:
                 self._fp8_workspace_versions[cache_name] = weight_version
 
+    def _get_fp8_transient_workspace(
+        self,
+        cache_name: str,
+        tensor: torch.Tensor,
+        quantizer: Quantizer,
+    ) -> QuantizedTensor:
+        """Get a reusable FP8 workspace for a forward-only temporary tensor."""
+        workspace = self._fp8_transient_workspaces.get(cache_name)
+        workspace_dtype = getattr(workspace, "dtype", getattr(workspace, "_dtype", None))
+        if (
+            workspace is None
+            or tuple(workspace.size()) != tuple(tensor.size())
+            or workspace_dtype != tensor.dtype
+            or workspace.device != tensor.device
+            or not _is_weight_workspace_valid(workspace, quantizer)
+        ):
+            workspace = quantizer.make_empty(
+                tensor.size(),
+                dtype=tensor.dtype,
+                device=tensor.device,
+                requires_grad=False,
+            )
+            self._fp8_transient_workspaces[cache_name] = workspace
+        return workspace
+
     def _get_fp8_params(self) -> Union[List[torch.Tensor], None]:
         """returns the FP8 weights."""
         fp8_params = []
@@ -1288,6 +1314,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             # Clear cached workspaces as they were created with the old recipe/quantizer type
             self._fp8_workspaces.clear()
             self._fp8_workspace_versions.clear()
+            self._fp8_transient_workspaces.clear()
 
     def prepare_forward(
         self,
