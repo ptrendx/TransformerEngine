@@ -294,6 +294,26 @@ def test_module_cpu_overhead_linear_mxfp8_input_workspace_matches_uncached_path(
     assert not reference_module._fp8_transient_workspaces
     _assert_tensors_close(out, ref_out, _MXFP8_TOLS)
 
+    with mock.patch.object(
+        te_linear_module.tex,
+        "quantize",
+        wraps=te_linear_module.tex.quantize,
+    ) as quantize_mock:
+        with te.autocast(enabled=True, recipe=fp8_recipe):
+            out = module(inp)
+    assert quantize_mock.call_count == 0
+    ref_inp = inp.detach().clone().requires_grad_(True)
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        ref_out = reference_module(ref_inp)
+    assert module._fp8_transient_workspaces["linear_input"] is workspace
+    torch.testing.assert_close(
+        cached_rowwise_data,
+        workspace._rowwise_data,
+        check_dtype=True,
+        check_device=True,
+    )
+    _assert_tensors_close(out, ref_out, _MXFP8_TOLS)
+
     new_inp = _make_input(seed=6789)
     new_ref_inp = new_inp.detach().clone().requires_grad_(True)
     with te.autocast(enabled=True, recipe=fp8_recipe):

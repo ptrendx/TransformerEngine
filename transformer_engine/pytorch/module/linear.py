@@ -144,6 +144,7 @@ def _linear_forward_impl(
         defer_fp8_backward_tensors,
         quantizers,
         input_workspace,
+        update_input_workspace,
     ) = non_tensor_args
     (
         input_quantizer,
@@ -261,7 +262,10 @@ def _linear_forward_impl(
                     and input_quantizer.rowwise_usage
                     and not input_quantizer.columnwise_usage
                 ):
-                    inputmat = tex.quantize(inputmat, input_quantizer, input_workspace)
+                    if update_input_workspace:
+                        inputmat = tex.quantize(inputmat, input_quantizer, input_workspace)
+                    else:
+                        inputmat = input_workspace
                 else:
                     inputmat = input_quantizer(inputmat)
                 own_quantized_input = True
@@ -535,6 +539,7 @@ def _linear_setup_ctx(
         _defer_fp8_backward_tensors,
         quantizers,
         _input_workspace,
+        _update_input_workspace,
     ) = non_tensor_args
     (
         input_quantizer,
@@ -1711,6 +1716,7 @@ class Linear(TransformerEngineBaseModule):
                     )
                 )
                 input_workspace = None
+                update_input_workspace = True
                 if (
                     defer_fp8_backward_tensors
                     and not custom
@@ -1718,11 +1724,14 @@ class Linear(TransformerEngineBaseModule):
                     and not isinstance(inp, QuantizedTensorStorage)
                 ):
                     input_quantizer.set_usage(rowwise=True, columnwise=False)
-                    input_workspace = self._get_fp8_transient_workspace(
+                    input_workspace_info = self._get_fp8_transient_workspace(
                         "linear_input",
                         inp,
                         input_quantizer,
+                        reuse_unchanged=True,
                     )
+                    if input_workspace_info is not None:
+                        input_workspace, update_input_workspace = input_workspace_info
 
                 if debug:
                     ub_overlap_rs_fprop = False
@@ -1782,6 +1791,7 @@ class Linear(TransformerEngineBaseModule):
                         grad_output_quantizer,
                     ),
                     input_workspace,
+                    update_input_workspace,
                 )
                 out, new_weight_workspace = linear_fn(
                     *autograd_ctx,

@@ -8,6 +8,7 @@ import math
 import os
 import pickle
 import warnings
+import weakref
 from enum import Enum
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -789,6 +790,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self._fp8_workspaces: Dict[str, QuantizedTensor] = {}
         self._fp8_workspace_versions: Dict[str, int] = {}
         self._fp8_transient_workspaces: Dict[str, QuantizedTensor] = {}
+        self._fp8_transient_workspace_sources: Dict[str, Tuple[Any, int, int, int]] = {}
         self.activation_dtype: Optional[torch.dtype] = None
         self.wgrad_accumulation_and_reduce_hooks = []
         self.wgrad_store = None
@@ -1208,17 +1210,20 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         cache_name: str,
         tensor: torch.Tensor,
         quantizer: Quantizer,
-    ) -> QuantizedTensor:
+        *,
+        reuse_unchanged: bool = False,
+    ) -> Union[QuantizedTensor, Tuple[QuantizedTensor, bool]]:
         """Get a reusable FP8 workspace for a forward-only temporary tensor."""
         workspace = self._fp8_transient_workspaces.get(cache_name)
         workspace_dtype = getattr(workspace, "dtype", getattr(workspace, "_dtype", None))
-        if (
+        workspace_miss = (
             workspace is None
             or tuple(workspace.size()) != tuple(tensor.size())
             or workspace_dtype != tensor.dtype
             or workspace.device != tensor.device
             or not _is_weight_workspace_valid(workspace, quantizer)
-        ):
+        )
+        if workspace_miss:
             workspace = quantizer.make_empty(
                 tensor.size(),
                 dtype=tensor.dtype,
@@ -1226,7 +1231,44 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 requires_grad=False,
             )
             self._fp8_transient_workspaces[cache_name] = workspace
-        return workspace
+            self._fp8_transient_workspace_sources.pop(cache_name, None)
+
+        if not reuse_unchanged:
+            return workspace
+
+        tensor_version = getattr(tensor, "_version", None)
+        tensor_handle = getattr(tensor, "_cdata", id(tensor))
+        cached_source = self._fp8_transient_workspace_sources.get(cache_name)
+        cached_ref = cached_source[0] if cached_source is not None else None
+        cached_tensor_matches = (
+            cached_source is not None
+            and (
+                (cached_ref is not None and cached_ref() is tensor)
+                or (cached_ref is None and cached_source[1] == tensor_handle)
+            )
+        )
+        update_workspace = (
+            tensor_version is None
+            or cached_source is None
+            or not cached_tensor_matches
+            or cached_source[2] != tensor_version
+            or cached_source[3] != tensor.data_ptr()
+        )
+        if update_workspace:
+            if tensor_version is None:
+                self._fp8_transient_workspace_sources.pop(cache_name, None)
+            else:
+                try:
+                    tensor_ref = weakref.ref(tensor)
+                except TypeError:
+                    tensor_ref = None
+                self._fp8_transient_workspace_sources[cache_name] = (
+                    tensor_ref,
+                    tensor_handle,
+                    tensor_version,
+                    tensor.data_ptr(),
+                )
+        return workspace, update_workspace
 
     def _get_fp8_params(self) -> Union[List[torch.Tensor], None]:
         """returns the FP8 weights."""
@@ -1315,6 +1357,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             self._fp8_workspaces.clear()
             self._fp8_workspace_versions.clear()
             self._fp8_transient_workspaces.clear()
+            self._fp8_transient_workspace_sources.clear()
 
     def prepare_forward(
         self,
