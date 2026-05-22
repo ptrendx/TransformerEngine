@@ -168,7 +168,6 @@ def _linear_forward_impl(
     assert inp.shape[-1] == in_features, "GEMM not possible"
 
     # Configure tensor-parallel communication
-    tp_world_size = get_distributed_world_size(tp_group)
     backward_needs_input = is_grad_enabled and weight.requires_grad
     with_input_all_gather_nccl = (
         parallel_mode == "column" and sequence_parallel and not ub_overlap_ag_fprop
@@ -362,7 +361,7 @@ def _linear_forward_impl(
     reduce_scatter_out = None
     if ub_overlap_rs_fprop:
         out_shape = list(inp.shape)
-        out_shape[0] //= tp_world_size
+        out_shape[0] //= tp_size
         out_shape[-1] = out_features
         reduce_scatter_out = torch.empty(out_shape, dtype=activation_dtype, device=inp.device)
 

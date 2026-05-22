@@ -125,6 +125,54 @@ def general_gemm(
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
 
+    if (
+        layout == "TN"
+        and out is None
+        and quantization_params is None
+        and not gelu
+        and gelu_in is None
+        and alpha == 1.0
+        and beta is None
+        and not accumulate
+        and not grad
+        and ub is None
+        and ub_type is None
+        and extra_output is None
+        and not bulk_overlap
+        and not isinstance(A, Float8BlockwiseQTensorStorage)
+        and not isinstance(B, Float8BlockwiseQTensorStorage)
+        and not _is_nvfp4_row_scaled_tensor(A)
+        and not _is_nvfp4_row_scaled_tensor(B)
+        and not is_custom(A)
+        and not is_custom(B)
+    ):
+        workspace = get_cublas_workspace(A.device.index, False, False)
+        out, bias_grad, gelu_input, extra_output = tex.generic_gemm(
+            A,
+            True,
+            B,
+            False,
+            None,
+            None,
+            TE_DType[out_dtype] if out_dtype is not None else None,
+            bias,
+            TE_DType[torch.bfloat16 if bias is None else bias.dtype],
+            False,
+            None,
+            False,
+            workspace,
+            workspace.shape[0],
+            False,
+            use_split_accumulator,
+            None,
+            None,
+            None,
+            False,
+            1.0,
+            0.0,
+        )
+        return out, bias_grad, gelu_input, extra_output
+
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
     transb = layout[1] == "T"
