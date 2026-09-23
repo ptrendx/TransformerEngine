@@ -129,16 +129,27 @@ affected.
 
 ## Task-specific guidance
 
-Read the relevant guide for the task:
+Read the guides relevant to the work being performed. Paths and commands in
+these guides are relative to the repository root. A task may require
+more than one guide but be wary of using more context than needed.
 
-- [Building](docs/development/building.md): setup, build controls, provenance,
-  and rebuild modes.
-- [Testing](docs/development/testing.md): test setup, QA launchers, and
-  numerical, backend, and distributed validation.
-- [Performance](docs/development/performance.md): benchmarking and reproducible
-  comparisons.
+- [Building](docs/development/building.md): read when installing or rebuilding
+  Transformer Engine, configuring its development environment, changing
+  toolchains or native build options, or verifying the imported installation.
+  Covers framework/container selection, source dependencies, editable
+  installation, architecture targets, build controls, and rebuild scope.
 
-Paths and commands in these guides are relative to the repository root.
+- [Testing](docs/development/testing.md): read when preparing the test
+  environment, choosing or running tests, reproducing CI test failures,
+  or validating numerical or backend behavior.
+  Covers test dependencies such as pytest and plugins, suite-specific
+  environment variables and options, QA launchers, C++ test executables,
+  and frontend, numerical, backend, and distributed validation.
+
+- [Performance](docs/development/performance.md): read when benchmarking,
+  investigating performance changes, or reporting performance comparisons.
+  Covers benchmark selection, measurement conditions, correctness checks,
+  and the information required to reproduce results.
 
 ## Formatting and Linting
 
