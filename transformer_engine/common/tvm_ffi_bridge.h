@@ -114,7 +114,7 @@ class DLTensorWrapper : public DLTensor {
   DLTensorWrapper() : DLTensor{} {}
 
   explicit DLTensorWrapper(const NVTEBasicTensor &tensor, bool flatten_2D = true,
-                           int32_t device_index = -1)
+                           int32_t device_index = -1, const int64_t *strides = nullptr)
       : DLTensor{} {
     if (device_index < 0) {
       device_index = transformer_engine::cuda::current_device();
@@ -151,6 +151,11 @@ class DLTensorWrapper : public DLTensor {
     this->shape = shape_buf_;
     this->strides = strides_buf_;
     this->byte_offset = 0;
+
+    if (strides != nullptr) {
+      NVTE_CHECK(!flatten_2D, "Explicit strides require an unflattened DLTensor");
+      std::memcpy(strides_buf_, strides, n * sizeof(int64_t));
+    }
 
     // TVM-FFI uses packed dtypes for sub-byte values and measures shapes and strides in their units,
     // whereas TE and CuTe DSL use logical sizes of unpacked tensors.
@@ -291,6 +296,10 @@ class TVMFFICentral {
     // Only check if libtvm_ffi.so is loaded if user enables the CuTeDSL backend.
     // So if user disables the CuTeDSL backend, don't output this warning message.
     if (!get_tvm_ffi_available()) {
+      std::lock_guard<std::mutex> init_lock(tvm_ffi_init_mutex_);
+      if (!get_tvm_ffi_available()) set_tvm_ffi_available(prepare_tvm_ffi());
+    }
+    if (!get_tvm_ffi_available()) {
       // Warn once rather than spamming every quantize call while TVM-FFI is unavailable.
       static std::once_flag warned;
       std::call_once(warned, [this] {
@@ -306,6 +315,14 @@ class TVMFFICentral {
       maybe_warn_not_chosen("no TVM-FFI kernel is registered for config `", key, "`.");
     }
     return fn;
+  }
+
+  // Resolve a function already compiled/registered by the caller. Loading the
+  // TVM runtime is independent of enabling a particular operation's backend.
+  // In particular, GEMM must not enable the optional quantization backend.
+  std::optional<tvm::ffi::Function> get_registered_function(const std::string &name) {
+    if (!prepare_tvm_ffi_library()) return std::nullopt;
+    return tvm::ffi::Function::GetGlobal(name);
   }
 
   // Runtime override of NVTE_ENABLE_CUTEDSL_BACKEND (exposed to Python as
@@ -358,13 +375,21 @@ class TVMFFICentral {
       : tvm_ffi_available_(false),
         cutedsl_backend_enabled_(is_cutedsl_backend_enabled()),
         warn_cutedsl_backend_not_chosen_(warn_if_cutedsl_backend_not_chosen()) {
-    set_tvm_ffi_available(prepare_tvm_ffi());
+    // Backend registration is lazy; resolving caller-registered functions must
+    // not initialize optional operation backends.
   }
 
   bool prepare_tvm_ffi() {
     if (!get_cutedsl_backend_enabled() || !initialize_python_cutedsl_backend()) {
       return false;
     }
+    return prepare_tvm_ffi_library();
+  }
+
+  bool prepare_tvm_ffi_library() {
+    if (library_available_.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lock(library_init_mutex_);
+    if (library_available_.load(std::memory_order_relaxed)) return true;
     if (tvm_ffi_handle_ == nullptr) {
       // Keep the library open for the lifetime of cached tvm::ffi::Function objects.
       tvm_ffi_handle_ = dlopen("libtvm_ffi.so", RTLD_NOW | RTLD_GLOBAL);
@@ -385,6 +410,7 @@ class TVMFFICentral {
           "The CuTeDSL kernel is not chosen because the TVM-FFI library could not be loaded.");
       return false;
     }
+    library_available_.store(true, std::memory_order_release);
     return true;
   }
 
@@ -402,11 +428,14 @@ class TVMFFICentral {
     return transformer_engine::getenv<bool>("NVTE_WARN_IF_CUTEDSL_BACKEND_NOT_CHOSEN");
   }
 
-  std::atomic<bool> tvm_ffi_available_;  // libtvm_ffi.so loaded; false disables the backend
+  // Policy-controlled backends need both Python registration and the TVM runtime.
+  std::atomic<bool> tvm_ffi_available_;
   std::mutex tvm_ffi_init_mutex_;
   std::atomic<bool> cutedsl_backend_enabled_;
   const bool warn_cutedsl_backend_not_chosen_;
   void *tvm_ffi_handle_ = nullptr;
+  std::atomic<bool> library_available_{false};
+  std::mutex library_init_mutex_;
 
   // These are symbols dynamically loaded from TVM-FFI
   using GetGlobalFn = decltype(&::TVMFFIFunctionGetGlobal);
@@ -438,40 +467,55 @@ class TVMFFIConfigCache {
       central.load_tvm_ffi_function(cfg);
       return std::nullopt;
     }
-    // Otherwise try the cache first, and ask Python to compile/register the kernel if not found.
-    const uint32_t id = cfg.to_id();
+    return get_or_load_impl(cfg.to_id(), map_, [&] { return central.load_tvm_ffi_function(cfg); });
+  }
+
+  // Caller-registered kernels use the same cache/launch/lifetime handling, with
+  // a full registry name rather than the compact quantization config ID.
+  std::optional<TVMFFIKernel> get_registered(const std::string &name) {
+    return get_or_load_impl(name, registered_, [&] {
+      return TVMFFICentral::getInstance().get_registered_function(name);
+    });
+  }
+
+ private:
+  template <typename Key, typename Loader>
+  std::optional<TVMFFIKernel> get_or_load_impl(
+      const Key &id, std::unordered_map<Key, std::optional<TVMFFIKernel>> &map, Loader load) {
     {
       std::shared_lock<std::shared_mutex> read_lock(mutex_);
-      auto it = map_.find(id);
-      if (it != map_.end()) {
+      auto it = map.find(id);
+      if (it != map.end()) {
         return it->second;
       }
     }
 
     std::unique_lock<std::shared_mutex> write_lock(mutex_);
     // After I grab the write lock, check again in case another thread already loaded it.
-    auto it = map_.find(id);
-    if (it != map_.end()) {
+    auto it = map.find(id);
+    if (it != map.end()) {
       // Another thread must have loaded it before I obtained the write lock, so just return it.
       return it->second;
     }
 
     // No other thread has loaded it, and none can load it now while I hold the write lock.
-    std::optional<tvm::ffi::Function> fn = central.load_tvm_ffi_function(cfg);
+    std::optional<tvm::ffi::Function> fn = load();
     std::optional<TVMFFIKernel> kernel;
     if (fn) {
       kernel.emplace(make_tvm_ffi_kernel(std::move(*fn)));
     }
-    map_.emplace(id, kernel);
+    // Retry caller-registered kernels after a miss; registration can happen
+    // later. Preserve the existing negative config cache for quantization.
+    if (kernel || std::is_same_v<Key, uint32_t>) map.emplace(id, kernel);
     return kernel;
   }
 
- private:
   TVMFFIConfigCache() = default;
   ~TVMFFIConfigCache() = default;
 
   std::shared_mutex mutex_;
   std::unordered_map<uint32_t, std::optional<TVMFFIKernel>> map_;
+  std::unordered_map<std::string, std::optional<TVMFFIKernel>> registered_;
 };
 
 // Optionally emit a warning explaining why the CuTeDSL backend was not chosen for this config.

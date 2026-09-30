@@ -273,3 +273,57 @@ def test_native_cutedsl_device_guard(backend):
     torch.testing.assert_close(
         result, (a.float() @ b.float().T).bfloat16(), rtol=0.008, atol=0.03125
     )
+
+
+def test_native_cutedsl_registered_cache_retry(backend):
+    """A registry miss must not poison the shared cache before registration."""
+    if backend != "cutedsl":
+        pytest.skip("native registry cache is specific to CuTeDSL")
+    import importlib
+    import tvm_ffi
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.constants import DType
+
+    module = importlib.import_module(
+        "transformer_engine.pytorch.cpp_extensions.batch_invariant_gemm"
+    )
+    if not module._native_cutedsl_available():
+        pytest.skip("the extension was built without TVM FFI headers")
+    a = torch.randn(17, 512, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda")
+    name, workspace = module._get_native_cutedsl_gemm(a.device.index, 512, 512, 512)
+    retry_name = name + ".retry_test"
+
+    def launch():
+        return tex.generic_gemm(
+            b,
+            True,
+            a,
+            False,
+            None,
+            None,
+            DType.kBFloat16,
+            None,
+            DType.kBFloat16,
+            False,
+            None,
+            False,
+            workspace,
+            0,
+            False,
+            False,
+            cutedsl_kernel=retry_name,
+        )[0]
+
+    with pytest.raises(RuntimeError, match="not registered"):
+        launch()
+    tvm_ffi.register_global_func(retry_name, tvm_ffi.get_global_func(name), override=True)
+    expected = batch_invariant_gemm(a, b, backend="cutedsl")
+    assert torch.equal(launch(), expected)
+
+    def unexpected_registry_lookup(*args):
+        raise AssertionError("cached launch resolved the replacement registry function")
+
+    tvm_ffi.register_global_func(retry_name, unexpected_registry_lookup, override=True)
+    # The owned native function survives a registry replacement and is reused.
+    assert torch.equal(launch(), expected)

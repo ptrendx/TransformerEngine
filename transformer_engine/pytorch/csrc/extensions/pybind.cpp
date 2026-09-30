@@ -253,7 +253,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("extra_output") = std::nullopt, py::arg("bulk_overlap") = false,
         py::arg("alpha") = 1.0f, py::arg("beta") = std::nullopt, py::arg("cutedsl_kernel") = "");
   m.def("has_native_batch_invariant_gemm", [] {
-#if __has_include(<tvm/ffi/c_api.h>)
+#if __has_include(<tvm/ffi/function.h>)
     return true;
 #else
     return false;
@@ -261,7 +261,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   });
   m.def("can_use_native_batch_invariant_gemm",
         [](const at::Tensor &a, const at::Tensor &b, bool automatic) {
-#if __has_include(<tvm/ffi/c_api.h>)
+#if __has_include(<tvm/ffi/function.h>)
           return a.is_cuda() && b.device() == a.device() && a.scalar_type() == at::kBFloat16 &&
                  b.scalar_type() == at::kBFloat16 && a.dim() == 2 && b.dim() == 2 &&
                  a.is_contiguous() && b.is_contiguous() && a.size(0) > 0 &&

@@ -61,6 +61,9 @@ caches the native function and passes stack-allocated DLTensor descriptors and
 the current PyTorch CUDA stream directly to it. Steady-state calls bypass the
 Python kernel launcher and cuBLASLt setup. Builds without those headers retain
 the Python CuTeDSL launcher, including when dependencies are installed later.
+The GEMM adapter reuses the common TVM FFI loader, function cache, tensor wrappers,
+and initial-launch handling. Resolving an already registered GEMM function does
+not enable the optional CuTeDSL quantization backend.
 
 Both backends accept an optional contiguous BF16 ``out`` tensor of shape
 ``[M, N]``. To compare their steady-state GPU and eager-call times with

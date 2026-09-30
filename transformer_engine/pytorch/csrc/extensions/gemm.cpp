@@ -241,7 +241,7 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
   // Batch-invariant dispatch: retain the existing C++ output allocation, but skip
   // cuBLASLt descriptors, heuristics, and general epilogue setup.
   if (!cutedsl_kernel.empty()) {
-#if __has_include(<tvm/ffi/c_api.h>)
+#if __has_include(<tvm/ffi/function.h>)
     NVTE_CHECK(transa && !transb && quantizer.is_none() && !bias && !gelu && !gelu_in && !grad &&
                    !accumulate && !use_split_accumulator && !comm_overlap && !comm_type &&
                    !extra_output && !bulk_overlap && alpha == 1.0f && beta == 0.0f,
@@ -270,7 +270,7 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
       auto kernel = batch_invariant_ffi::get_batch_invariant_ffi(cutedsl_kernel);
       NVTE_SCOPED_GIL_RELEASE({
         batch_invariant_ffi::launch_batch_invariant_ffi(
-            *kernel, input.data_ptr(), weight.data_ptr(), destination.data_ptr(), m == 1 ? 2 : m, n,
+            kernel, input.data_ptr(), weight.data_ptr(), destination.data_ptr(), m == 1 ? 2 : m, n,
             k, m == 1 ? 0 : k, input.get_device(), stream);
       });
       if (scratch) output.copy_(m == 1 ? destination.narrow(0, 0, 1) : destination);
