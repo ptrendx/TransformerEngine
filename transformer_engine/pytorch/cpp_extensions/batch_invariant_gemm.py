@@ -9,7 +9,7 @@ heuristic depends on the full problem shape. That makes a given input row's outp
 depend on how many *other* rows are present in the batch. This module provides an
 opt-in forward path with a reduction order that only depends on the tile
 coordinates, so a row's result is bitwise stable across batch composition.
-On Blackwell, large aligned problems use a fixed-tile CuTeDSL tensor-core
+On Blackwell, large aligned problems use a persistent CuTeDSL tensor-core
 kernel; the Triton kernel handles other configurations.
 
 Supported: BF16, ``Y = X @ W.T``, contiguous 2-D operands, no bias.
@@ -172,7 +172,7 @@ def _get_cutedsl_gemm(device_index: int, n: int, k: int, a_row_stride: int):
 def _batch_invariant_gemm_cutedsl(
     a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    """Run the same compiled CuTeDSL kernel for every batch size."""
+    """Run a cached CuTeDSL callable with output tiling selected inside TVM FFI."""
     # The Blackwell TMA epilogue faults for a one-row output. Give it two
     # logical rows while aliasing the input, then return only the first result.
     # No device copy is needed for the input and the reduction order is unchanged.

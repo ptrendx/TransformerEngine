@@ -104,6 +104,30 @@ def test_triton_tiles_are_bitwise_stable_across_batch_sizes():
         assert torch.equal(part, full[lo:hi]), f"rows {lo}:{hi} changed across Triton tiles"
 
 
+@pytest.mark.parametrize(
+    "shape", [(4096, 4096, 4096), (4097, 1032, 520), (1025, 520, 72), (1025, 8, 8)]
+)
+def test_cutedsl_persistent_tiles_are_bitwise_stable(shape):
+    """Cover tile transitions, multiple persistent iterations, and N/K tails."""
+    pytest.importorskip("cutlass")
+    pytest.importorskip("tvm_ffi")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("CuTeDSL batch-invariant GEMM requires Blackwell")
+    m, n, k = shape
+    torch.manual_seed(2026)
+    a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    full = batch_invariant_gemm(a, b, backend="cutedsl")
+    ref = (a.float() @ b.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(full, ref, rtol=0.008, atol=0.03125)
+    for lo, rows in ((0, 1), (5, 7), (0, 256), (5, 257), (0, 1024), (0, 1025)):
+        part = batch_invariant_gemm(a[lo : lo + rows], b, backend="cutedsl")
+        assert torch.equal(part, full[lo : lo + rows]), f"{rows} rows changed across CuTe tiles"
+    perm = torch.randperm(m, device="cuda")
+    reordered = batch_invariant_gemm(a[perm], b, backend="cutedsl")
+    assert torch.equal(reordered, full[perm]), "rows changed when moved to different tiles"
+
+
 def test_unsupported_combinations_raise():
     if not torch.cuda.is_available():
         pytest.skip("batch_invariant_gemm requires a GPU")

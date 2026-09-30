@@ -16,6 +16,7 @@ import argparse
 import statistics
 import time
 from functools import partial
+from importlib.metadata import version
 
 import torch
 import triton
@@ -121,6 +122,17 @@ def main() -> None:
         parser.error("a CUDA GPU is required")
     torch.manual_seed(2026)
     print(f"GPU: {torch.cuda.get_device_name()} | PyTorch: {torch.__version__}")
+    print(
+        f"CC: {torch.cuda.get_device_capability()} | CUDA: {torch.version.cuda} | "
+        f"cuDNN: {torch.backends.cudnn.version()} | Triton: {triton.__version__} | "
+        f"CuTeDSL: {version('nvidia-cutlass-dsl')}"
+    )
+    print("Inputs: contiguous BF16 A[M,K], B[N,K], randn with seed 2026; preallocated output")
+    print(
+        f"Warmup: {args.warmup} calls/backend; graph: {args.graph_nodes} nodes, "
+        f"3 warmup replays, median of {args.graph_trials} trials; eager: "
+        f"{args.eager_iterations} iterations, median of {args.eager_trials} trials"
+    )
     print("M,N,K | graph Triton/CuTe/general (us) | eager Triton/CuTe/general (us)")
     if args.include_triton_baseline:
         print("Additional column: original Triton graph (us)")

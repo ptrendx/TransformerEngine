@@ -19,7 +19,7 @@ and does not support bias or autograd.
 
    y = batch_invariant_gemm(a, b)  # [M, N]
 
-The default ``backend="auto"`` uses a fixed-tile CuTeDSL tensor-core kernel on
+The default ``backend="auto"`` uses a persistent CuTeDSL tensor-core kernel on
 Blackwell when N and K are at least 512 and multiples of eight and the CuTeDSL
 dependencies are available. It uses Triton for other configurations. This
 choice depends on N and K, never on M. Use ``backend="triton"`` or
@@ -32,6 +32,14 @@ small batches and larger tiles for large batches. The K tile and sequential
 reduction order remain fixed for a given N and K, so rows stay bitwise stable
 when batch composition changes. Other GPU architectures use the fixed Triton
 tile.
+
+The CuTeDSL backend uses separate warps for TMA loads, tensor-core computation,
+and output stores. Resident blocks process multiple output tiles, with two
+accumulator buffers to overlap computation and stores. The output tile is
+128x128 for up to 256 rows, 128x256 for up to 1024 rows, and 256x256 for larger
+batches. These choices run inside the cached compiled callable. All use the
+same 64-element K tile and sequential reduction order, preserving bitwise
+batch invariance across output tile sizes.
 
 Both backends accept an optional contiguous BF16 ``out`` tensor of shape
 ``[M, N]``. To compare their steady-state GPU and eager-call times with

@@ -2,16 +2,16 @@
 #
 # See LICENSE for license information.
 
-"""Compile the fixed-tile Blackwell BF16 batch-invariant GEMM.
+"""Compile the persistent Blackwell BF16 batch-invariant GEMM.
 
-The MMA tile, cluster, and K loop do not depend on M. A compiled function accepts
-any M with the same N and K, including batches formed by slicing the input.
+Output tiling adapts to M without changing the cluster or sequential K reduction.
+A compiled function accepts any M with the same N and K, including sliced inputs.
 """
 
 from functools import lru_cache
 
 import cutlass
-from cutlass import cute
+from cutlass import cute, utils
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 import cuda.bindings.driver as cuda
 
@@ -24,6 +24,7 @@ def _gemm_2d(
     b: cute.Tensor,
     c: cute.Tensor,
     stream: cuda.CUstream,  # pylint: disable=c-extension-no-member
+    max_active_clusters: cutlass.Constexpr,
 ):
     """Give the dense GEMM's tensors a unit batch mode without PyTorch views."""
     a3 = cute.make_tensor(
@@ -38,13 +39,20 @@ def _gemm_2d(
         c.iterator,
         cute.make_layout((c.shape[0], c.shape[1], 1), stride=(c.layout.stride[0], 1, 1)),
     )
-    DenseGemmKernel(
-        acc_dtype=cutlass.Float32,
-        use_2cta_instrs=True,
-        mma_tiler_mn=(128, 256),
-        cluster_shape_mn=(2, 1),
-        use_tma_store=True,
-    )(a3, b3, c3, stream)
+    # All variants use the same K=64 tile and ordered tcgen05 MMA instructions.
+    # Choose output geometry in the compiled host function, with no Python dispatch.
+    if a.shape[0] <= 256:
+        DenseGemmKernel(cutlass.Float32, True, (128, 128), (2, 1), True)(
+            a3, b3, c3, max_active_clusters, stream
+        )
+    elif a.shape[0] <= 1024:
+        DenseGemmKernel(cutlass.Float32, True, (128, 256), (2, 1), True)(
+            a3, b3, c3, max_active_clusters, stream
+        )
+    else:
+        DenseGemmKernel(cutlass.Float32, True, (256, 256), (2, 1), True)(
+            a3, b3, c3, max_active_clusters, stream
+        )
 
 
 @lru_cache(maxsize=32)
@@ -59,4 +67,7 @@ def compile_batch_invariant_gemm(n: int, k: int, device_index: int, a_row_stride
     a = make_fake_tensor(cutlass.BFloat16, (m, k), stride=(a_row_stride, 1), assumed_align=16)
     b = make_fake_tensor(cutlass.BFloat16, (n, k), stride=(k, 1), assumed_align=16)
     c = make_fake_tensor(cutlass.BFloat16, (m, n), stride=(n, 1), assumed_align=16)
-    return cute.compile(_gemm_2d, a, b, c, make_fake_stream(), options="--enable-tvm-ffi")
+    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(2)
+    return cute.compile(
+        _gemm_2d, a, b, c, make_fake_stream(), max_active_clusters, options="--enable-tvm-ffi"
+    )
