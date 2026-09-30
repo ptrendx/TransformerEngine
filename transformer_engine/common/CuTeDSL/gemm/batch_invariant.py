@@ -71,3 +71,22 @@ def compile_batch_invariant_gemm(n: int, k: int, device_index: int, a_row_stride
     return cute.compile(
         _gemm_2d, a, b, c, make_fake_stream(), max_active_clusters, options="--enable-tvm-ffi"
     )
+
+
+@lru_cache(maxsize=32)
+def register_native_gemm(n: int, k: int, device_index: int, a_row_stride: int):
+    """Register the compiled native entrypoint once for C++ dispatch."""
+    import tvm_ffi
+
+    compiled = compile_batch_invariant_gemm(n, k, device_index, a_row_stride)
+    native = getattr(compiled, "__tvm_ffi_object__", lambda: None)()
+    if native is None:
+        if isinstance(compiled, tvm_ffi.Function):
+            native = compiled
+        else:
+            raise RuntimeError(
+                "CuTeDSL GEMM compilation did not expose a native TVM FFI entrypoint"
+            )
+    name = f"nvte.batch_invariant.{device_index}.{n}.{k}.{a_row_stride}"
+    tvm_ffi.register_global_func(name, native, override=True)
+    return name

@@ -28,14 +28,12 @@
 
 #include "common.h"
 #include "util/cuda_runtime.h"
+#include "util/cutedsl_launch.h"
 #include "util/logging.h"
 #include "util/system.h"
 
 namespace transformer_engine {
 namespace tvm_ffi_bridge {
-
-// All CuTeDSL kernels share this lock while their TVM-FFI entrypoints are first used.
-inline std::mutex first_cutedsl_launch_mutex;
 
 // Cached copies of the lambda share this state for one compiled kernel.
 struct TVMFFIKernelState {
@@ -62,7 +60,7 @@ inline auto make_tvm_ffi_kernel(tvm::ffi::Function function) {
     NVTE_CHECK(device >= 0 && device < state->num_devices, "Invalid CUDA device index: ", device);
     // If we never launch the kernel on this device, we need to make its initial launch serialized
     if (!state->launched[device].load(std::memory_order_acquire)) {
-      std::lock_guard<std::mutex> lock(first_cutedsl_launch_mutex);
+      std::lock_guard<std::mutex> lock(first_cutedsl_launch_mutex());
       // Check again in case another thread already launched it while we were waiting for the lock
       if (!state->launched[device].load(std::memory_order_relaxed)) {
         // Launch the kernel while holding the global mutex and mark it as launched for this device after we're done.

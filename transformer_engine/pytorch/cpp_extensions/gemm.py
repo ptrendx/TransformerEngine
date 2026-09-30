@@ -208,8 +208,40 @@ def general_gemm(
     ub_type: tex.CommOverlapType = None,
     extra_output: Optional[torch.Tensor] = None,
     bulk_overlap: bool = False,
+    batch_invariant: bool = False,
 ) -> Iterable[Optional[torch.Tensor]]:
-    """GEMM supporting fp8 inputs."""
+    """GEMM supporting fp8 inputs.
+
+    ``batch_invariant=True`` selects the BF16 ``TN`` forward path with a fixed
+    reduction order. It supports contiguous 2-D inputs and BF16 output, without
+    bias, activation, quantization, accumulation, scaling, or communication overlap.
+    """
+
+    if batch_invariant:
+        # Keep all unsupported options together so this opt-in path cannot
+        # silently drop a requested epilogue or scaling operation.
+        # pylint: disable=too-many-boolean-expressions
+        if (
+            layout != "TN"
+            or out_dtype not in (None, torch.bfloat16)
+            or quantization_params is not None
+            or bias is not None
+            or gelu
+            or gelu_in is not None
+            or grad
+            or accumulate
+            or use_split_accumulator
+            or alpha != 1.0
+            or beta not in (None, 0.0)
+            or ub is not None
+            or ub_type is not None
+            or extra_output is not None
+            or bulk_overlap
+        ):
+            raise ValueError("Batch-invariant GEMM supports only unscaled BF16 TN forward")
+        from .batch_invariant_gemm import batch_invariant_gemm
+
+        return batch_invariant_gemm(B, A, out=out), None, None, None
 
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"

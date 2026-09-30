@@ -10,6 +10,7 @@
 #include <string>
 
 #include "../extensions.h"
+#include "common/gemm/batch_invariant_ffi.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -146,7 +147,8 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
                              at::Tensor workspace, size_t workspaceSize, bool accumulate,
                              bool use_split_accumulator, CommOverlapCore* comm_overlap,
                              std::optional<CommOverlapType> comm_type, MaybeTensor extra_output,
-                             bool bulk_overlap, float alpha, std::optional<float> beta) {
+                             bool bulk_overlap, float alpha, std::optional<float> beta,
+                             const std::string& cutedsl_kernel) {
   using namespace transformer_engine::pytorch::detail;
 
   // Ensure that cublasLt handle is created on the correct device,
@@ -214,6 +216,18 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
   if (D.is_none()) {
     std::tie(D_tensor, D) = createOutputTensor(D_shape, output_dtype, quantizer);
   } else {
+    if (!cutedsl_kernel.empty()) {
+      auto output = py::cast<at::Tensor>(D);
+      if (output.dim() != 2 || !output.is_contiguous() || output.scalar_type() != at::kBFloat16 ||
+          output.device() != workspace.device()) {
+        throw py::value_error(
+            "Batch-invariant GEMM requires a contiguous 2-D BF16 out on the input device");
+      }
+      if (output.size(0) != static_cast<int64_t>(D_shape[0]) ||
+          output.size(1) != static_cast<int64_t>(D_shape[1])) {
+        throw py::value_error("Batch-invariant GEMM out must have shape [M,N]");
+      }
+    }
     D_tensor = makeTransformerEngineTensor(D, quantizer);
     NVTE_CHECK(detail::checkGemmShape(D_shape, D_tensor.shape()),
                "GEMM output has invalid dims (expected ", std::to_string(D_shape), ", got ",
@@ -222,6 +236,49 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
       NVTE_CHECK(*out_dtype == D_tensor.dtype(), "GEMM output has invalid dtype (expected ",
                  static_cast<int>(*out_dtype), ", found ", static_cast<int>(D_tensor.dtype()), ")");
     }
+  }
+
+  // Batch-invariant dispatch: retain the existing C++ output allocation, but skip
+  // cuBLASLt descriptors, heuristics, and general epilogue setup.
+  if (!cutedsl_kernel.empty()) {
+#if __has_include(<tvm/ffi/c_api.h>)
+    NVTE_CHECK(transa && !transb && quantizer.is_none() && !bias && !gelu && !gelu_in && !grad &&
+                   !accumulate && !use_split_accumulator && !comm_overlap && !comm_type &&
+                   !extra_output && !bulk_overlap && alpha == 1.0f && beta == 0.0f,
+               "CuTeDSL batch-invariant GEMM supports only BF16 TN forward without an epilogue");
+    auto weight = py::cast<at::Tensor>(A);
+    auto input = py::cast<at::Tensor>(B);
+    auto output = py::cast<at::Tensor>(D);
+    NVTE_CHECK(weight.is_cuda() && input.device() == weight.device() &&
+                   output.device() == input.device() &&
+                   cuda::sm_arch(input.get_device()) / 10 == 10,
+               "CuTeDSL batch-invariant GEMM requires SM100-family CUDA tensors on one device");
+    NVTE_CHECK(weight.scalar_type() == at::kBFloat16 && input.scalar_type() == at::kBFloat16 &&
+                   output.scalar_type() == at::kBFloat16 && weight.dim() == 2 && input.dim() == 2 &&
+                   output.dim() == 2 && weight.is_contiguous() && input.is_contiguous() &&
+                   output.is_contiguous(),
+               "CuTeDSL batch-invariant GEMM requires contiguous 2-D BF16");
+    const int64_t m = input.size(0), n = weight.size(0), k = weight.size(1);
+    NVTE_CHECK(n >= 8 && k >= 8 && n % 8 == 0 && k % 8 == 0 &&
+                   reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
+                   reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0,
+               "CuTeDSL batch-invariant GEMM requires aligned operands and N,K divisible by eight");
+    if (m != 0) {
+      const bool scratch = m == 1 || reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 != 0;
+      auto destination = scratch ? at::empty({m == 1 ? 2 : m, n}, output.options()) : output;
+      auto stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
+      auto kernel = batch_invariant_ffi::get_batch_invariant_ffi(cutedsl_kernel);
+      NVTE_SCOPED_GIL_RELEASE({
+        batch_invariant_ffi::launch_batch_invariant_ffi(
+            *kernel, input.data_ptr(), weight.data_ptr(), destination.data_ptr(), m == 1 ? 2 : m, n,
+            k, m == 1 ? 0 : k, input.get_device(), stream);
+      });
+      if (scratch) output.copy_(m == 1 ? destination.narrow(0, 0, 1) : destination);
+    }
+    return {std::move(D), py::none(), py::none(), py::none()};
+#else
+    NVTE_ERROR("CuTeDSL batch-invariant GEMM requires TVM FFI headers when building the extension");
+#endif
   }
 
   // maintain unquantized tensor in case we need unfused quantization support.

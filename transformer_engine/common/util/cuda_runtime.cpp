@@ -17,8 +17,16 @@
 #include "../util/shared_lib_wrapper.h"
 #include "../util/system.h"
 #include "common/util/cuda_runtime.h"
+#include "common/util/cutedsl_launch.h"
 
 namespace transformer_engine {
+
+namespace tvm_ffi_bridge {
+std::mutex &first_cutedsl_launch_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+}  // namespace tvm_ffi_bridge
 
 namespace cuda {
 

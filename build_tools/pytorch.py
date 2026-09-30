@@ -68,6 +68,15 @@ def setup_pytorch_extension(
         ]
     )
 
+    # Native batch-invariant GEMM dispatch is optional. Keep builds without TVM
+    # FFI working; the Python CuTeDSL launcher remains available in that case.
+    try:
+        tvm_ffi_dist = metadata.distribution("apache-tvm-ffi")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        include_dirs.append(tvm_ffi_dist.locate_file("tvm_ffi/include"))
+
     # Compiler flags
     cxx_flags = ["-O3", "-fvisibility=hidden"]
     if debug_build_enabled():

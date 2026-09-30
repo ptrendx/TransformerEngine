@@ -23,6 +23,9 @@ from typing import Literal, Optional
 import torch
 import triton
 import triton.language as tl
+import transformer_engine_torch as tex
+
+from ..constants import DType
 
 __all__ = ["batch_invariant_gemm", "is_supported"]
 
@@ -169,7 +172,7 @@ def _get_cutedsl_gemm(device_index: int, n: int, k: int, a_row_stride: int):
         return compile_batch_invariant_gemm(n, k, device_index, a_row_stride), CUstream
 
 
-def _batch_invariant_gemm_cutedsl(
+def _batch_invariant_gemm_cutedsl_python(
     a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor]
 ) -> torch.Tensor:
     """Run a cached CuTeDSL callable with output tiling selected inside TVM FFI."""
@@ -194,6 +197,57 @@ def _batch_invariant_gemm_cutedsl(
     if padded_out is not out:
         out.copy_(padded_out[:1] if single_row else padded_out)
     return out
+
+
+@lru_cache(maxsize=1)
+def _native_cutedsl_available() -> bool:
+    """The extension can use TVM FFI when its headers were present at build time."""
+    return getattr(tex, "has_native_batch_invariant_gemm", lambda: False)()
+
+
+@lru_cache(maxsize=32)
+def _get_native_cutedsl_gemm(device_index: int, n: int, k: int, a_row_stride: int):
+    """Compile/register once; the native binding caches the TVM FFI function."""
+    try:
+        from transformer_engine.common.CuTeDSL.gemm.batch_invariant import register_native_gemm
+    except ImportError as exc:
+        raise RuntimeError("CuTeDSL batch-invariant GEMM requires cutlass and cuda-python") from exc
+
+    with torch.cuda.device(device_index):
+        return (
+            register_native_gemm(n, k, device_index, a_row_stride),
+            torch.empty(0, dtype=torch.uint8, device=device_index),
+        )
+
+
+def _batch_invariant_gemm_cutedsl(
+    a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Use general_gemm's native allocation and direct TVM FFI dispatch."""
+    if not _native_cutedsl_available():
+        return _batch_invariant_gemm_cutedsl_python(a, b, out)
+    kernel, workspace = _get_native_cutedsl_gemm(
+        a.device.index, b.shape[0], b.shape[1], 0 if a.shape[0] == 1 else a.shape[1]
+    )
+    return tex.generic_gemm(
+        b,
+        True,
+        a,
+        False,
+        out,
+        None,
+        DType.kBFloat16,
+        None,
+        DType.kBFloat16,
+        False,
+        None,
+        False,
+        workspace,
+        workspace.numel(),
+        False,
+        False,
+        cutedsl_kernel=kernel,
+    )[0]
 
 
 def batch_invariant_gemm(
@@ -223,6 +277,15 @@ def batch_invariant_gemm(
     torch.Tensor
         The ``[M, N]`` result. Same layout contract as :func:`general_gemm`'s output.
     """
+    # Check eligibility in the binding to avoid repeating PyTorch metadata and
+    # device queries in Python before the native binding validates them again.
+    if (
+        backend in ("auto", "cutedsl")
+        and _native_cutedsl_available()
+        and _cutedsl_dependencies_available()
+        and tex.can_use_native_batch_invariant_gemm(a, b, backend == "auto")
+    ):
+        return _batch_invariant_gemm_cutedsl(a, b, out)
     _check(a, b, out)
     if backend not in ("auto", "triton", "cutedsl"):
         raise ValueError(f"Unknown batch_invariant_gemm backend: {backend}.")

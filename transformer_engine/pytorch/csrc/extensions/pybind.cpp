@@ -19,6 +19,7 @@
 #include "../common.h"
 #include "../extensions.h"
 #include "common.h"
+#include "common/util/cuda_runtime.h"
 
 namespace transformer_engine::pytorch {
 
@@ -250,7 +251,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace_size"), py::arg("accumulate"), py::arg("use_split_accumulator"),
         py::arg("comm_overlap") = nullptr, py::arg("comm_type") = std::nullopt,
         py::arg("extra_output") = std::nullopt, py::arg("bulk_overlap") = false,
-        py::arg("alpha") = 1.0f, py::arg("beta") = std::nullopt);
+        py::arg("alpha") = 1.0f, py::arg("beta") = std::nullopt, py::arg("cutedsl_kernel") = "");
+  m.def("has_native_batch_invariant_gemm", [] {
+#if __has_include(<tvm/ffi/c_api.h>)
+    return true;
+#else
+    return false;
+#endif
+  });
+  m.def("can_use_native_batch_invariant_gemm",
+        [](const at::Tensor &a, const at::Tensor &b, bool automatic) {
+#if __has_include(<tvm/ffi/c_api.h>)
+          return a.is_cuda() && b.device() == a.device() && a.scalar_type() == at::kBFloat16 &&
+                 b.scalar_type() == at::kBFloat16 && a.dim() == 2 && b.dim() == 2 &&
+                 a.is_contiguous() && b.is_contiguous() && a.size(0) > 0 &&
+                 a.size(1) == b.size(1) && b.size(0) >= (automatic ? 512 : 8) &&
+                 b.size(1) >= (automatic ? 512 : 8) && b.size(0) % 8 == 0 && b.size(1) % 8 == 0 &&
+                 reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0 &&
+                 reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0 &&
+                 transformer_engine::cuda::sm_arch(a.get_device()) / 10 == 10;
+#else
+    return false;
+#endif
+        });
   /* GLU (sigmoid gate) */
   m.def("glu", transformer_engine::pytorch::glu, "GLU activation", py::arg("input"),
         py::arg("quantizer"));
