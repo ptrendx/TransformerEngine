@@ -27,6 +27,12 @@ choice depends on N and K, never on M. Use ``backend="triton"`` or
 requires Blackwell, CuTeDSL, TVM FFI, cuda-python, and 16-byte aligned BF16
 input pointers and rows. Unsupported configurations raise ``ValueError``.
 
+On compute capability 10.x, the Triton backend uses smaller output tiles for
+small batches and larger tiles for large batches. The K tile and sequential
+reduction order remain fixed for a given N and K, so rows stay bitwise stable
+when batch composition changes. Other GPU architectures use the fixed Triton
+tile.
+
 Both backends accept an optional contiguous BF16 ``out`` tensor of shape
 ``[M, N]``. To compare their steady-state GPU and eager-call times with
 ``general_gemm`` on the same device, run:
@@ -34,3 +40,6 @@ Both backends accept an optional contiguous BF16 ``out`` tensor of shape
 .. code-block:: bash
 
    CUDA_VISIBLE_DEVICES=0 python benchmarks/gemm/benchmark_batch_invariant_gemm.py
+
+Add ``--include-triton-baseline`` to include the original 64x64x64 Triton
+kernel in the CUDA graph timing comparison.
