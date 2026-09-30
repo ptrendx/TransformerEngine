@@ -9,4 +9,4 @@ Other optimizations
 .. toctree::
 
    cpu_offloading/cpu_offloading.rst
-
+   batch_invariant_gemm.rst
