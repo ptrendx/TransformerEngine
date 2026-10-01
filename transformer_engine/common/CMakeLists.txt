@@ -297,6 +297,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      cast/cast_dbias.cu
      cast/cast_grouped.cu
      cast/cast_grouped_dbias.cu
+     cast/mxfp8/requantize_mxfp8.cu
      cast/fused_group_requantize.cu
      gemm/cutlass_grouped_gemm.cu
      hadamard_transform/group_hadamard_transform.cu

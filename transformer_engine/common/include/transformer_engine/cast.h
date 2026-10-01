@@ -429,6 +429,33 @@ void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t str
 void nvte_group_dequantize(const NVTEGroupedTensor input, NVTEGroupedTensor output,
                            cudaStream_t stream);
 
+/*! \brief Requantizes a grouped tensor. Currently supports MXFP8 1D scaling only.
+ *
+ * This is equivalent to grouped MXFP8 dequantization followed by columnwise-only
+ * grouped MXFP8 quantization, without materializing the high-precision
+ * intermediate in global memory. `use_fast_math` in `quant_config` selects a
+ * BF16 intermediate; the default intermediate is FP32.
+ *
+ * Input and output must describe the same grouped shapes. Input must contain
+ * rowwise FP8 data with compact E8M0 scales. Output must contain columnwise E4M3
+ * data and E8M0 scales; its scales may be compact or GEMM-swizzled. Output
+ * rowwise data is optional and, when present, must alias the input rowwise data.
+ * Output rowwise scales are also optional. When present, they must alias the
+ * input scales if the layouts match. If the layouts differ, they must use a
+ * separate allocation; the kernel swizzles them out of place. No rowwise
+ * data or scale copy is performed. Each group must have row and column counts
+ * divisible by 128.
+ *
+ *  \param[in]     input          Compact rowwise MXFP8 grouped tensor.
+ *  \param[in,out] output         Columnwise MXFP8 E4M3 grouped tensor with
+ *                                optional rowwise data and scales.
+ *  \param[in]     quant_config   Quantization configuration.
+ *  \param[in]     stream         CUDA stream used for the operation.
+ */
+void nvte_grouped_requantize(
+    const NVTEGroupedTensor input, NVTEGroupedTensor output,
+    const NVTEQuantizationConfig quant_config, cudaStream_t stream);
+
 /*! \brief Fused grouped requantization. Currently only MXFP8 1D scaling is supported.
  *
  * Makes a rowwise-only grouped MXFP8 tensor GEMM-ready in one kernel:
