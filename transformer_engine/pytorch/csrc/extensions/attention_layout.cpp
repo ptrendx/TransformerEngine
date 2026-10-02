@@ -1,33 +1,35 @@
 /*************************************************************************
- * Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights
- *reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
 
 #include <ATen/ATen.h>
+#include <ATen/TensorSubclassLikeUtils.h>
 #include <pybind11/pybind11.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include <limits>
+#include <stdexcept>
 #include <string>
 namespace py = pybind11;
 namespace transformer_engine::pytorch {
 namespace {
 struct Metadata {
-  const void *storage;
+  const void* storage;
   at::IntArrayRef shape;
   at::IntArrayRef stride;
   int64_t offset;
   int64_t elements;
-  explicit Metadata(const at::Tensor &t)
+  explicit Metadata(const at::Tensor& t)
       : storage(t.storage().data_ptr().get()),
         shape(t.sizes()),
         stride(t.strides()),
         offset(t.storage_offset()),
         elements(t.numel()) {}
 };
-std::string classify(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                     const std::string &fmt, const std::string &qfmt, const std::string &kvfmt) {
+std::string classify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                     const std::string& fmt, const std::string& qfmt, const std::string& kvfmt) {
   const Metadata a(q), b(k), c(v);
   const bool shared_qk = a.storage == b.storage;
   const bool shared_kv = b.storage == c.storage;
@@ -76,23 +78,54 @@ std::string classify(const at::Tensor &q, const at::Tensor &k, const at::Tensor 
 }
 }  // namespace
 
-py::object get_qkv_layout(at::Tensor q, at::Tensor k, at::Tensor v, const std::string &fmt) {
-  // Delegate exceptional/non-dense inputs to the untouched Python
-  // implementation.
-  for (const auto *t : {&q, &k, &v}) {
-    if (t->is_meta() || t->layout() != at::kStrided || t->dim() < 2 || t->size(-1) == 0)
-      return py::none();
+py::object get_qkv_layout(at::Tensor q, at::Tensor k, at::Tensor v, const std::string& fmt) {
+  // Functional/Batched/GradTracking wrappers can have exact Python Tensor type.
+  // Reject them before reading storage, including manually wrapped tensors.
+  for (const auto* tensor : {&q, &k, &v}) {
+    if (at::isTensorSubclassLike(*tensor)) return py::none();
   }
-  for (const auto *t : {&q, &k, &v}) {
+  // Validate formats/ranks before any indexing. Exceptional inputs retain Python
+  // error behavior; returning None does not imply a newly supported layout.
+  const auto split = fmt.find("_2");
+  const std::string qfmt = split == std::string::npos ? fmt : fmt.substr(0, split);
+  const std::string kvfmt = split == std::string::npos ? fmt : fmt.substr(split + 2);
+  const auto valid_format = [](const std::string& format) {
+    return format == "bshd" || format == "sbhd" || format == "thd";
+  };
+  if (!valid_format(qfmt) || !valid_format(kvfmt) || q.dim() != static_cast<int64_t>(qfmt.size()) ||
+      k.dim() != static_cast<int64_t>(kvfmt.size()) || k.dim() != v.dim()) {
+    return py::none();
+  }
+  // PyTorch normally bounds numel, but zero-size tensors can have very large
+  // dimensions. Delegate arithmetic that would overflow signed metadata.
+  const auto limit = std::numeric_limits<int64_t>::max();
+  for (const auto* t : {&q, &k, &v}) {
+    if (!t->device().is_cpu() && !t->device().is_cuda()) return py::none();
+    if (t->size(-1) > 0 && t->size(-2) > limit / t->size(-1) / 2) return py::none();
+    if (t->numel() > limit / 2) return py::none();
+  }
+  // Delegate exceptional/non-dense inputs to the untouched Python implementation.
+  for (const auto* t : {&q, &k, &v}) {
+    if (t->is_meta() || t->is_conj() || t->is_neg() || t->layout() != at::kStrided ||
+        t->dim() < 2 || t->size(-1) == 0)
+      return py::none();
+    // Python integer true division rounds the exact ratio. Converting large
+    // integers to double first can change normalized K/V stride equality.
+    // Empty tensors can legitimately carry such strides without large storage.
+    constexpr int64_t kMaxExactDoubleInteger = int64_t{1} << 53;
+    if (t->size(-1) > kMaxExactDoubleInteger) return py::none();
+    for (const auto stride : t->strides()) {
+      if (stride > kMaxExactDoubleInteger || stride < -kMaxExactDoubleInteger) return py::none();
+    }
+  }
+  for (const auto* t : {&q, &k, &v}) {
     if (t->stride(-1) != 1) {
       PyErr_SetString(PyExc_AssertionError,
                       "q, k and v must have stride 1 in their last dimension!");
       throw py::error_already_set();
     }
   }
-  const auto split = fmt.find("_2");
-  const std::string qfmt = split == std::string::npos ? fmt : fmt.substr(0, split);
-  const std::string kvfmt = split == std::string::npos ? fmt : fmt.substr(split + 2);
+
   auto layout = classify(q, k, v, fmt, qfmt, kvfmt);
   if (layout == "not_supported") {
     q = q.contiguous();
