@@ -80,4 +80,5 @@ Transformer Engine documentation
    debug
    envvars
    examples/attention/attention.ipynb
+   examples/attention/attention_cpu_overhead
    examples/attention/cp_ag_thd_dpa_jax_deep_dive.ipynb
