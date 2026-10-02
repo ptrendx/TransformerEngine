@@ -27,6 +27,9 @@ class CommOverlapP2P;
 
 namespace transformer_engine::pytorch {
 
+// Private eager QKV metadata classifier; None requests the Python fallback.
+py::object get_qkv_layout(at::Tensor q, at::Tensor k, at::Tensor v, const std::string &format);
+
 /***************************************************************************************************
  * Router fusion
  **************************************************************************************************/

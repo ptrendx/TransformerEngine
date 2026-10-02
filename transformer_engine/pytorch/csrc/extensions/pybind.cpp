@@ -191,6 +191,8 @@ void bind_quantize_with_amax_extensions(py::module_ &m) {
 #include "common/util/pybind_helper.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("get_qkv_layout", &transformer_engine::pytorch::get_qkv_layout,
+        "Classify eager QKV storage metadata and retry with contiguous tensors");
   NVTE_DECLARE_COMMON_PYBIND11_HANDLES(m)
 
   // Register __eq__/__ne__ on the pybind ``DType`` enum so it compares by integer.
