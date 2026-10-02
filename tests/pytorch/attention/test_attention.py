@@ -4054,3 +4054,110 @@ class Custom_MHA_FP8(TransformerEngineBaseModule):
                 self.quantizers,
             )
         return out
+
+
+@pytest.mark.parametrize("backend", ["fused", "flash"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fmt", ["bshd", "sbhd", "thd"])
+@pytest.mark.parametrize("layout", ["separate", "3hd", "h3d", "2hd", "h2d", "copy", "declared"])
+@pytest.mark.parametrize("mode", ["train", "eval_grad", "no_grad", "inference"])
+def test_dpa_native_layout_reference(backend, dtype, fmt, layout, mode, monkeypatch):
+    """Check the installed detector through each backend against FP32 attention."""
+    import contextlib
+    from transformer_engine.pytorch.attention.dot_product_attention import utils as layout_utils
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if backend == "flash" and not FlashAttentionUtils.is_installed:
+        pytest.skip("FlashAttention 2 is required")
+    monkeypatch.setenv("NVTE_FUSED_ATTN", str(int(backend == "fused")))
+    monkeypatch.setenv("NVTE_FLASH_ATTN", str(int(backend == "flash")))
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setattr(layout_utils, "_NVTE_FLASH_ATTN", int(backend == "flash"))
+    _attention_backends["backend_selection_requires_update"] = True
+    torch.manual_seed(1234)
+    b, s, h, d = 2, 16, 4, 64
+    shape = (b, s, h, d) if fmt == "bshd" else ((s, b, h, d) if fmt == "sbhd" else (b * s, h, d))
+    needs_grad = mode in ("train", "eval_grad")
+
+    def make(size):
+        return torch.randn(size, device="cuda", dtype=dtype, requires_grad=needs_grad)
+
+    tensors = [make(shape) for _ in range(3)]
+    kwargs = {}
+    if layout in ("3hd", "h3d", "2hd", "h2d", "declared"):
+        count = 3 if layout in ("3hd", "h3d", "declared") else 2
+        axis = -3 if layout in ("3hd", "2hd", "declared") else -2
+        packed_shape = list(shape)
+        packed_shape.insert(len(shape) + axis + 1, count)
+        packed = make(packed_shape)
+        tensors = list(packed.unbind(axis)) if count == 3 else [tensors[0], *packed.unbind(axis)]
+        if layout == "declared":
+            kwargs.update(qkv_layer=packed, qkv_interleave_dim=-3)
+    elif layout == "copy":
+        tensors[1] = make((*shape[:-2], 2 * h, d))[..., ::2, :]
+    if fmt == "thd":
+        cu = torch.tensor([0, s, 2 * s], dtype=torch.int32, device="cuda")
+        kwargs.update(cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=s, max_seqlen_kv=s)
+    module = (
+        DotProductAttention(
+            h,
+            d,
+            qkv_format=fmt,
+            attn_mask_type="padding_causal" if fmt == "thd" else "causal",
+            attention_dropout=0,
+        )
+        .cuda()
+        .train(mode == "train")
+    )
+    selected = []
+    handle = getattr(
+        module, "fused_attention" if backend == "fused" else "flash_attention"
+    ).register_forward_pre_hook(lambda *_args: selected.append(True))
+    if layout == "declared":
+        monkeypatch.setattr(
+            layout_utils,
+            "get_qkv_layout",
+            lambda *_args, **_kwargs: pytest.fail("declared layout entered detection"),
+        )
+    context = (
+        contextlib.nullcontext()
+        if needs_grad
+        else (torch.inference_mode() if mode == "inference" else torch.no_grad())
+    )
+    with context:
+        actual = module(*((None, None, None) if layout == "declared" else tensors), **kwargs)
+    handle.remove()
+    assert selected, "Requested backend was not invoked"
+
+    def dense(tensor):
+        return tensor.transpose(0, 1) if fmt == "sbhd" else tensor.reshape(b, s, h, d)
+
+    refs = [dense(t).detach().float().requires_grad_(needs_grad) for t in tensors]
+    scores = torch.einsum("bshd,bthd->bhst", refs[0], refs[1]) / d**0.5
+    mask = torch.ones(s, s, device="cuda", dtype=torch.bool).triu(1)
+    expected = torch.einsum(
+        "bhst,bthd->bshd", scores.masked_fill(mask, float("-inf")).softmax(-1), refs[2]
+    )
+    expected = (
+        expected.transpose(0, 1)
+        if fmt == "sbhd"
+        else (expected.reshape(b * s, h, d) if fmt == "thd" else expected)
+    )
+    expected = expected.flatten(-2)
+    tol = dict(atol=0.005, rtol=0.005) if dtype == torch.float16 else dict(atol=0.025, rtol=0.025)
+    torch.testing.assert_close(actual.float(), expected, **tol)
+    if needs_grad:
+        grad = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(
+            actual, tensors if layout != "declared" else (packed,), grad
+        )
+        ref_grads = torch.autograd.grad(expected, refs, grad.float())
+        ref_grads = [
+            g.transpose(0, 1) if fmt == "sbhd" else (g.reshape(b * s, h, d) if fmt == "thd" else g)
+            for g in ref_grads
+        ]
+        if layout == "declared":
+            ref_grads = [torch.stack(ref_grads, dim=-3)]
+        for actual_grad, ref_grad in zip(actual_grads, ref_grads):
+            torch.testing.assert_close(actual_grad.float(), ref_grad, **tol)
