@@ -2803,6 +2803,32 @@ def qkv_layout_needs_detection(*qkv: Optional[torch.Tensor]) -> bool:
     )
 
 
+def get_max_seqlens(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    max_seqlen_q: Optional[int],
+    max_seqlen_kv: Optional[int],
+) -> Tuple[int, int]:
+    """Read missing THD maxima with at most one device-to-host transfer.
+
+    Supplied values are returned unchanged. Callers own padding and rounding.
+    Keep a direct scalar readback when only one maximum is missing.
+    """
+    if max_seqlen_q is None and max_seqlen_kv is None:
+        maxima = torch.stack(
+            (
+                (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max(),
+                (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).max(),
+            )
+        ).tolist()
+        return maxima[0], maxima[1]
+    if max_seqlen_q is None:
+        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+    elif max_seqlen_kv is None:
+        max_seqlen_kv = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).max().item()
+    return max_seqlen_q, max_seqlen_kv
+
+
 def get_qkv_layout(
     q: torch.Tensor,
     k: torch.Tensor,

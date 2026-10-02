@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Attention."""
+
 from contextlib import nullcontext
 import math
 import os
@@ -66,7 +67,6 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
     FusedAttention,
     FlashAttention,
 )
-
 
 # Setup Attention Logging
 attn_log.setup_logging()
@@ -191,7 +191,8 @@ def _validate_thd_policy_sequence_ids(policies: List[Dict[str, Any]], batch_size
         _thd_policy_validation_cache
     ):
         if (
-            cached_batch_size == batch_size
+            all(version is not None for version in sequence_id_versions)
+            and cached_batch_size == batch_size
             and sequence_id_versions == cached_versions
             and len(sequence_id_tensors) == len(cached_tensors)
             and all(
@@ -202,10 +203,13 @@ def _validate_thd_policy_sequence_ids(policies: List[Dict[str, Any]], batch_size
             _thd_policy_validation_cache.append(_thd_policy_validation_cache.pop(cache_index))
             return
 
-    if is_graph_capturing():
+    if is_graph_capturing() or (
+        torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+    ):
         raise RuntimeError(
             "Mixed THD policy sequence_ids must be validated by an eager warm-up call "
-            "before CUDA graph capture."
+            "before CUDA graph capture. Use DotProductAttention.prepare_thd_attention_policies "
+            "for inference tensors without version counters."
         )
 
     order_checks = [
@@ -231,9 +235,50 @@ def _validate_thd_policy_sequence_ids(policies: List[Dict[str, Any]], batch_size
     if not valid_coverage:
         raise ValueError("Mixed THD policies must assign every sequence exactly once.")
 
-    _thd_policy_validation_cache.append((batch_size, sequence_id_tensors, sequence_id_versions))
+    if all(version is not None for version in sequence_id_versions):
+        _thd_policy_validation_cache.append((batch_size, sequence_id_tensors, sequence_id_versions))
     if len(_thd_policy_validation_cache) > _THD_POLICY_VALIDATION_CACHE_LIMIT:
         _thd_policy_validation_cache.pop(0)
+
+
+class _PreparedTHDAttentionPolicies(list):
+    """Own versioned ID snapshots and their validation proof without cache eviction."""
+
+    def __init__(self, policies, batch_size, lengths=(), token_indices=None):
+        super().__init__(policies)
+        self._batch_size = batch_size
+        self._ids = tuple(policy["sequence_ids"] for policy in policies)
+        self._versions = tuple(tensor._version for tensor in self._ids)
+        self._lengths = lengths
+        self._length_versions = tuple(
+            _get_thd_policy_tensor_version(tensor) if tensor is not None else None
+            for tensor in lengths
+        )
+        self._token_indices = token_indices
+
+    def check(self, policies, batch_size, lengths=()):
+        """Reject replaced or mutated snapshots without any device readback."""
+        ids = tuple(policy["sequence_ids"] for policy in policies)
+        lengths_match = not self._lengths or (
+            len(lengths) == len(self._lengths)
+            and all(tensor is original for tensor, original in zip(lengths, self._lengths))
+            and tuple(
+                _get_thd_policy_tensor_version(tensor) if tensor is not None else None
+                for tensor in lengths
+            )
+            == self._length_versions
+        )
+        if (
+            batch_size != self._batch_size
+            or not lengths_match
+            or len(ids) != len(self._ids)
+            or any(tensor is not original for tensor, original in zip(ids, self._ids))
+            or tuple(_get_thd_policy_tensor_version(tensor) for tensor in ids) != self._versions
+        ):
+            raise RuntimeError(
+                "Prepared THD policy sequence_ids changed or cumulative lengths changed; call "
+                "DotProductAttention.prepare_thd_attention_policies again."
+            )
 
 
 class _IdentityWithMaskedGradient(torch.autograd.Function):
@@ -1573,6 +1618,99 @@ class DotProductAttention(TransformerEngineBaseModule):
         return base[:num_quantizers]
 
     @staticmethod
+    def prepare_thd_attention_policies(
+        policies: List[Dict[str, Any]],
+        batch_size: int,
+        *,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+        cu_seqlens_kv_padded: Optional[torch.Tensor] = None,
+    ):
+        """Validate and snapshot mixed THD sequence IDs before attention calls.
+
+        Preparation performs readbacks and must run outside CUDA graph capture.
+        The returned list owns independent, versioned sequence-ID tensors even
+        when called under inference_mode. Pass it as thd_attention_policies to
+        avoid validation readbacks in forward. Changing or replacing its IDs
+        requires preparation again; changes to mask/window metadata are still
+        validated normally in forward. Ordinary lists retain eager validation.
+        Provide versioned cumulative lengths to also prepare grouped-dispatch
+        token indices (required to avoid compaction waits with FlashAttention 2).
+        Those length tensors must be reused unchanged in forward.
+        """
+        if is_graph_capturing() or (
+            torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError("THD policy preparation must run outside CUDA graph capture.")
+        if not isinstance(policies, list) or not policies:
+            raise ValueError("thd_attention_policies must be a non-empty list.")
+        snapshots = []
+        with torch.inference_mode(False), torch.no_grad():
+            for policy in policies:
+                if not isinstance(policy, dict) or "sequence_ids" not in policy:
+                    raise ValueError("Each THD policy must contain sequence_ids.")
+                ids = policy["sequence_ids"]
+                if (
+                    not isinstance(ids, torch.Tensor)
+                    or ids.ndim != 1
+                    or ids.dtype not in (torch.int32, torch.int64)
+                ):
+                    raise ValueError(
+                        "Mixed THD policy sequence_ids must be one-dimensional int32 or int64"
+                        " tensors."
+                    )
+                snapshots.append(dict(policy, sequence_ids=ids.clone()))
+        if sum(policy["sequence_ids"].numel() for policy in snapshots) != batch_size:
+            raise ValueError("Mixed THD policies must assign every sequence exactly once by count.")
+        if any(
+            policy["sequence_ids"].device != snapshots[0]["sequence_ids"].device
+            for policy in snapshots
+        ):
+            raise ValueError("THD policy sequence_ids must share a device.")
+        _validate_thd_policy_sequence_ids(snapshots, batch_size)
+        lengths, token_indices = (), None
+        if cu_seqlens_q is not None or cu_seqlens_kv is not None:
+            lengths = (cu_seqlens_q, cu_seqlens_kv, cu_seqlens_q_padded, cu_seqlens_kv_padded)
+            if cu_seqlens_q is None or cu_seqlens_kv is None:
+                raise ValueError(
+                    "Policy token preparation requires both Q and KV cumulative lengths."
+                )
+            for tensor in lengths:
+                if tensor is None:
+                    continue
+                if (
+                    tensor.ndim != 1
+                    or tensor.numel() != batch_size + 1
+                    or tensor.dtype != torch.int32
+                    or tensor.device != snapshots[0]["sequence_ids"].device
+                    or _get_thd_policy_tensor_version(tensor) is None
+                ):
+                    raise ValueError(
+                        "Prepared THD cumulative lengths must be versioned int32 tensors of shape"
+                        " [batch_size + 1] on the sequence-ID device."
+                    )
+            physical_q = cu_seqlens_q if cu_seqlens_q_padded is None else cu_seqlens_q_padded
+            physical_kv = cu_seqlens_kv if cu_seqlens_kv_padded is None else cu_seqlens_kv_padded
+            q_tokens, kv_tokens = physical_q[-1].item(), physical_kv[-1].item()
+            token_indices = {}
+            for policy in snapshots:
+                ids = policy["sequence_ids"]
+                q_mask = DotProductAttention._selected_thd_token_mask(
+                    q_tokens, cu_seqlens_q, cu_seqlens_q_padded, ids
+                )
+                kv_mask = DotProductAttention._selected_thd_token_mask(
+                    kv_tokens, cu_seqlens_kv, cu_seqlens_kv_padded, ids
+                )
+                token_indices[id(ids)] = (
+                    torch.nonzero(q_mask).flatten(),
+                    torch.nonzero(kv_mask).flatten(),
+                )
+        elif cu_seqlens_q_padded is not None or cu_seqlens_kv_padded is not None:
+            raise ValueError("Policy token preparation requires logical cumulative lengths.")
+        return _PreparedTHDAttentionPolicies(snapshots, batch_size, lengths, token_indices)
+
+    @staticmethod
     def _partition_thd_mask_policies(
         policies: List[Dict[str, Any]],
         attention_params_kwargs: Dict[str, Any],
@@ -1760,20 +1898,23 @@ class DotProductAttention(TransformerEngineBaseModule):
             sequence_ids = policy["sequence_ids"]
             if sequence_ids.numel() == 0:
                 continue
-            q_token_mask = self._selected_thd_token_mask(
-                query_layer.shape[0],
-                cu_seqlens_q,
-                cu_seqlens_q_padded,
-                sequence_ids,
-            )
-            kv_token_mask = self._selected_thd_token_mask(
-                key_layer.shape[0],
-                cu_seqlens_kv,
-                cu_seqlens_kv_padded,
-                sequence_ids,
-            )
-            q_token_indices = torch.nonzero(q_token_mask, as_tuple=False).flatten()
-            kv_token_indices = torch.nonzero(kv_token_mask, as_tuple=False).flatten()
+            if "_prepared_token_indices" in policy:
+                q_token_indices, kv_token_indices = policy["_prepared_token_indices"]
+            else:
+                q_token_mask = self._selected_thd_token_mask(
+                    query_layer.shape[0],
+                    cu_seqlens_q,
+                    cu_seqlens_q_padded,
+                    sequence_ids,
+                )
+                kv_token_mask = self._selected_thd_token_mask(
+                    key_layer.shape[0],
+                    cu_seqlens_kv,
+                    cu_seqlens_kv_padded,
+                    sequence_ids,
+                )
+                q_token_indices = torch.nonzero(q_token_mask, as_tuple=False).flatten()
+                kv_token_indices = torch.nonzero(kv_token_mask, as_tuple=False).flatten()
             selected_cu_seqlens_q, _ = self._select_thd_sequences(
                 cu_seqlens_q,
                 cu_seqlens_q_padded,
@@ -2227,6 +2368,8 @@ class DotProductAttention(TransformerEngineBaseModule):
             is available. This is a capability check, not a performance comparison. If no
             such backend is available, the policy's logical tokens are compacted before its
             scalar-mask attention call.
+            Use :meth:`prepare_thd_attention_policies` before forward to avoid
+            sequence-ID validation readbacks. Ordinary lists retain eager validation.
         thd_attention_policy_dispatch: {``"auto"``, ``"grouped"``}, default = ``"auto"``
             Dispatch strategy for mixed THD policies. ``"auto"`` uses the padded-first
             backend capability check described above. ``"grouped"`` compacts each policy's
@@ -2462,18 +2605,17 @@ class DotProductAttention(TransformerEngineBaseModule):
                     cu_seqlens_q.dtype == torch.int32 and cu_seqlens_kv.dtype == torch.int32
                 ), "cu_seqlens_q and cu_seqlens_q must both be in dtype torch.int32!"
                 batch_size = len(cu_seqlens_q) - 1
-                if max_seqlen_q is None:
-                    if cu_seqlens_q_padded is not None:
-                        seqlens_q = cu_seqlens_q_padded[1:] - cu_seqlens_q_padded[:-1]
-                    else:
-                        seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-                    max_seqlen_q = int((seqlens_q.max().item() + 63) // 64 * 64)
-                if max_seqlen_kv is None:
-                    if cu_seqlens_kv_padded is not None:
-                        seqlens_kv = cu_seqlens_kv_padded[1:] - cu_seqlens_kv_padded[:-1]
-                    else:
-                        seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-                    max_seqlen_kv = int((seqlens_kv.max().item() + 63) // 64 * 64)
+                missing_q, missing_kv = max_seqlen_q is None, max_seqlen_kv is None
+                max_seqlen_q, max_seqlen_kv = dpa_utils.get_max_seqlens(
+                    cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q,
+                    cu_seqlens_kv_padded if cu_seqlens_kv_padded is not None else cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                )
+                if missing_q:
+                    max_seqlen_q = int((max_seqlen_q + 63) // 64 * 64)
+                if missing_kv:
+                    max_seqlen_kv = int((max_seqlen_kv + 63) // 64 * 64)
 
             if thd_mask_policies is not None:
                 # Validate the shared call contract before dispatching each policy
@@ -2526,7 +2668,19 @@ class DotProductAttention(TransformerEngineBaseModule):
                         "Mixed THD policies must assign every sequence exactly once by count: "
                         f"got {assigned_sequence_count} assignments for {batch_size} sequences."
                     )
-                _validate_thd_policy_sequence_ids(thd_mask_policies, batch_size)
+                if isinstance(thd_attention_policies, _PreparedTHDAttentionPolicies):
+                    thd_attention_policies.check(
+                        thd_mask_policies,
+                        batch_size,
+                        (cu_seqlens_q, cu_seqlens_kv, cu_seqlens_q_padded, cu_seqlens_kv_padded),
+                    )
+                    if thd_attention_policies._token_indices is not None:
+                        for policy in thd_mask_policies:
+                            policy["_prepared_token_indices"] = (
+                                thd_attention_policies._token_indices[id(policy["sequence_ids"])]
+                            )
+                else:
+                    _validate_thd_policy_sequence_ids(thd_mask_policies, batch_size)
 
             # update KV cache and retrieve saved tokens from cache for inference
             if inference_params is not None:

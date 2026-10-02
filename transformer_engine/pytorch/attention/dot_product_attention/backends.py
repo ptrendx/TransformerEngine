@@ -1147,12 +1147,9 @@ class FlashAttention(torch.nn.Module):
                 assert (
                     cu_seqlens_q is not None and cu_seqlens_kv is not None
                 ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
-                if max_seqlen_q is None:
-                    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-                    max_seqlen_q = seqlens_q.max().item()
-                if max_seqlen_kv is None:
-                    seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-                    max_seqlen_kv = seqlens_kv.max().item()
+                max_seqlen_q, max_seqlen_kv = dpa_utils.get_max_seqlens(
+                    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+                )
         else:
             if qkv_format in ["sbhd_2bshd", "bshd"]:
                 # q is in bshd in both cases from conversion above or the original input
