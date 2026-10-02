@@ -73,6 +73,11 @@ _print_rank = int(os.getenv("NVTE_PRINT_RANK", "0"))
 
 _cu_seqlens_cache = {}
 
+# Conservatively retain Python detection if a supported PyTorch build lacks
+# these private dispatch-context queries.
+_layout_dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", lambda: 1)
+_layout_transforms_active = getattr(torch._C, "_are_functorch_transforms_active", lambda: True)
+
 
 class AttentionLogging:
     """
@@ -2804,6 +2809,61 @@ def get_qkv_layout(
     v: torch.Tensor,
     qkv_format: str = "sbhd",
     inference_params: InferenceParams = None,
+):
+    """Classify QKV layout, using native metadata detection for ordinary eager tensors.
+
+    See :func:`_get_qkv_layout_python` for the format and replacement-tensor contract.
+    Compilation, export, subclasses and active tensor transformations use the Python path.
+    """
+    result = None
+    # Exact types are intentional: isinstance admits Parameters and subclasses.
+    # Each independent guard excludes a context where storage inspection is unsafe.
+    # pylint: disable=too-many-boolean-expressions,unidiomatic-typecheck
+    if (
+        not torch.compiler.is_compiling()
+        and not is_in_onnx_export_mode()
+        and type(q) is torch.Tensor
+        and type(k) is torch.Tensor
+        and type(v) is torch.Tensor
+        and qkv_format
+        in ("bshd", "sbhd", "thd", "sbhd_2bshd", "bshd_2sbhd", "thd_2bshd", "thd_2sbhd")
+        and _layout_dispatch_depth() == 0
+        and not _layout_transforms_active()
+        and not torch.overrides.has_torch_function((q, k, v))
+    ):
+        result = tex.get_qkv_layout(q, k, v, qkv_format)
+    # pylint: enable=too-many-boolean-expressions,unidiomatic-typecheck
+    if result is None:
+        result = _get_qkv_layout_python(q, k, v, qkv_format)
+    qkv_layout, q, k, v, q_format, kv_format = result
+    if len(qkv_layout.split("_")) < 3:
+        # q/k/v were recognized as views of a packed buffer only by inspecting
+        # their data pointers, strides and storage offsets. Skip the nudge while
+        # CPU offloading is enabled: offloading forces MultiheadAttention onto
+        # its sliced-views fallback, so packed views reaching detection are
+        # expected there and the caller has no migration option.
+        if not is_cpu_offload_enabled():
+            warnings.warn(
+                "Relying on pointer-based detection of packed q/k/v layouts"
+                f" (detected {qkv_layout!r}) is deprecated: pass the packed buffer"
+                " explicitly via qkv_layer/kv_layer (with qkv_interleave_dim) to"
+                " DotProductAttention instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+    if inference_params is not None and inference_params.is_paged:
+        qkv_layout = "paged_kv_" + qkv_layout
+
+    return qkv_layout, q, k, v, q_format, kv_format
+
+
+def _get_qkv_layout_python(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qkv_format: str = "sbhd",
+    inference_params: InferenceParams = None,
 ) -> str:
     """Get qkv layout.
 
@@ -2996,22 +3056,6 @@ def get_qkv_layout(
         qkv_layout = run_iteratively(q, k, v)
     if qkv_layout == "not_supported":
         raise RuntimeError("The provided qkv memory layout is not supported!")
-
-    if len(qkv_layout.split("_")) < 3:
-        # q/k/v were recognized as views of a packed buffer only by inspecting
-        # their data pointers, strides and storage offsets. Skip the nudge while
-        # CPU offloading is enabled: offloading forces MultiheadAttention onto
-        # its sliced-views fallback, so packed views reaching detection are
-        # expected there and the caller has no migration option.
-        if not is_cpu_offload_enabled():
-            warnings.warn(
-                "Relying on pointer-based detection of packed q/k/v layouts"
-                f" (detected {qkv_layout!r}) is deprecated: pass the packed buffer"
-                " explicitly via qkv_layer/kv_layer (with qkv_interleave_dim) to"
-                " DotProductAttention instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
     if inference_params is not None and inference_params.is_paged:
         qkv_layout = "paged_kv_" + qkv_layout
