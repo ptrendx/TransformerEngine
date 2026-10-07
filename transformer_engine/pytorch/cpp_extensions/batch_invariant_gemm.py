@@ -26,8 +26,8 @@ import triton.language as tl
 
 __all__ = ["batch_invariant_gemm", "is_supported"]
 
-# Tile geometry. These are fixed on purpose: making them depend on M would
-# reintroduce the batch dependence this path exists to remove.
+# Baseline tile geometry. The reduction tile and order stay fixed for a given
+# N, K and GPU; on SM100, M/N tile sizes may vary without splitting K.
 TRITON_BLOCK_M = 64
 TRITON_BLOCK_N = 64
 TRITON_BLOCK_K = 64
@@ -128,6 +128,25 @@ def _can_use_cutedsl(a: torch.Tensor, b: torch.Tensor) -> bool:
         and a.data_ptr() % 16 == 0
         and b.data_ptr() % 16 == 0
     )
+
+
+@lru_cache(maxsize=128)
+def _triton_tile_config(m: int, n: int, k: int, device_index: int) -> tuple[int, int, int, int]:
+    """Choose M/N parallelism without changing the reduction order within a shape."""
+    baseline = (TRITON_BLOCK_M, TRITON_BLOCK_N, TRITON_BLOCK_K, 4)
+    if torch.cuda.get_device_capability(device_index)[0] != 10:
+        return baseline
+    if n <= 256 and k <= 256:
+        return (32, 64, 32, 4)
+    if n >= 2048 and k >= 2048:
+        if m <= 64:
+            return baseline
+        if m <= 512:
+            return (64, 128, 64, 8)
+        if m <= 2048:
+            return (128, 256, 64, 8)
+        return (256, 256, 64, 8)
+    return baseline
 
 
 @lru_cache(maxsize=1)
@@ -232,7 +251,8 @@ def batch_invariant_gemm(
     if out is None:
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
 
-    grid = (triton.cdiv(m, TRITON_BLOCK_M), triton.cdiv(n, TRITON_BLOCK_N))
+    block_m, block_n, block_k, num_warps = _triton_tile_config(m, n, k, a.device.index)
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     _bi_gemm_kernel[grid](
         a,
         b,
@@ -246,8 +266,9 @@ def batch_invariant_gemm(
         b.stride(1),
         out.stride(0),
         out.stride(1),
-        BLOCK_M=TRITON_BLOCK_M,
-        BLOCK_N=TRITON_BLOCK_N,
-        BLOCK_K=TRITON_BLOCK_K,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
     )
     return out

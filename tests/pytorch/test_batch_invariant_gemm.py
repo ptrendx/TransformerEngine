@@ -5,8 +5,8 @@
 
 The general GEMM path lets cuBLASLt pick a kernel from the full problem shape, so
 the same row can produce different bits depending on the batch it arrives in.
-``batch_invariant_gemm`` fixes the tile geometry and the reduction order so the
-result is a function of the row and the weight only.
+``batch_invariant_gemm`` fixes the K reduction order for a given weight shape
+so the result is a function of the row and the weight only.
 """
 
 import pytest
@@ -89,6 +89,19 @@ def test_cutedsl_one_row_out_and_auto_dispatch():
         batch_invariant_gemm(unaligned_a, b),
         batch_invariant_gemm(unaligned_a, b, backend="triton"),
     )
+
+
+def test_triton_tiles_are_bitwise_stable_across_batch_sizes():
+    """On SM100, M/N tiling changes must leave each row's K reduction unchanged."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("adaptive Triton tiling requires Blackwell")
+    torch.manual_seed(2026)
+    a = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    full = batch_invariant_gemm(a, b, backend="triton")
+    for lo, hi in ((0, 1), (0, 64), (0, 256), (128, 1152), (128, 2304)):
+        part = batch_invariant_gemm(a[lo:hi], b, backend="triton")
+        assert torch.equal(part, full[lo:hi]), f"rows {lo}:{hi} changed across Triton tiles"
 
 
 def test_unsupported_combinations_raise():
