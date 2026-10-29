@@ -128,6 +128,7 @@ def run_one_case(n, h, w, start_offset):
 def test_mxfp8_scaling_partial_cast():
     torch.cuda.manual_seed(1234)
 
+    run_one_case(0, 64, 64, 0)
     run_one_case(3, 32, 64, 31)
     run_one_case(64 * 64 - 2, 64, 64, 1)
     run_one_case(16384 * 6144, 16384, 6144, 0)
@@ -166,7 +167,7 @@ def test_mxfp8_partial_cast_requires_scales_for_columnwise_output():
     columnwise = torch.empty_like(output)
     scales = torch.full((128, 4), 127, dtype=torch.uint8, device="cuda")
     missing_scales = torch.empty((0, 0), dtype=torch.uint8, device="cuda")
-    with pytest.raises(RuntimeError, match="columnwise output requires inverse scales"):
+    with pytest.raises(RuntimeError, match="Columnwise output requires columnwise scales"):
         tex.mxfp8_scaling_partial_cast(
             inp, output, columnwise, scales, missing_scales, 64, 64, 31
         )
@@ -224,3 +225,39 @@ def test_nvfp4_partial_cast_encoded_scales(input_dtype, batched, start_offset, n
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     if n % 2:
         assert (output[-1] >> 4).item() == 0xA
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize("offset,length", [(0, 0), (31, 3), (1, 4094)])
+@pytest.mark.parametrize("with_columnwise_scales", [False, True])
+def test_rowwise_partial_kernels(offset, length, with_columnwise_scales):
+    inp = torch.randn(length, device="cuda", dtype=torch.bfloat16)
+    row = torch.zeros((128, 4), device="cuda", dtype=inp.dtype)
+    ref = torch.zeros_like(row)
+    col = torch.zeros((4, 128), device="cuda", dtype=inp.dtype)
+    # The PyTorch extension must normalize empty views with backing storage.
+    omitted = col.flatten()[:0].view(0, 0)
+    tex.mxfp8_scaling_compute_partial_amax(inp, row, omitted, 64, 64, offset)
+    tex.mxfp8_scaling_compute_partial_amax(inp, ref, col, 64, 64, offset)
+    torch.testing.assert_close(row, ref, rtol=0, atol=0)
+    scales = torch.full((128, 4), 127, dtype=torch.uint8, device="cuda")
+    columnwise_scales = (
+        torch.full((4, 128), 126, dtype=torch.uint8, device="cuda")
+        if with_columnwise_scales
+        else scales.flatten()[:0].view(0, 0)
+    )
+    out = torch.empty(length, dtype=torch.uint8, device="cuda")
+    tex.mxfp8_scaling_partial_cast(inp, out, out[:0], scales, columnwise_scales, 64, 64, offset)
+    torch.testing.assert_close(out, inp.to(torch.float8_e4m3fn).view(torch.uint8), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+def test_mxfp8_partial_cast_requires_columnwise_scales():
+    inp = torch.randn(3, device="cuda", dtype=torch.bfloat16)
+    row = torch.empty(3, device="cuda", dtype=torch.uint8)
+    col = torch.empty_like(row)
+    scales = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="Columnwise output requires columnwise scales"):
+        tex.mxfp8_scaling_partial_cast(
+            inp, row, col, scales, scales.flatten()[:0].view(0, 0), 64, 64, 31
+        )

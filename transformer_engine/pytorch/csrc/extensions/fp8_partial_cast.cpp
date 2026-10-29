@@ -62,7 +62,9 @@ void mxfp8_scaling_compute_partial_amax(const at::Tensor &input, at::Tensor amax
 
   const TensorWrapper input_cu = makeTransformerEngineTensor(input);
   TensorWrapper amax_rowwise_cu = makeTransformerEngineTensor(amax_rowwise);
-  TensorWrapper amax_colwise_cu = makeTransformerEngineTensor(amax_colwise);
+  // Empty PyTorch views may have a backing pointer. Normalize omission at this boundary.
+  TensorWrapper amax_colwise_cu =
+      amax_colwise.numel() == 0 ? TensorWrapper() : makeTransformerEngineTensor(amax_colwise);
 
   nvte_mxfp8_scaling_compute_partial_amax(input_cu.data(), amax_rowwise_cu.data(),
                                           amax_colwise_cu.data(), rows, cols, start_offset,
@@ -92,6 +94,8 @@ void mxfp8_scaling_partial_cast(const at::Tensor &input, at::Tensor output_rowwi
   // Normalize empty output views, which may still have a backing data pointer,
   // to an absent columnwise data field. Auxiliary scales do not select usage.
   if (output_colwise.numel() != 0) {
+    TORCH_CHECK(scale_inv_colwise.numel() != 0,
+                "Columnwise output requires columnwise scales");
     TORCH_CHECK(output_colwise.is_contiguous(), "output_colwise must be contiguous");
     TORCH_CHECK(scale_inv_colwise.is_contiguous(), "scale_inv_colwise must be contiguous");
     TORCH_CHECK(output_colwise.scalar_type() == at::ScalarType::Byte ||
